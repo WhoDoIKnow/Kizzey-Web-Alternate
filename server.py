@@ -70,7 +70,7 @@ KIZZY_IMAGE_API = "https://kizzy-api.cjjdxhdjd.workers.dev"
 KIZZEY_RELEASES_API = "https://codeberg.org/api/v1/repos/UnpackedX/Kizzey/releases/latest"
 KIZZEY_REPO = "https://codeberg.org/UnpackedX/Kizzey"
 
-MAX_BODY = 32 * 1024 * 1024
+MAX_BODY = 64 * 1024 * 1024
 MAX_CHAT = 250
 SERVER_STARTED = time.monotonic()
 
@@ -830,6 +830,1012 @@ def visible_patch(obj: dict) -> dict:
     if not isinstance(obj, dict):
         return {}
     return {k: v for k, v in obj.items() if k not in PROTECTED_PATCH_KEYS}
+
+
+IMPORTABLE_STATE_GROUPS = {
+    "settings", "custom", "apps", "media", "console", "experimental", "cycling",
+    "multiple", "health", "location", "weather", "navigation", "androidAuto",
+    "samsung", "emulation", "screenRead", "automation", "drawer", "chatProfile",
+    "wallet", "premium", "quickControls", "ui", "recent", "usage", "savedConfigs",
+    "bulk", "plugins", "gallery", "appCatalog",
+}
+
+
+# ---------------------------------------------------------------------------
+# Kizzey Android backup/config compatibility
+# ---------------------------------------------------------------------------
+
+KIZZEY_BACKUP_FORMAT = "kizzey-backup"
+KIZZEY_PRESET_FORMAT = "kizzey-preset"
+KIZZEY_WEB_FORMAT = "kizzey-web-backup"
+KIZZEY_PRESET_LIMIT = 300
+KIZZEY_CONFIG_LIMIT = 300
+KIZZEY_IMAGE_LIMIT = 64
+KIZZEY_IMAGE_B64_LIMIT = 6 * 1024 * 1024
+KIZZEY_IMAGE_BYTES_LIMIT = 4 * 1024 * 1024
+KIZZEY_SAVED_LIMIT = 500
+KIZZEY_WARNING_LIMIT = 20
+KIZZEY_NOW_WINDOW_MS = 5 * 60 * 1000
+KIZZEY_ACTIVITY_TYPES = {0, 1, 2, 3, 5}
+KIZZEY_STATUS_VALUES = {"online", "idle", "dnd", "invisible", "offline"}
+KIZZEY_HOME_SECTIONS = {
+    "updates": "updates",
+    "live": "live",
+    "quick": "quick",
+    "recent": "recent",
+    "chat": "chat",
+    "stats": "stats",
+    "about": "about",
+}
+KIZZEY_LANGUAGE_TAGS = {
+    "en", "pt-BR", "ru", "tr", "vi", "ar", "de", "es", "fa", "fil", "fr", "hi",
+    "hr", "in", "it", "ja", "ko", "nl", "pl", "pt", "th", "zh-CN", "zh-TW", "he", "my",
+}
+KIZZEY_LEGACY_LANGUAGES = {
+    1: "en", 2: "tr", 3: "nl", 4: "ru", 5: "pl", 6: "pt-BR", 7: "in", 8: "zh-CN",
+    9: "zh-TW", 10: "my", 11: "vi", 12: "it", 13: "fil", 14: "fr", 15: "hr", 16: "fa",
+    17: "de", 18: "th", 19: "ja", 20: "ko", 21: "ar", 22: "es", 23: "he",
+}
+KIZZEY_CONFIG_MARKERS = (
+    "largeImg", "smallImg", "button1", "button2", "button1link", "button2link",
+    "timestampsStart", "timestampsStop", "partyCurrentSize", "partyMaxSize", "platform",
+)
+KIZZEY_WEB_STATE_MARKERS = ("settings", "custom", "savedConfigs", "chatProfile", "ui", "apps", "media")
+KIZZEY_PRESET_GRADIENTS = (
+    "linear-gradient(135deg,#342748,#7b4f7c)",
+    "linear-gradient(135deg,#1d3340,#3f7280)",
+    "linear-gradient(135deg,#3b2432,#894d65)",
+    "linear-gradient(135deg,#25332a,#5f8068)",
+)
+
+
+def _kz_clean(value, limit: int = 256) -> str:
+    if value is None or isinstance(value, (dict, list, tuple, bool)):
+        return ""
+    return str(value).strip()[:limit]
+
+
+def _kz_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off", ""):
+            return False
+    return None
+
+
+def _kz_int(value, low=None, high=None, fallback=None):
+    try:
+        if value is None or isinstance(value, bool) or (isinstance(value, str) and not value.strip()):
+            return fallback
+        number = int(float(value))
+    except Exception:
+        return fallback
+    if low is not None:
+        number = max(low, number)
+    if high is not None:
+        number = min(high, number)
+    return number
+
+
+def _kz_float(value, low=None, high=None, fallback=None):
+    try:
+        if value is None or isinstance(value, bool) or (isinstance(value, str) and not value.strip()):
+            return fallback
+        number = float(value)
+        if number != number:
+            return fallback
+    except Exception:
+        return fallback
+    if low is not None:
+        number = max(low, number)
+    if high is not None:
+        number = min(high, number)
+    return round(number, 3)
+
+
+def _kz_json(value):
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
+
+
+def _kz_color(value):
+    if isinstance(value, str):
+        text = value.strip()
+        match = re.fullmatch(r"#?([0-9a-fA-F]{6})", text)
+        if match:
+            return "#" + match.group(1).lower()
+        match = re.fullmatch(r"#?([0-9a-fA-F]{8})", text)
+        if match:
+            return "#" + match.group(1)[-6:].lower()
+    try:
+        number = int(value)
+    except Exception:
+        return None
+    if number < -0x80000000 or number > 0xFFFFFFFF:
+        return None
+    number &= 0xFFFFFFFF
+    if number == 0:
+        return None
+    return f"#{number & 0xFFFFFF:06x}"
+
+
+def _kz_activity_type(value, fallback: str = "0") -> str:
+    number = _kz_int(value)
+    return str(number) if number in KIZZEY_ACTIVITY_TYPES else fallback
+
+
+def _kz_status(value, fallback: str = "online") -> str:
+    text = _kz_clean(value, 16).lower()
+    return text if text in KIZZEY_STATUS_VALUES else fallback
+
+
+def _kz_timestamp(value) -> str:
+    text = _kz_clean(value, 48)
+    if not text:
+        return ""
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        try:
+            number = float(text)
+        except Exception:
+            return ""
+        return str(int(number)) if number > 0 else ""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}[T ][0-9:.+\-Z]+", text):
+        return text
+    return ""
+
+
+def _kz_url(value) -> str:
+    text = _kz_clean(value, 2048)
+    return text if re.match(r"^https?://", text, re.I) else ""
+
+
+def _kz_file_stem(file_name: str) -> str:
+    name = Path(str(file_name or "").replace("\\", "/")).name.strip()
+    if name.lower().endswith(".json"):
+        name = name[:-5]
+    return _kz_clean(name, 64)
+
+
+def _kz_ids(value) -> list[str]:
+    if isinstance(value, list):
+        rows = value
+    elif isinstance(value, str):
+        parsed = _kz_json(value)
+        rows = parsed if isinstance(parsed, list) else value.split(",")
+    else:
+        return []
+    out = []
+    for row in rows:
+        text = _kz_clean(row, 64).lower()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _kz_home_ids(value) -> list[str]:
+    out = []
+    for raw in _kz_ids(value):
+        target = KIZZEY_HOME_SECTIONS.get(raw)
+        if target and target not in out:
+            out.append(target)
+    return out
+
+
+def _kz_detect_image(blob: bytes) -> str:
+    if blob.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if blob.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if blob.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if len(blob) >= 12 and blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+        return "webp"
+    return ""
+
+
+def _kz_new_context(payload: dict) -> dict:
+    images = payload.get("presetImages") if isinstance(payload, dict) else {}
+    if not isinstance(images, dict):
+        images = {}
+    return {
+        "images": {str(k): v for k, v in images.items() if isinstance(v, str)},
+        "image_urls": {},
+        "images_imported": 0,
+        "images_skipped": 0,
+        "local_image_misses": 0,
+        "image_errors": 0,
+        "config_errors": 0,
+        "entries_skipped": 0,
+        "bad_application_id": False,
+        "warnings": [],
+    }
+
+
+def _kz_save_image(ctx: dict, key: str, encoded: str) -> str:
+    base = Path(str(key or "").replace("\\", "/")).name.strip()
+    if not base:
+        return ""
+    if base in ctx["image_urls"]:
+        return ctx["image_urls"][base]
+    if ctx["images_imported"] >= KIZZEY_IMAGE_LIMIT:
+        ctx["images_skipped"] += 1
+        return ""
+    raw = str(encoded or "").strip()
+    if raw.startswith("data:"):
+        raw = raw.partition(",")[2].strip()
+    if not raw or len(raw) > KIZZEY_IMAGE_B64_LIMIT:
+        ctx["image_errors"] += 1
+        return ""
+    try:
+        blob = base64.b64decode(raw, validate=False)
+    except Exception:
+        ctx["image_errors"] += 1
+        return ""
+    if not blob or len(blob) > KIZZEY_IMAGE_BYTES_LIMIT:
+        ctx["image_errors"] += 1
+        return ""
+    extension = _kz_detect_image(blob)
+    if not extension:
+        ctx["image_errors"] += 1
+        return ""
+    name = uuid.uuid4().hex + "." + extension
+    try:
+        (UPLOAD_DIR / name).write_bytes(blob)
+    except Exception:
+        ctx["image_errors"] += 1
+        return ""
+    ctx["images_imported"] += 1
+    url = "/uploads/" + name
+    ctx["image_urls"][base] = url
+    return url
+
+
+def _kz_image_ref(ctx: dict, raw) -> tuple[str, str]:
+    """Return (web value, kind) where kind is url, asset or blank."""
+    value = _kz_clean(raw, 2048)
+    if not value:
+        return "", ""
+    if re.match(r"^https?://", value, re.I):
+        return value, "url"
+    if value.startswith(("mp:", "external/", "attachments/")):
+        return value, "asset"
+    if re.fullmatch(r"/uploads/[A-Za-z0-9][A-Za-z0-9._-]*", value):
+        return value, "url"
+    if value.startswith("/uploads/"):
+        return "", ""
+    if value.startswith("data:image/"):
+        url = _kz_save_image(ctx, uuid.uuid4().hex, value)
+        return (url, "url") if url else ("", "")
+    base = Path(value.replace("\\", "/")).name
+    if base and base in ctx["images"]:
+        url = _kz_save_image(ctx, base, ctx["images"][base])
+        if url:
+            return url, "url"
+    ctx["local_image_misses"] += 1
+    return "", ""
+
+
+def _kz_custom_from_config(config, ctx: dict) -> dict:
+    cfg = config if isinstance(config, dict) else {}
+    large_value, large_kind = _kz_image_ref(ctx, cfg.get("largeImg") or cfg.get("largeUrl"))
+    small_value, small_kind = _kz_image_ref(ctx, cfg.get("smallImg") or cfg.get("smallUrl"))
+    activity_type = _kz_activity_type(cfg.get("type"), "0")
+    button1link = _kz_url(cfg.get("button1link"))
+    button2link = _kz_url(cfg.get("button2link"))
+    app_id = _kz_clean(cfg.get("applicationId"), 32)
+    if app_id and not re.fullmatch(r"\d{18,19}", app_id):
+        app_id = ""
+        ctx["bad_application_id"] = True
+    return {
+        "name": _kz_clean(cfg.get("name"), 128),
+        "details": _kz_clean(cfg.get("details"), 128),
+        "state": _kz_clean(cfg.get("state"), 128),
+        "partyCurrentSize": _kz_clean(cfg.get("partyCurrentSize"), 8),
+        "partyMaxSize": _kz_clean(cfg.get("partyMaxSize"), 8),
+        "timestampsStart": _kz_timestamp(cfg.get("timestampsStart")),
+        "timestampsStop": _kz_timestamp(cfg.get("timestampsStop")),
+        "platform": _kz_clean(cfg.get("platform"), 32) or "android",
+        "status": _kz_status(cfg.get("status"), "online"),
+        "button1": _kz_clean(cfg.get("button1"), 32),
+        "button1link": button1link,
+        "button2": _kz_clean(cfg.get("button2"), 32),
+        "button2link": button2link,
+        "largeImg": large_value if large_kind == "asset" else "",
+        "largeText": _kz_clean(cfg.get("largeText") or cfg.get("large_text"), 128),
+        "smallImg": small_value if small_kind == "asset" else "",
+        "smallText": _kz_clean(cfg.get("smallText") or cfg.get("small_text"), 128),
+        "type": activity_type,
+        "url": _kz_url(cfg.get("url")),
+        "applicationId": app_id,
+        "statusDisplayType": -1,
+        "largeUrl": large_value if large_kind == "url" else "",
+        "smallUrl": small_value if small_kind == "url" else "",
+    }
+
+
+def _kz_custom_has_content(custom: dict) -> bool:
+    if not isinstance(custom, dict):
+        return False
+    keys = (
+        "name", "details", "state", "largeImg", "largeUrl", "smallImg", "smallUrl",
+        "button1", "button2", "partyCurrentSize", "timestampsStart",
+    )
+    return any(custom.get(key) for key in keys)
+
+
+def _kz_preset(title: str, custom: dict, number: int, source_title: str | None = None) -> dict:
+    name = _kz_clean(title, 80) or _kz_clean(custom.get("name"), 80) or f"Imported preset {number + 1}"
+    start = _kz_clean(custom.get("timestampsStart"), 48)
+    stop = _kz_clean(custom.get("timestampsStop"), 48)
+    timestamp = (
+        {"mode": "absolute", "start": start, "stop": stop}
+        if start or stop
+        else {"mode": "none"}
+    )
+    return {
+        "id": "kz-" + uuid.uuid4().hex[:12],
+        "name": name,
+        "custom": custom,
+        "timestamp": timestamp,
+        "sourceTitle": _kz_clean(title if source_title is None else source_title, 80),
+        "createdAt": now_ms(),
+        "author": "Kizzey import",
+        "tag": "Imported",
+        "emoji": "📥",
+        "gradient": KIZZEY_PRESET_GRADIENTS[number % len(KIZZEY_PRESET_GRADIENTS)],
+    }
+
+
+def _kz_preset_from_config(config, title: str, ctx: dict, number: int) -> dict | None:
+    custom = _kz_custom_from_config(config, ctx)
+    if not _kz_custom_has_content(custom):
+        return None
+    return _kz_preset(title, custom, number, source_title=title)
+
+
+def _kz_preset_from_text(entry, ctx: dict, number: int) -> dict | None:
+    if not isinstance(entry, dict):
+        return None
+    title = _kz_clean(entry.get("title"), 80)
+    name = _kz_clean(entry.get("name"), 128)
+    details = _kz_clean(entry.get("details"), 128)
+    state = _kz_clean(entry.get("state"), 128)
+    image = _kz_clean(entry.get("image"), 2048)
+    if not any((title, name, details, state, image)):
+        return None
+    custom = _kz_custom_from_config(
+        {
+            "name": name,
+            "details": details,
+            "state": state,
+            "largeImg": image,
+            "status": "online",
+        },
+        ctx,
+    )
+    return _kz_preset(title or name or details or state, custom, number, source_title=title)
+
+
+def _kz_preset_from_template(entry, ctx: dict, number: int) -> dict | None:
+    if not isinstance(entry, dict):
+        return None
+    if _kz_clean(entry.get("source"), 24) == "builtin":
+        return None
+    config = entry.get("config") if isinstance(entry.get("config"), dict) else {}
+    custom = _kz_custom_from_config(config, ctx)
+    # Template images and timers come only from the image refs and timestamp
+    # fields. Kizzey ignores the stored config's volatile fields on apply.
+    custom["largeImg"] = ""
+    custom["largeUrl"] = ""
+    custom["smallImg"] = ""
+    custom["smallUrl"] = ""
+    custom["timestampsStart"] = ""
+    custom["timestampsStop"] = ""
+    title = _kz_clean(entry.get("title"), 80)
+    app_id = _kz_clean(entry.get("applicationId"), 32)
+    if app_id and re.fullmatch(r"\d{18,19}", app_id):
+        custom["applicationId"] = app_id
+    elif app_id:
+        ctx["bad_application_id"] = True
+
+    def template_image(ref, slot: str):
+        if not isinstance(ref, dict):
+            return
+        kind = _kz_clean(ref.get("kind"), 24)
+        value = ref.get("value")
+        image_value, image_kind = "", ""
+        if kind == "url":
+            image_value, image_kind = _kz_image_ref(ctx, value)
+        elif kind == "local_upload":
+            base = Path(str(value or "").replace("\\", "/")).name
+            if base and base in ctx["images"]:
+                url = _kz_save_image(ctx, base, ctx["images"][base])
+                if url:
+                    image_value, image_kind = url, "url"
+            else:
+                ctx["local_image_misses"] += 1
+        elif kind not in ("", "none"):
+            image_value, image_kind = _kz_image_ref(ctx, value)
+        if image_value:
+            custom[slot + "Img"] = image_value if image_kind == "asset" else ""
+            custom[slot + "Url"] = image_value if image_kind == "url" else ""
+
+    template_image(entry.get("largeImage"), "large")
+    template_image(entry.get("smallImage"), "small")
+
+    mode = _kz_clean(entry.get("timestampMode"), 24)
+    duration = _kz_int(entry.get("durationMs"), 0)
+    start_abs = _kz_int(entry.get("startAbsolute"), 0)
+    stop_abs = _kz_int(entry.get("stopAbsolute"), 0)
+    updated = _kz_int(entry.get("updatedTs"), 0)
+    now = now_ms()
+    timestamp = {"mode": "none"}
+    # Match RpcPresetApply: a captured absolute start wins over timestampMode.
+    # Near the save time it was a live timer and restarts on apply; an older
+    # value is a fixed date and is applied verbatim.
+    if start_abs and start_abs > 0:
+        if updated and abs(start_abs - updated) <= KIZZEY_NOW_WINDOW_MS:
+            custom["timestampsStart"] = str(now)
+            if stop_abs and stop_abs > start_abs:
+                custom["timestampsStop"] = str(now + (stop_abs - start_abs))
+                timestamp = {"mode": "duration", "durationMs": stop_abs - start_abs}
+            else:
+                custom["timestampsStop"] = ""
+                timestamp = {"mode": "since_apply"}
+        else:
+            custom["timestampsStart"] = str(start_abs)
+            custom["timestampsStop"] = str(stop_abs) if stop_abs and stop_abs > 0 else ""
+            timestamp = {
+                "mode": "absolute",
+                "start": str(start_abs),
+                "stop": str(stop_abs) if stop_abs and stop_abs > 0 else "",
+            }
+    elif mode == "since_apply":
+        custom["timestampsStart"] = str(now)
+        custom["timestampsStop"] = ""
+        timestamp = {"mode": "since_apply"}
+    elif mode == "duration":
+        length = max(0, duration or 0)
+        custom["timestampsStart"] = str(now)
+        custom["timestampsStop"] = str(now + length)
+        timestamp = {"mode": "duration", "durationMs": length}
+    if not _kz_custom_has_content(custom):
+        return None
+    preset = _kz_preset(title or custom.get("name", ""), custom, number, source_title=title)
+    preset["timestamp"] = timestamp
+    return preset
+
+
+def _kz_saved_buttons(prefs: dict) -> dict:
+    data = _kz_json(prefs.get("saved_rpc_buttons_data"))
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    mapping = {
+        "button1": ("button1", 32),
+        "button2": ("button2", 32),
+        "button1Url": ("button1link", 2048),
+        "button2Url": ("button2link", 2048),
+    }
+    for source, (target, limit) in mapping.items():
+        value = _kz_clean(data.get(source), limit)
+        if target.endswith("link"):
+            value = _kz_url(value)
+        if value:
+            out[target] = value
+    return out
+
+
+def _kz_updates_from_prefs(prefs: dict, ctx: dict) -> dict:
+    updates = {}
+    if not isinstance(prefs, dict):
+        return updates
+
+    settings = {}
+    media = {}
+    cycling = {}
+    counts = {"settings": 0}
+
+    def put_setting(key: str, value):
+        if value is None:
+            return
+        settings[key] = value
+        counts["settings"] += 1
+
+    def put_media(key: str, value):
+        if value is None:
+            return
+        media[key] = value
+        counts["settings"] += 1
+
+    def put_cycling(key: str, value):
+        if value is None:
+            return
+        cycling[key] = value
+        counts["settings"] += 1
+
+    dark = _kz_int(prefs.get("dark_theme_value"))
+    if dark == 2:
+        put_setting("theme", "dark")
+    elif dark == 3:
+        put_setting("theme", "light")
+    elif dark == 1:
+        put_setting("theme", "system")
+
+    accent = _kz_color(prefs.get("theme_color")) or _kz_color(prefs.get("custom_theme_color"))
+    if accent:
+        put_setting("accent", accent)
+    high_contrast = _kz_bool(prefs.get("high_contrast"))
+    if high_contrast is not None:
+        put_setting("highContrast", high_contrast)
+    dynamic = _kz_bool(prefs.get("dynamic_color"))
+    if dynamic is not None:
+        put_setting("dynamicColor", dynamic)
+    accent_art = _kz_bool(prefs.get("accent_from_art"))
+    if accent_art is not None:
+        put_setting("accentFromArt", accent_art)
+    art_background = _kz_bool(prefs.get("art_background"))
+    if art_background is not None:
+        put_setting("artBackground", art_background)
+    blur = _kz_int(prefs.get("art_background_blur"), 0, 50)
+    if blur is not None:
+        put_setting("artBackgroundBlur", blur)
+    dim = _kz_int(prefs.get("art_background_dim"), 0, 90)
+    if dim is not None:
+        put_setting("artBackgroundDim", dim)
+    scale = _kz_float(prefs.get("ui_scale"), 0.85, 1.2)
+    if scale is not None:
+        put_setting("fontScale", scale)
+
+    layout_list = _kz_bool(prefs.get("home_layout_list"))
+    if layout_list is not None:
+        put_setting("homeLayout", "list" if layout_list else "grid")
+    columns = _kz_int(prefs.get("home_grid_columns"), 1, 2)
+    if columns is not None:
+        put_setting("homeColumns", columns)
+    if "home_sections_order" in prefs:
+        order = _kz_home_ids(prefs.get("home_sections_order"))
+        if order:
+            put_setting("homeOrder", order)
+    if "home_sections_hidden" in prefs:
+        hidden = _kz_home_ids(prefs.get("home_sections_hidden"))
+        put_setting("hiddenHome", hidden)
+
+    greeting = _kz_clean(prefs.get("welcome_message"), 160)
+    if greeting:
+        put_setting("greeting", greeting)
+    active_now = _kz_bool(prefs.get("show_active_now_on_home"))
+    if active_now is not None:
+        put_setting("showLiveNow", active_now)
+    chat_preview = _kz_bool(prefs.get("chat_home_preview_enabled"))
+    if chat_preview is not None:
+        put_setting("showChatPreview", chat_preview)
+    notifications = _kz_bool(prefs.get("realtime_notif_enabled"))
+    if notifications is not None:
+        put_setting("notifications", notifications)
+
+    language = _kz_clean(prefs.get("k844p1_language_tag"), 20)
+    if language not in KIZZEY_LANGUAGE_TAGS:
+        language = KIZZEY_LEGACY_LANGUAGES.get(_kz_int(prefs.get("language")), "")
+    if language in KIZZEY_LANGUAGE_TAGS:
+        put_setting("language", language)
+
+    use_buttons = _kz_bool(prefs.get("use_saved_rpc_buttons"))
+    if use_buttons is not None:
+        put_setting("showButtons", use_buttons)
+    settings.update(_kz_saved_buttons(prefs))
+
+    custom = {}
+    raw_last = prefs.get("last_run_custom_rpc")
+    last = _kz_json(raw_last)
+    if isinstance(last, dict):
+        custom.update(_kz_custom_from_config(last, ctx))
+    elif raw_last not in (None, "") and isinstance(raw_last, str):
+        ctx["warnings"].append("The saved active Custom RPC card could not be read, so only its separate settings were imported.")
+
+    custom_type = _kz_int(prefs.get("custom_activity_type"))
+    if custom_type in KIZZEY_ACTIVITY_TYPES:
+        custom["type"] = str(custom_type)
+    custom_status = _kz_clean(prefs.get("custom_activity_status"), 16).lower()
+    if custom_status in KIZZEY_STATUS_VALUES:
+        custom["status"] = custom_status
+        put_setting("rpcStatus", custom_status)
+    app_id = _kz_clean(
+        prefs.get("custom_activity_application_id_") or prefs.get("custom_activity_application_id"),
+        32,
+    )
+    if app_id:
+        if re.fullmatch(r"\d{18,19}", app_id):
+            custom["applicationId"] = app_id
+        else:
+            ctx["bad_application_id"] = True
+    stream = _kz_url(prefs.get("custom_activity_stream_url"))
+    if stream:
+        custom["url"] = stream
+    display_type = _kz_int(prefs.get("custom_rpc_status_display_type"), -1, 2)
+    if display_type is not None:
+        custom["statusDisplayType"] = display_type
+        put_setting("statusDisplay", display_type)
+    roll = _kz_bool(prefs.get("custom_rpc_status_roll"))
+    if roll is not None:
+        put_setting("statusRoll", roll)
+    roll_interval = _kz_int(prefs.get("custom_rpc_status_roll_interval"), 1, 120)
+    if roll_interval is not None:
+        put_setting("statusRollInterval", roll_interval)
+    roll_raw = prefs.get("k844_lyrics_roll_lines_custom")
+    if roll_raw not in (None, ""):
+        roll_data = _kz_json(roll_raw)
+        if isinstance(roll_data, list):
+            names = {0: "name", 1: "state", 2: "details"}
+            lines = [names[value] for value in (_kz_int(row) for row in roll_data) if value in names]
+            if lines:
+                put_setting("statusRollLines", lines)
+    if custom and (_kz_custom_has_content(custom) or custom.get("applicationId") or custom.get("url")):
+        updates["custom"] = custom
+
+    show_progress = _kz_bool(prefs.get("enable_timestamps"))
+    if show_progress is not None:
+        put_media("showProgress", show_progress)
+    hide_paused = _kz_bool(prefs.get("hide_on_pause"))
+    if hide_paused is not None:
+        put_media("hideOnPause", hide_paused)
+    media_type = _kz_int(prefs.get("media_rpc_activity_type"))
+    if media_type in KIZZEY_ACTIVITY_TYPES:
+        put_media("type", media_type)
+    pause_status = _kz_clean(prefs.get("k844p2_rpc_media_pause_status"), 16).lower()
+    if pause_status in KIZZEY_STATUS_VALUES:
+        put_media("hiddenStatus", pause_status)
+    media_cycling = _kz_bool(prefs.get("media_cycling_enabled"))
+    if media_cycling is not None:
+        put_cycling("enabled", media_cycling)
+    cycling_types = _kz_json(prefs.get("media_cycling_types"))
+    if isinstance(cycling_types, list):
+        values = []
+        for row in cycling_types:
+            number = _kz_int(row)
+            if number in KIZZEY_ACTIVITY_TYPES and number not in values:
+                values.append(number)
+        if values:
+            put_cycling("types", values)
+    cycling_interval = _kz_int(prefs.get("media_cycling_interval"), 1, 600)
+    if cycling_interval is not None:
+        put_cycling("interval", cycling_interval)
+    cycling_stream = _kz_url(prefs.get("media_cycling_stream_url"))
+    if cycling_stream:
+        put_cycling("streamUrl", cycling_stream)
+
+    if prefs.get("custom_css_theme") or prefs.get("custom_css_theme_enabled"):
+        ctx["warnings"].append("Kizzey's serialised custom CSS palette was not converted into web CSS variables.")
+
+    if settings:
+        updates["settings"] = settings
+    if media:
+        updates["media"] = media
+    if cycling:
+        updates["cycling"] = cycling
+    ctx["settings_count"] = counts["settings"]
+    return updates
+
+
+def _kz_add_preset(presets: list, seen: set, preset: dict | None, ctx: dict) -> bool:
+    if not preset:
+        return False
+    key = _saved_merge_key(preset)
+    if key and key in seen:
+        ctx["duplicates"] = ctx.get("duplicates", 0) + 1
+        return False
+    if len(presets) >= KIZZEY_PRESET_LIMIT:
+        ctx["truncated"] = True
+        return False
+    if key:
+        seen.add(key)
+    presets.append(preset)
+    return True
+
+
+def _kz_final_warnings(ctx: dict, report: dict) -> list[str]:
+    warnings = list(ctx["warnings"])
+    if ctx["local_image_misses"]:
+        count = ctx["local_image_misses"]
+        warnings.append(
+            f"{count} local Android image path{'s' if count != 1 else ''} could not be read. "
+            "Export a full Kizzey settings backup to carry preset artwork, or add the image again here."
+        )
+    if ctx["images_skipped"]:
+        count = ctx["images_skipped"]
+        warnings.append(
+            f"Only {KIZZEY_IMAGE_LIMIT} preset artwork files are imported at once; "
+            f"{count} more {'were' if count != 1 else 'was'} skipped."
+        )
+    if ctx["image_errors"]:
+        count = ctx["image_errors"]
+        warnings.append(f"{count} preset image{'s' if count != 1 else ''} could not be decoded or stored and {'were' if count != 1 else 'was'} skipped.")
+    if ctx.get("duplicates"):
+        count = ctx["duplicates"]
+        warnings.append(f"{count} duplicate preset title{'s were' if count != 1 else ' was'} merged.")
+    if ctx.get("truncated"):
+        warnings.append(f"Only the first {KIZZEY_PRESET_LIMIT} presets were imported.")
+    if ctx.get("bad_application_id"):
+        warnings.append("A Custom RPC application ID was not 18 or 19 digits, so it was omitted.")
+    if ctx.get("config_errors", 0) > 3:
+        count = ctx["config_errors"]
+        warnings.append(f"{count} saved config files could not be read; the first few failures are listed above.")
+    if ctx.get("entries_skipped"):
+        count = ctx["entries_skipped"]
+        warnings.append(
+            f"{count} preset entr{'ies were' if count != 1 else 'y was'} malformed or had no importable fields and {'were' if count != 1 else 'was'} skipped."
+        )
+    seen = set()
+    out = []
+    for warning in warnings:
+        if warning and warning not in seen:
+            seen.add(warning)
+            out.append(warning)
+    report["warnings"] = out[:KIZZEY_WARNING_LIMIT]
+    return out
+
+
+def build_kizzey_backup_import(payload: dict, file_name: str = "") -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("That Kizzey backup is not a JSON object.")
+    ctx = _kz_new_context(payload)
+    version = _kz_int(payload.get("version"), 1)
+    app_version = _kz_clean(payload.get("appVersion"), 40)
+    if version and version > 2:
+        ctx["warnings"].append(
+            f"This is a version {version} Kizzey backup. Known settings were imported and newer fields were ignored."
+        )
+    prefs = payload.get("prefs") if isinstance(payload.get("prefs"), dict) else {}
+    updates = _kz_updates_from_prefs(prefs, ctx)
+
+    presets = []
+    seen = set()
+    template_count = 0
+    config_count = 0
+    text_count = 0
+
+    raw_templates = prefs.get("custom_rpc_template_presets")
+    if raw_templates not in (None, ""):
+        templates = _kz_json(raw_templates)
+        if isinstance(templates, list):
+            if len(templates) > KIZZEY_PRESET_LIMIT:
+                ctx["truncated"] = True
+            for entry in templates[:KIZZEY_PRESET_LIMIT]:
+                preset = _kz_preset_from_template(entry, ctx, len(presets))
+                if preset is None:
+                    if not (isinstance(entry, dict) and _kz_clean(entry.get("source"), 24) == "builtin"):
+                        ctx["entries_skipped"] += 1
+                    continue
+                if _kz_add_preset(presets, seen, preset, ctx):
+                    template_count += 1
+        else:
+            ctx["warnings"].append("The saved Custom RPC template presets could not be read.")
+    elif "custom_rpc_template_presets" in prefs:
+        ctx["warnings"].append("The saved Custom RPC template presets were empty or unreadable.")
+
+    raw_configs = payload.get("configs")
+    configs = raw_configs if isinstance(raw_configs, dict) else {}
+    for index, (raw_name, raw_content) in enumerate(configs.items()):
+        if index >= KIZZEY_CONFIG_LIMIT:
+            ctx["truncated"] = True
+            break
+        title = _kz_file_stem(raw_name)
+        content = _kz_json(raw_content)
+        if not isinstance(content, dict):
+            ctx["config_errors"] += 1
+            if ctx["config_errors"] <= 3:
+                ctx["warnings"].append(f"The saved config {title or 'file'} could not be read.")
+            continue
+        preset = _kz_preset_from_config(content, title, ctx, len(presets))
+        if preset is None:
+            ctx["entries_skipped"] += 1
+        elif _kz_add_preset(presets, seen, preset, ctx):
+            config_count += 1
+
+    raw_presets = prefs.get("rpc_presence_presets")
+    if raw_presets not in (None, ""):
+        preset_rows = _kz_json(raw_presets)
+        if isinstance(preset_rows, list):
+            if len(preset_rows) > KIZZEY_PRESET_LIMIT:
+                ctx["truncated"] = True
+            for entry in preset_rows[:KIZZEY_PRESET_LIMIT]:
+                preset = _kz_preset_from_text(entry, ctx, len(presets))
+                if preset is None:
+                    ctx["entries_skipped"] += 1
+                elif _kz_add_preset(presets, seen, preset, ctx):
+                    text_count += 1
+        else:
+            ctx["warnings"].append("The saved text presets could not be read.")
+    elif "rpc_presence_presets" in prefs:
+        ctx["warnings"].append("The saved text presets were empty or unreadable.")
+
+    account_ignored = bool(payload.get("includesAccount")) or any(
+        key in prefs for key in ("token", "user_data", "user_id", "user_bio", "user_nitro", "multi_rpc_accounts")
+    )
+    if account_ignored:
+        ctx["warnings"].append("Discord account and token fields from the Android backup were ignored.")
+
+    if not updates and not presets:
+        raise ValueError(
+            "That Kizzey backup has no settings or presets this web build can import."
+        )
+
+    report = {
+        "kind": "kizzey-backup",
+        "label": "Kizzey settings backup",
+        "settings": ctx.get("settings_count", 0),
+        "presets": len(presets),
+        "configs": config_count,
+        "templatePresets": template_count,
+        "textPresets": text_count,
+        "images": ctx["images_imported"],
+        "accountIgnored": bool(account_ignored),
+        "sourceVersion": app_version or (f"format {version}" if version else ""),
+        "warnings": [],
+    }
+    _kz_final_warnings(ctx, report)
+    return {"updates": updates, "presets": presets, "report": report}
+
+
+def build_kizzey_preset_import(payload, file_name: str = "") -> dict:
+    if isinstance(payload, dict) and isinstance(payload.get("presets"), list):
+        entries = payload["presets"]
+    elif _looks_like_text_preset(payload):
+        entries = [payload]
+    else:
+        entries = payload
+    if not isinstance(entries, list):
+        raise ValueError("That Kizzey preset pack does not contain a presets list.")
+    ctx = _kz_new_context(payload if isinstance(payload, dict) else {})
+    if len(entries) > KIZZEY_PRESET_LIMIT:
+        ctx["truncated"] = True
+    presets = []
+    seen = set()
+    for entry in entries[:KIZZEY_PRESET_LIMIT]:
+        preset = _kz_preset_from_text(entry, ctx, len(presets))
+        if preset is None:
+            ctx["entries_skipped"] += 1
+        else:
+            _kz_add_preset(presets, seen, preset, ctx)
+    if not presets:
+        raise ValueError("That Kizzey preset pack contains no presets with usable text.")
+    report = {
+        "kind": "kizzey-preset",
+        "label": "Kizzey preset pack",
+        "settings": 0,
+        "presets": len(presets),
+        "configs": 0,
+        "templatePresets": 0,
+        "textPresets": len(presets),
+        "images": ctx["images_imported"],
+        "accountIgnored": False,
+        "sourceVersion": _kz_clean(payload.get("appVersion"), 40) if isinstance(payload, dict) else "",
+        "warnings": [],
+    }
+    _kz_final_warnings(ctx, report)
+    return {"updates": {}, "presets": presets, "report": report}
+
+
+def build_kizzey_config_import(payload, file_name: str = "") -> dict:
+    entries = payload if isinstance(payload, list) else [payload]
+    ctx = _kz_new_context({})
+    filtered = [entry for entry in entries if isinstance(entry, dict)]
+    ctx["entries_skipped"] += len(entries) - len(filtered)
+    entries = filtered
+    if not entries:
+        raise ValueError("That file does not contain a Kizzey Custom RPC config.")
+    presets = []
+    seen = set()
+    base_title = _kz_file_stem(file_name)
+    if len(entries) > KIZZEY_CONFIG_LIMIT:
+        ctx["truncated"] = True
+    for index, entry in enumerate(entries[:KIZZEY_CONFIG_LIMIT]):
+        title = base_title if len(entries) == 1 else ""
+        if not title:
+            title = _kz_clean(entry.get("name"), 80) or (f"{base_title} {index + 1}" if base_title else f"Imported config {index + 1}")
+        preset = _kz_preset_from_config(entry, title, ctx, len(presets))
+        if preset is None:
+            ctx["entries_skipped"] += 1
+        else:
+            _kz_add_preset(presets, seen, preset, ctx)
+    if not presets:
+        raise ValueError("That Kizzey config has no card fields this web build can import.")
+    report = {
+        "kind": "kizzey-config",
+        "label": "Kizzey Custom RPC config",
+        "settings": 0,
+        "presets": len(presets),
+        "configs": len(presets),
+        "templatePresets": 0,
+        "textPresets": 0,
+        "images": ctx["images_imported"],
+        "accountIgnored": False,
+        "sourceVersion": "",
+        "warnings": [],
+    }
+    _kz_final_warnings(ctx, report)
+    return {"updates": {}, "presets": presets, "report": report}
+
+
+def _looks_like_rpc_config(value) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if isinstance(value.get("state"), dict):
+        return False
+    if any(marker in value for marker in KIZZEY_CONFIG_MARKERS):
+        return True
+    return any(key in value for key in ("name", "details", "state")) and not any(
+        key in value for key in ("title", "image", "presets", "prefs")
+    )
+
+
+def _looks_like_text_preset(value) -> bool:
+    return isinstance(value, dict) and any(
+        key in value for key in ("title", "name", "details", "state", "image")
+    ) and not _looks_like_rpc_config(value)
+
+
+def detect_import_kind(payload) -> str:
+    if isinstance(payload, list):
+        if any(_looks_like_rpc_config(row) for row in payload):
+            return "kizzey-config"
+        if any(_looks_like_text_preset(row) for row in payload):
+            return "kizzey-preset"
+        return "unknown"
+    if not isinstance(payload, dict):
+        return "unknown"
+    fmt = _kz_clean(payload.get("format"), 48)
+    if fmt == KIZZEY_BACKUP_FORMAT:
+        return "kizzey-backup"
+    if fmt == KIZZEY_PRESET_FORMAT:
+        return "kizzey-preset"
+    if fmt == KIZZEY_WEB_FORMAT:
+        return "web"
+    if fmt:
+        return "unknown"
+    if isinstance(payload.get("prefs"), dict) or isinstance(payload.get("configs"), dict):
+        return "kizzey-backup"
+    if any(key in payload for key in KIZZEY_WEB_STATE_MARKERS):
+        return "web"
+    if isinstance(payload.get("state"), dict):
+        return "web"
+    if isinstance(payload.get("presets"), list):
+        return "kizzey-preset"
+    if _looks_like_text_preset(payload) and any(key in payload for key in ("title", "image")):
+        return "kizzey-preset"
+    if _looks_like_rpc_config(payload):
+        return "kizzey-config"
+    # Preserve the original import contract: an object with no Kizzey marker is
+    # treated as a raw web state, even when only one state group is present.
+    return "web"
+
+
+def _saved_merge_key(preset) -> str:
+    if not isinstance(preset, dict):
+        return ""
+    value = preset.get("sourceTitle") if "sourceTitle" in preset else preset.get("name")
+    return str(value or "").strip().casefold()
+
+
+def merge_saved_configs(existing, incoming: list) -> tuple[list, int]:
+    current = existing if isinstance(existing, list) else []
+    incoming_keys = {_saved_merge_key(preset) for preset in incoming if _saved_merge_key(preset)}
+    kept = [preset for preset in current if _saved_merge_key(preset) not in incoming_keys]
+    merged = list(incoming) + kept
+    dropped = max(0, len(merged) - KIZZEY_SAVED_LIMIT)
+    return merged[:KIZZEY_SAVED_LIMIT], dropped
 
 
 # ---------------------------------------------------------------------------
@@ -3004,7 +4010,7 @@ class Handler(BaseHTTPRequestHandler):
     def send_error_json(self, message: str, status: int = 400, **extra):
         self.send_json({"ok": False, "error": message, **extra}, status=status)
 
-    def read_json(self) -> dict:
+    def read_json(self, allow_list: bool = False):
         length = int(self.headers.get("Content-Length") or 0)
         if length > MAX_BODY:
             raise ValueError("Request is too large.")
@@ -3013,8 +4019,8 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8"))
         except Exception:
             raise ValueError("Invalid JSON body.")
-        if not isinstance(data, dict):
-            raise ValueError("JSON body must be an object.")
+        if not isinstance(data, dict) and not (allow_list and isinstance(data, list)):
+            raise ValueError("JSON body must be an object or list." if allow_list else "JSON body must be an object.")
         return data
 
     def query(self) -> dict:
@@ -3508,22 +4514,98 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def handle_import(self):
-        data = self.read_json()
-        payload = data.get("backup") if isinstance(data.get("backup"), dict) else data
-        incoming = payload.get("state") if isinstance(payload.get("state"), dict) else payload
-        if not isinstance(incoming, dict):
-            return self.send_error_json("That backup does not contain a state object.", 400)
-        with STORE.lock:
-            for key, value in visible_patch(incoming).items():
-                if key in ("settings", "custom", "apps", "media", "console", "experimental", "cycling", "multiple", "health", "location", "weather", "navigation", "androidAuto", "samsung", "emulation", "screenRead", "automation", "drawer", "chatProfile", "wallet", "premium", "quickControls", "ui", "recent", "usage", "savedConfigs", "bulk", "plugins", "gallery", "appCatalog"):
+        assert STORE is not None
+        data = self.read_json(allow_list=True)
+        if isinstance(data, list):
+            wrapped = False
+            payload = data
+            file_name = ""
+        else:
+            wrapped = isinstance(data.get("backup"), (dict, list))
+            payload = data.get("backup") if wrapped else data
+            file_name = str(data.get("fileName") or "").strip()[:240] if wrapped else ""
+        kind = detect_import_kind(payload)
+
+        if kind == "unknown":
+            return self.send_error_json(
+                "Expected a Kizzey Web backup, a Kizzey settings backup, a Kizzey preset pack "
+                "or a Custom RPC config JSON file.",
+                400,
+            )
+
+        if kind == "web":
+            incoming = payload.get("state") if isinstance(payload, dict) and isinstance(payload.get("state"), dict) else payload
+            if not isinstance(incoming, dict):
+                return self.send_error_json("That backup does not contain a state object.", 400)
+            with STORE.lock:
+                for key, value in visible_patch(incoming).items():
+                    if key not in IMPORTABLE_STATE_GROUPS:
+                        continue
                     if isinstance(value, dict) and isinstance(STORE.state.get(key), dict):
                         deep_merge(STORE.state[key], value)
                     else:
                         STORE.state[key] = value
+                STORE.save()
+                saved_count = len(STORE.state.get("savedConfigs") or [])
+            STORE.log("INFO", "Backup", "Settings imported from a Kizzey Web backup.")
+            STORE.broadcast_state()
+            return self.send_json(
+                {
+                    "ok": True,
+                    "state": public_state(),
+                    "import": {
+                        "kind": "web",
+                        "label": "Kizzey Web backup",
+                        "settings": 0,
+                        "presets": saved_count,
+                        "images": 0,
+                        "warnings": [],
+                    },
+                }
+            )
+
+        try:
+            if kind == "kizzey-backup":
+                bundle = build_kizzey_backup_import(payload, file_name)
+            elif kind == "kizzey-preset":
+                bundle = build_kizzey_preset_import(payload, file_name)
+            else:
+                bundle = build_kizzey_config_import(payload, file_name)
+        except ValueError as exc:
+            return self.send_error_json(str(exc), 400)
+
+        report = bundle["report"]
+        with STORE.lock:
+            for key, value in bundle["updates"].items():
+                if key not in IMPORTABLE_STATE_GROUPS or key == "savedConfigs":
+                    continue
+                if isinstance(value, dict) and isinstance(STORE.state.get(key), dict):
+                    deep_merge(STORE.state[key], value)
+                else:
+                    STORE.state[key] = value
+            if bundle["presets"]:
+                merged, dropped = merge_saved_configs(STORE.state.get("savedConfigs"), bundle["presets"])
+                STORE.state["savedConfigs"] = merged
+                if dropped:
+                    note = f"{dropped} older saved preset{'s were' if dropped != 1 else ' was'} dropped at the local limit of {KIZZEY_SAVED_LIMIT}."
+                    if note not in report["warnings"]:
+                        report["warnings"] = (report["warnings"] + [note])[:KIZZEY_WARNING_LIMIT]
             STORE.save()
-        STORE.log("INFO", "Backup", "Settings imported from a backup.")
+
+        detail_parts = []
+        if report.get("settings"):
+            detail_parts.append(f"{report['settings']} setting{'s' if report['settings'] != 1 else ''}")
+        if report.get("presets"):
+            detail_parts.append(f"{report['presets']} preset{'s' if report['presets'] != 1 else ''}")
+        if report.get("configs"):
+            detail_parts.append(f"{report['configs']} config{'s' if report['configs'] != 1 else ''}")
+        if report.get("images"):
+            detail_parts.append(f"{report['images']} image{'s' if report['images'] != 1 else ''}")
+        STORE.log("INFO", "Import", f"{report['label']} imported: {', '.join(detail_parts) or 'no countable changes'}.")
+        for warning in report.get("warnings", []):
+            STORE.log("WARN", "Import", warning)
         STORE.broadcast_state()
-        return self.send_json({"ok": True, "state": public_state()})
+        return self.send_json({"ok": True, "state": public_state(), "import": report})
 
     # -- patch ------------------------------------------------------------
     def handle_patch(self):

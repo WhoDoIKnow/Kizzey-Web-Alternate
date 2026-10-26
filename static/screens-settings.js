@@ -488,17 +488,171 @@
       try { bytes = new Blob([JSON.stringify(state)]).size; } catch {}
       return page('Backup & restore', 'Take your settings with you.', `
         ${K.settingGroup('Export', infoRow('download', 'Download a backup', 'All client state, presets, chat profile, gallery, history and wallet. Discord tokens and server logs are excluded.', `<a class="btn btn-primary btn-sm" href="/api/export" download>${K.icon('download', 'sm')}Export</a>`) + infoRow('database', 'Current state', `${fmtBytes(bytes)} · ${(state.savedConfigs || []).length} presets · ${(state.history || []).length} sessions`, ''))}
-        ${K.settingGroup('Restore', infoRow('upload', 'Import a backup', 'Accepts a Kizzey Web backup JSON. State is merged into the current server; the Discord token is never imported.', `<button class="btn btn-ghost btn-sm" data-action="backup-import">${K.icon('upload', 'sm')}Choose file</button>`) + infoRow('shield', 'Protected fields', 'Account, gateway, token, live presence, logs and server history are not replaced by an import.', '<span class="badge plain">SAFE</span>'))}
+        ${K.settingGroup('Restore', infoRow('upload', 'Import a backup or config', 'Kizzey Web backup, Kizzey settings backup, Kizzey preset pack or a stand-alone Custom RPC config JSON. The Discord token is never imported.', `<button class="btn btn-ghost btn-sm" data-action="backup-import">${K.icon('upload', 'sm')}Choose file</button>`) + infoRow('smartphone', 'From the Android app', 'Reads Kizzey-settings-*.json, Kizzey-presets-*.json and Save config files. Account and token fields, APK-private data and Android-only switches stay behind.', '<span class="badge plain">KIZZEY</span>') + infoRow('shield', 'Protected fields', 'Account, gateway, token, live presence, logs and server history are not replaced by an import.', '<span class="badge plain">SAFE</span>'))}
         <div class="danger-zone">
           <div class="dz-title">Before restoring</div>
-          <p>A backup can replace settings, presets and chat profile. Take a fresh export first. Invalid JSON is rejected before anything is written.</p>
+          <p>A Kizzey Web backup can replace settings, presets and chat profile. For Android files, titled cards replace a local card with the same title; untitled presets are appended. Take a fresh export first; unsupported files are rejected before settings or presets change.</p>
           <div class="card-row" style="gap:8px"><a class="btn btn-ghost btn-sm" href="/api/export" download>${K.icon('download', 'sm')}Export now</a><button class="btn btn-ghost btn-sm" data-action="backup-import">${K.icon('upload', 'sm')}Restore</button></div>
         </div>
-        ${K.settingGroup('Private data', infoRow('key', 'Discord token', 'Lives separately in data/secret.json. Never exported. Sign out from Settings to erase it.', `<button class="btn btn-ghost btn-sm" data-route="settings">Settings</button>`) + infoRow('image', 'Uploaded images', 'Stored under data/uploads and referenced by URL. Backups contain the URLs, not the image bytes.', '<span class="badge plain">FILES</span>') + infoRow('history', 'History file', 'data/history.json is written whenever a presence stops. The public state carries the most recent 120 entries.', ''))}
-        <div class="field-hint" style="padding:14px 5px">To make a complete copy, stop the server and copy the entire data/ folder. The JSON export is for settings and community state only.</div>
+        ${K.settingGroup('Private data', infoRow('key', 'Discord token', 'Lives separately in data/secret.json. Never exported. Sign out from Settings to erase it.', `<button class="btn btn-ghost btn-sm" data-route="settings">Settings</button>`) + infoRow('image', 'Uploaded images', 'Stored under data/uploads and referenced by URL. Web backups contain URLs; a full Kizzey settings backup can also carry preset artwork bytes.', '<span class="badge plain">FILES</span>') + infoRow('history', 'History file', 'data/history.json is written whenever a presence stops. The public state carries the most recent 120 entries.', ''))}
+        <div class="field-hint" style="padding:14px 5px">To make a complete copy, stop the server and copy the entire data/ folder. The JSON export is for settings and community state only. Android MMKV files and the app's private data directory cannot be read directly.</div>
         <div style="height:20px"></div>`);
     },
   };
+
+  function kzPresetList(raw) {
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw !== 'string' || !raw.trim()) return [];
+    try {
+      const value = JSON.parse(raw);
+      return Array.isArray(value) ? value : [];
+    } catch { return []; }
+  }
+
+  function kzLooksConfig(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    if (value.state && typeof value.state === 'object') return false;
+    const markers = ['largeImg', 'smallImg', 'button1', 'button2', 'button1link', 'button2link', 'timestampsStart', 'timestampsStop', 'partyCurrentSize', 'partyMaxSize', 'platform'];
+    if (markers.some(key => key in value)) return true;
+    return ['name', 'details', 'state'].some(key => key in value)
+      && !['title', 'image', 'presets', 'prefs', 'settings', 'savedConfigs'].some(key => key in value);
+  }
+
+  function kzLooksPreset(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    if (value.state && typeof value.state === 'object') return false;
+    return !kzLooksConfig(value)
+      && ['title', 'name', 'details', 'state', 'image'].some(key => key in value);
+  }
+
+  function kzCount(value, singular, plural = singular + 's') {
+    const number = Number(value) || 0;
+    return `${number} ${number === 1 ? singular : plural}`;
+  }
+
+  function importPreview(payload, file) {
+    if (Array.isArray(payload)) {
+      if (payload.some(kzLooksConfig)) {
+        return {
+          mode: 'kizzey',
+          title: 'Import these Custom RPC configs?',
+          subtitle: `${kzCount(payload.length, 'RPC card')} in ${file.name}`,
+          confirm: 'Import configs',
+          body: '<p class="about-copy" style="margin-top:0">Each RPC card is saved as a local preset. Open Gallery and look under <b>Your cards</b> to apply one.</p><p class="about-copy">Android-local artwork paths are skipped because those bytes live in the app\'s private folder. Public artwork URLs are kept.</p>',
+        };
+      }
+      if (payload.some(kzLooksPreset)) {
+        return {
+          mode: 'kizzey',
+          title: 'Import these Kizzey presets?',
+          subtitle: `${kzCount(payload.length, 'preset')} in ${file.name}`,
+          confirm: 'Import presets',
+          body: '<p class="about-copy" style="margin-top:0">Titled presets replace a local preset with the same title; untitled presets are appended.</p>',
+        };
+      }
+      throw new Error('No Kizzey presets or RPC configs were found in that list.');
+    }
+    if (!payload || typeof payload !== 'object') throw new Error('That file does not contain a backup or config object.');
+    const format = typeof payload.format === 'string' ? payload.format : '';
+
+    if (format === 'kizzey-backup' || (!format && payload.prefs && typeof payload.prefs === 'object')) {
+      const prefs = payload.prefs && typeof payload.prefs === 'object' ? payload.prefs : {};
+      const configs = payload.configs && typeof payload.configs === 'object' ? payload.configs : {};
+      const images = payload.presetImages && typeof payload.presetImages === 'object' ? payload.presetImages : {};
+      const templates = kzPresetList(prefs.custom_rpc_template_presets);
+      const textPresets = kzPresetList(prefs.rpc_presence_presets);
+      const summary = [
+        kzCount(Object.keys(prefs).length, 'preference'),
+        kzCount(Object.keys(configs).length, 'config file'),
+        kzCount(templates.length + textPresets.length, 'preset'),
+        Object.keys(images).length ? kzCount(Object.keys(images).length, 'artwork file') : '',
+        payload.appVersion ? `Kizzey ${payload.appVersion}` : '',
+      ].filter(Boolean).join(' · ');
+      return {
+        mode: 'kizzey',
+        title: 'Import this Kizzey backup?',
+        subtitle: summary || file.name,
+        confirm: 'Import backup',
+        body: '<p class="about-copy" style="margin-top:0">Mapped look, Home, Custom RPC and media settings are merged into this server. Saved RPC configs, template presets and text presets become local saved cards; titled cards replace local cards with the same title, and untitled presets are appended.</p><p class="about-copy">Discord account and token fields, Android-only switches and MMKV data are ignored. Artwork is copied only when the bytes are present in the settings backup.</p>',
+      };
+    }
+
+    if (format === 'kizzey-preset' || (Array.isArray(payload.presets) && !payload.prefs)) {
+      const presets = Array.isArray(payload.presets) ? payload.presets : [];
+      if (!presets.length) throw new Error('That Kizzey preset pack is empty.');
+      return {
+        mode: 'kizzey',
+        title: 'Import this Kizzey preset pack?',
+        subtitle: `${kzCount(presets.length, 'preset')}${payload.appVersion ? ` · Kizzey ${payload.appVersion}` : ''}`,
+        confirm: 'Import presets',
+        body: '<p class="about-copy" style="margin-top:0">Presets are merged by title, and an imported copy replaces a local preset with the same title. Untitled presets are appended. Only public https artwork URLs can travel in a preset pack.</p>',
+      };
+    }
+
+    if (format && format !== 'kizzey-web-backup') {
+      throw new Error(`The file format "${format}" is not supported.`);
+    }
+
+    if (kzLooksPreset(payload) && !kzLooksConfig(payload)) {
+      return {
+        mode: 'kizzey',
+        title: 'Import this Kizzey preset?',
+        subtitle: payload.title || payload.name || file.name,
+        confirm: 'Import preset',
+        body: '<p class="about-copy" style="margin-top:0">The preset is saved as a local card. Public https artwork is kept.</p>',
+      };
+    }
+
+    if (kzLooksConfig(payload)) {
+      return {
+        mode: 'kizzey',
+        title: 'Import this Custom RPC config?',
+        subtitle: `${payload.name || file.name}${payload.platform ? ` · ${payload.platform}` : ''}`,
+        confirm: 'Import config',
+        body: '<p class="about-copy" style="margin-top:0">The card becomes a local saved preset. Open Gallery and look under <b>Your cards</b> to apply it. Android-local artwork paths are skipped because a stand-alone config does not carry image bytes.</p>',
+      };
+    }
+
+    const state = payload.state || payload;
+    if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('No state object was found.');
+    const summary = [
+      state.savedConfigs ? kzCount(state.savedConfigs.length, 'preset') : '',
+      state.history ? `${state.history.length} history entries` : '',
+      state.chatProfile ? `profile ${state.chatProfile.name || ''}` : '',
+      payload.exportedAt ? `exported ${new Date(payload.exportedAt).toLocaleString()}` : '',
+    ].filter(Boolean).join(' · ');
+    return {
+      mode: 'web',
+      title: 'Restore this backup?',
+      subtitle: summary || file.name,
+      confirm: 'Restore backup',
+      body: '<p class="about-copy" style="margin-top:0">Settings and community data will be merged into this server. The Discord token, gateway and server history stay untouched.</p>',
+    };
+  }
+
+  function finishKizzeyImport(info) {
+    const bits = [];
+    if (info.settings) bits.push(kzCount(info.settings, 'setting'));
+    if (info.presets) bits.push(kzCount(info.presets, 'preset'));
+    if (info.images) bits.push(kzCount(info.images, 'artwork file'));
+    const summary = [info.label || 'Kizzey import', bits.join(' · ')].filter(Boolean).join(' · ');
+    const warnings = Array.isArray(info.warnings) ? info.warnings.filter(Boolean) : [];
+    if (!warnings.length) {
+      K.toast('Kizzey import complete', [summary, info.presets ? 'Saved cards are in Gallery → Your cards.' : ''].filter(Boolean).join(' — '), 'ok');
+      return;
+    }
+    K.sheet({
+      title: 'Kizzey import complete',
+      subtitle: K.esc(summary),
+      body: `<div class="card soft" style="margin-bottom:12px">
+          <div class="card-title" style="margin-bottom:8px">Import notes</div>
+          <ul style="margin:0;padding-left:18px">${warnings.map(warning => `<li style="margin:0 0 9px;color:var(--text-dim);font-size:0.8125rem;line-height:1.5">${K.esc(warning)}</li>`).join('')}</ul>
+        </div>
+        ${info.presets ? '<p class="about-copy">Saved cards are in Gallery → Your cards.</p>' : ''}
+        <p class="field-hint">These notes are also kept in Logs.</p>
+        <div class="modal-actions"><button class="btn btn-primary" data-close-sheet>Done</button></div>`,
+    });
+  }
 
   K.actions['backup-import'] = () => {
     K.bindFilePicker(async file => {
@@ -506,29 +660,28 @@
         const text = await file.text();
         let payload;
         try { payload = JSON.parse(text); } catch { throw new Error('That file is not valid JSON.'); }
-        const state = payload.state || payload;
-        if (!state || typeof state !== 'object') throw new Error('No state object was found.');
-        const summary = [
-          state.savedConfigs ? `${state.savedConfigs.length} presets` : '',
-          state.history ? `${state.history.length} history entries` : '',
-          state.chatProfile ? `profile ${state.chatProfile.name || ''}` : '',
-          payload.exportedAt ? `exported ${new Date(payload.exportedAt).toLocaleString()}` : '',
-        ].filter(Boolean).join(' · ');
+        const preview = importPreview(payload, file);
         K.confirm({
-          title: 'Restore this backup?', subtitle: summary || file.name, confirm: 'Restore backup',
-          body: '<p class="about-copy" style="margin-top:0">Settings and community data will be merged into this server. The Discord token, gateway and server history stay untouched.</p>',
+          title: preview.title,
+          subtitle: preview.subtitle,
+          confirm: preview.confirm,
+          body: preview.body,
           onConfirm: async () => {
             try {
-              const data = await K.api('/api/import', { method: 'POST', body: payload });
+              const data = await K.api('/api/import', { method: 'POST', body: { backup: payload, fileName: file.name } });
               if (data.state) K.receiveState(data.state);
               K.applyTheme();
-              K.toast('Backup restored', 'The current session has been refreshed.', 'ok');
               K.render();
-            } catch (error) { K.toast('Restore failed', error.message, 'error'); }
+              if (preview.mode === 'web') {
+                K.toast('Backup restored', 'The current session has been refreshed.', 'ok');
+              } else {
+                finishKizzeyImport(data.import || {});
+              }
+            } catch (error) { K.toast('Import failed', error.message, 'error'); }
           },
         });
       } catch (error) {
-        K.toast('Could not read backup', error.message, 'error');
+        K.toast('Could not read file', error.message, 'error');
       }
     }, 'application/json,.json');
   };

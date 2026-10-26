@@ -60,6 +60,7 @@
       liked: liked.includes('saved-' + (preset.id || index)),
       source: 'saved',
       savedId: preset.id,
+      timestamp: preset.timestamp || null,
     }));
     const submitted = (gallery.submitted || []).map((item, index) => ({
       id: item.id,
@@ -138,18 +139,7 @@
   K.actions['gallery-use'] = async el => {
     const item = K.galleryItems().find(row => row.id === el.dataset.id);
     if (!item) return;
-    const next = Object.assign({}, K.get('custom', {}), K.clone(item.custom || {}), {
-      name: item.custom?.name || item.name,
-      timestampsStart: String(Date.now()),
-      timestampsStop: '',
-      status: K.get('settings.rpcStatus', 'online'),
-      platform: K.get('custom.platform', 'android'),
-      applicationId: K.get('custom.applicationId', ''),
-      largeUrl: item.custom?.largeUrl || '',
-      largeImg: item.custom?.largeImg || '',
-      smallUrl: item.custom?.smallUrl || '',
-      smallImg: item.custom?.smallImg || '',
-    });
+    const next = K.customFromPreset(item, item.name);
     K.setLocal('custom', next);
     await K.queuePatch({ custom: next }, 0);
     K.navigate('custom');

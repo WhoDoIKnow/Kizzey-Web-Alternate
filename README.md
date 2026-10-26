@@ -50,6 +50,48 @@ Public state, logs, API responses and state exports never include it. Use a toke
 server you control, keep the server off untrusted networks, and remember that Discord user
 tokens carry account risk.
 
+## Importing from Kizzey for Android
+
+**Backup & restore** reads the JSON files the Android app writes:
+
+- Full settings backups (`Kizzey-settings-*.json`, format `kizzey-backup`, version 2).
+- Preset packs (`Kizzey-presets-*.json`, format `kizzey-preset`, version 1).
+- Stand-alone Custom RPC configs saved by **Save config** (`RpcConfig` JSON).
+
+The importer also accepts a raw JSON array of configs or presets, or a wrapped payload from a
+script. Kizzey's own exports use the object formats above.
+
+Mapped look, Home, Custom RPC and media preferences are merged into this server. Android
+`Save config` files, full Custom RPC template presets and text presets become saved cards in the
+Gallery. A full settings backup can also carry preset artwork; those bytes are copied into
+`data/uploads` and used when a card is applied. A stand-alone config cannot carry Android-local
+images, so those paths are reported as skipped.
+
+Discord account, token, profile and Nitro fields are never imported, even when the Android backup
+was exported with account data included. Android-only controls with no browser equivalent are
+ignored, as are raw MMKV files and app-private files that are not present in the backup JSON.
+Titled imported presets merge by title; the imported copy replaces a local card with the same
+title. Untitled presets are appended, as they are in Kizzey. Imported timers keep Kizzey's meaning:
+a from-now timer restarts on apply, a duration keeps its length, and a fixed absolute date is
+applied verbatim. A single native file imports at most 300 cards and 64 artwork files; the local
+saved-card library is capped at 500. The result sheet and Logs report anything skipped, including
+Android-local image paths, malformed entries, merged duplicate titles and discarded older cards.
+
+## Checks
+
+The runtime has no dependencies, but the repository includes regression checks for the native
+import path. Node is optional and only used to exercise the browser-side actions with stubs.
+
+```bash
+python3 -m py_compile server.py
+for file in static/*.js; do node --check "$file"; done
+python3 tests/test_kizzey_import.py
+node tests/test_import_ui.js
+node tests/test_gallery_apply.js
+```
+
+The integration test runs a temporary copy of the server and does not touch `data/`.
+
 ## What is included
 
 **Presence modes**
@@ -73,7 +115,7 @@ tokens carry account risk.
 - Moments, leaderboard, Discord friends list, presence browser, profile and usage/history screens
 - KCoin wallet, shop, cosmetic equip actions and a no-payment Kizzey+ demo
 - Weather/geocoding via Open-Meteo, driving routes via OSRM
-- Local host diagnostics, plugins, bulk operations, backup/export/import and update checks
+- Local host diagnostics, plugins, bulk operations, update checks and Web/Kizzey Android backup import
 - Installable PWA shell with offline fallback for the interface
 
 ## Browser substitutions

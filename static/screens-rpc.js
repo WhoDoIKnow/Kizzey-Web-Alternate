@@ -27,6 +27,42 @@
   ];
   const PLATFORM_LABEL = { android: 'Android', ios: 'iOS', desktop: 'Desktop', web: 'Web', samsung: 'Samsung', xbox: 'Xbox', ps5: 'PlayStation' };
 
+  K.customFromPreset = function customFromPreset(preset, fallbackName = 'Preset') {
+    const source = K.clone(preset?.custom || preset || {});
+    const now = Date.now();
+    let timestampsStart = String(now);
+    let timestampsStop = '';
+    const timestamp = preset?.timestamp;
+    if (timestamp && typeof timestamp === 'object') {
+      if (timestamp.mode === 'none') {
+        timestampsStart = '';
+        timestampsStop = '';
+      } else if (timestamp.mode === 'duration') {
+        const duration = Math.max(0, Number(timestamp.durationMs) || 0);
+        timestampsStart = String(now);
+        timestampsStop = String(now + duration);
+      } else if (timestamp.mode === 'absolute') {
+        timestampsStart = timestamp.start ? String(timestamp.start) : '';
+        timestampsStop = timestamp.stop ? String(timestamp.stop) : '';
+      } else if (timestamp.mode === 'since_apply') {
+        timestampsStart = String(now);
+        timestampsStop = '';
+      }
+    }
+    return Object.assign({}, K.get('custom', {}), source, {
+      name: source.name || preset?.name || fallbackName,
+      timestampsStart,
+      timestampsStop,
+      status: source.status || K.get('settings.rpcStatus', 'online'),
+      platform: source.platform || K.get('custom.platform', 'android'),
+      applicationId: source.applicationId || K.get('custom.applicationId', ''),
+      largeUrl: source.largeUrl || '',
+      largeImg: source.largeImg || '',
+      smallUrl: source.smallUrl || '',
+      smallImg: source.smallImg || '',
+    });
+  };
+
   K.presetLibrary = [
     {
       name: 'Midnight listening',
@@ -222,19 +258,7 @@
     if (id) preset = (K.get('savedConfigs', []) || []).find(p => p.id === id);
     else preset = K.presetLibrary[index];
     if (!preset) return;
-    const source = preset.custom || preset;
-    const next = Object.assign({}, K.get('custom', {}), K.clone(source), {
-      timestampsStart: String(Date.now()),
-      timestampsStop: '',
-      status: K.get('settings.rpcStatus', 'online'),
-      platform: K.get('custom.platform', 'android'),
-      applicationId: K.get('custom.applicationId', ''),
-    });
-    // Never carry another saved preset's remote assets across.
-    next.largeUrl = source.largeUrl || '';
-    next.largeImg = source.largeImg || '';
-    next.smallUrl = source.smallUrl || '';
-    next.smallImg = source.smallImg || '';
+    const next = K.customFromPreset(preset, preset.name);
     K.setLocal('custom', next);
     await K.queuePatch({ custom: next }, 0);
     K.navigate('custom');
