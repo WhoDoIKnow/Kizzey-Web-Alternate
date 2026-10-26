@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+data/state.json
+data/secret.json
+data/history.json
+data/kizzey.log
+data/uploads/
+data/tmp/
+.DS_Store
