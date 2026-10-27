@@ -50,6 +50,52 @@ Public state, logs, API responses and state exports never include it. Use a toke
 server you control, keep the server off untrusted networks, and remember that Discord user
 tokens carry account risk.
 
+### Multiple Discord accounts
+
+Open **Settings → Discord accounts**, or choose the same item in the drawer, to save and switch
+identities. Up to eight accounts are kept in a private `accounts` array in `data/secret.json`;
+the legacy `token` field remains as a compatibility copy of the active token. The browser only
+receives account IDs, usernames, display names, avatars, timestamps and boolean token status —
+never a token, token fragment or hint.
+
+One gateway and one live presence run at a time. Switching validates the target token, stops the
+old presence and socket, then opens the target session. Replacing the token of the live account
+restarts its gateway too. Removing the active account falls back to the next saved account that
+has a token; if none remains, the server has no active session. **Remove all accounts** clears
+every token and pauses account-backed relays. Tokens remain server-only, so each saved identity
+can be switched from any browser that can reach this server.
+
+This is sequential account switching, not simultaneous Rich Presence for several accounts. The
+Android app's **Multiple Account RPC** concerns several RPC sources; Kizzey Web instead offers
+saved-account switching plus the message forwarder below.
+
+## Message mirror
+
+**Settings → Message mirror** forwards new messages from a source channel to a destination
+channel. Each rule selects a source account, source channel ID, destination account and
+destination channel ID, and can include or skip your own messages, bots/webhooks, attachment
+links and embed links. Copy numeric channel IDs from Discord with Developer Mode enabled.
+
+The server is a poller, not a gateway listener. A new rule records the newest source message as
+its starting cursor, so existing history is never backfilled. Only messages after that cursor
+are copied. The cursor and delivery counters persist across restarts. At most 30 messages are
+processed per rule per check, posts are paced at roughly one per second, and Discord 429
+responses set a retry cooldown. Background checks need both the global auto-mirror switch and the
+individual rule enabled. **Run now** bypasses both pause switches and the retry cooldown so an
+operator can test a rule deliberately.
+
+Forwarded posts include an author label, message text, attachment URLs, embed URLs and sticker
+names, use `allowed_mentions: {parse: []}` so text cannot ping anyone, and end with an invisible
+`U+2063` marker. System messages, bots and the source account's own messages are skipped by
+default; the marker prevents a relay from forwarding its own output again. Edits, deletes,
+reactions, replies, threads and voice state are not synchronised.
+
+The limits are 20 rules, a 5–300 second interval (default 12), and eight saved accounts. Rules
+store account IDs, channel IDs, labels, counters and the last message ID — never tokens. A web
+backup can carry mirror configuration, but every imported rule is restored paused until it is
+reviewed. Forwarding with user tokens is self-bot behaviour and may conflict with Discord's
+terms; use relays only in channels you control.
+
 ## Importing from Kizzey for Android
 
 **Backup & restore** reads the JSON files the Android app writes:
@@ -86,11 +132,15 @@ import path. Node is optional and only used to exercise the browser-side actions
 python3 -m py_compile server.py
 for file in static/*.js; do node --check "$file"; done
 python3 tests/test_kizzey_import.py
+python3 tests/test_accounts_mirror.py
 node tests/test_import_ui.js
 node tests/test_gallery_apply.js
+node tests/test_accounts_ui.js
 ```
 
-The integration test runs a temporary copy of the server and does not touch `data/`.
+The Python integration tests boot temporary server state and replace Discord with deterministic
+fakes, so they do not touch `data/` or use a real token. The browser tests run the screen code
+against a stubbed Material runtime.
 
 ## What is included
 
@@ -105,6 +155,8 @@ The integration test runs a temporary copy of the server and does not touch `dat
 - Start, stop, refresh, preview, status display type and status-line rolling
 - Persistent history, server logs and usage counters
 - Saved presets, a gallery with local submissions, and automation schedules
+- Up to eight saved Discord accounts with server-side token isolation and active fallback
+- A real, rate-limited message mirror between channels and saved accounts
 - Optional album-art backdrop and artwork-sampled accent colour in Display settings
 - Custom CSS variables, text scaling, themes, AMOLED mode and Material You-style accents
 
@@ -133,6 +185,7 @@ are deliberate and shown honestly in the interface:
 | Native chat/voice backend | Local persisted rooms and voice state; microphone test has no live audio relay |
 | Android overlays, tiles, Android Auto | UI controls and honest preview/state analogues |
 | APK/system installer | PWA "Add to Home screen" |
+| Simultaneous multi-account RPC | One live gateway, saved-account switching and a message mirror |
 | Stripe checkout | Local Kizzey+ and KCoin demo mechanisms |
 
 Discord's relationship endpoint returns friends but not their live activities. Live friend
@@ -151,8 +204,8 @@ and foreground-app detection cannot be reproduced from a regular web page.
 State is JSON under `data/`:
 
 ```text
-data/state.json     settings, presets, chat, history, wallet, UI state
-data/secret.json    Discord token only
+data/state.json     settings, presets, mirror rules, chat, history, wallet, UI state
+data/secret.json    private Discord tokens and active-account ID
 data/history.json   presence-history mirror
 data/kizzey.log     server event log
 data/uploads/       local chat images, avatars and screen captures
@@ -172,8 +225,10 @@ created automatically. Removing `secret.json` signs the server out of Discord.
 
 The frontend uses JSON endpoints and an SSE stream. The main groups are:
 
-- `GET /api/state`, `GET /api/events`, `POST /api/patch`
+- `GET /api/state`, `/api/events`, `/api/accounts`, `/api/mirror`; `POST /api/patch`
 - `POST /api/auth/token`, `/api/auth/logout`, `/api/account/refresh`, `/api/gateway/reconnect`
+- `POST /api/accounts/{add,switch,remove,remove-all}`
+- `POST /api/mirror/settings`, `/api/mirror/rules`, `/api/mirror/rules/{toggle,delete}`, `/api/mirror/run`
 - `POST /api/rpc/{start,stop,refresh,preview}`
 - `GET /api/weather`, `/api/geocode`, `/api/route`, `/api/friends`, `/api/hoststats`, `/api/update`
 - `POST /api/upload`, `/api/image`, `/api/ocr`, `/api/chat/*`, `/api/voice/*`, `/api/moments/*`

@@ -69,6 +69,14 @@
       const account = K.get('account');
       const status = K.discordStatus();
       const settings = K.get('settings', {});
+      const accounts = K.get('accounts', []);
+      const mirror = K.get('mirror', {});
+      const mirrorRules = Array.isArray(mirror?.rules) ? mirror.rules : [];
+      const enabledRules = mirrorRules.filter(rule => rule?.enabled).length;
+      const discordGroup = K.settingGroup('Discord', [
+        tappable('Discord accounts', accounts.length ? `${accounts.length} saved · ${account ? h(account.displayName) : 'no active account'}` : 'Add a token and switch identities safely', { route: 'accounts', icon: 'users' }),
+        tappable('Message mirror', mirrorRules.length ? `${enabledRules} of ${mirrorRules.length} relays enabled${mirror.enabled ? '' : ' · auto paused'}` : 'Forward new messages between channels', { route: 'mirror', icon: 'repeat' }),
+      ].join(''));
       const pieces = [
         tappable('RPC Settings', 'Connection, status and presence defaults', { route: 'rpc-settings', icon: 'sliders-horizontal' }),
         tappable('Display', 'Theme, accent, motion and home layout', { route: 'display', icon: 'palette' }),
@@ -83,9 +91,10 @@
       return page('Settings', 'One place for how Kizzey behaves.', `
         <div class="account-hero">
           ${K.avatar({ name: account?.displayName || K.get('chatProfile.name', 'You'), url: account?.avatarUrl || K.get('chatProfile.avatar', ''), cls: '', style: 'width:54px;height:54px;font-size:1.125rem' })}
-          <div style="flex:1;min-width:0"><div class="account-name" style="font-size:1.1875rem">${h(account?.displayName || K.get('chatProfile.name', 'You'))}</div><div class="account-handle">${account ? '@' + h(account.username || '') : 'Kizzey Web on this server'}</div><div class="account-meta" style="margin-top:5px"><span class="badge ${status.color === 'good' ? 'good' : 'plain'}">${h(status.text)}</span><span class="pill">${h(settings.theme || 'dark')}</span></div></div>
-          ${account ? `<button class="icon-btn" data-action="logout" aria-label="Sign out">${K.icon('logout', 'sm')}</button>` : `<button class="btn btn-primary btn-sm" data-action="retry-login">Connect</button>`}
+          <div style="flex:1;min-width:0"><div class="account-name" style="font-size:1.1875rem">${h(account?.displayName || K.get('chatProfile.name', 'You'))}</div><div class="account-handle">${account ? '@' + h(account.username || '') : 'Kizzey Web on this server'}</div><div class="account-meta" style="margin-top:5px"><span class="badge ${status.color === 'good' ? 'good' : 'plain'}">${h(status.text)}</span><span class="pill">${h(settings.theme || 'dark')}</span>${accounts.length ? `<span class="pill">${accounts.length} account${accounts.length === 1 ? '' : 's'}</span>` : ''}</div></div>
+          ${account ? `<button class="icon-btn" data-route="accounts" aria-label="Manage accounts">${K.icon('users', 'sm')}</button><button class="icon-btn" data-action="logout" aria-label="Sign out">${K.icon('logout', 'sm')}</button>` : `<button class="btn btn-primary btn-sm" data-action="retry-login">Connect</button>`}
         </div>
+        ${discordGroup}
         ${K.settingGroup('General', pieces)}
         ${group('Notifications', toggle('Notifications', 'Ask the browser for permission and show chat updates while the tab is in the background.', 'settings.notifications', 'bell') + toggle('Sound', 'Play a short notification sound with chat notifications.', 'settings.notificationSound', 'volume'))}
         ${group('Connection', toggle('Offline mode', 'Pause update checks, weather/routes and new artwork resolution. The Discord gateway keeps running.', 'settings.offlineMode', 'wifi-off') + toggle('Reconnect notices', 'Show a toast while the server retries the Discord gateway after a drop.', 'settings.reconnect', 'refresh') + tappable('Gateway diagnostics', K.gatewayConnected() ? `Connected · ${K.get('gateway.latency') != null ? K.get('gateway.latency') + ' ms' : 'latency unavailable'}` : status.text, { route: 'logs', icon: 'wifi' }))}

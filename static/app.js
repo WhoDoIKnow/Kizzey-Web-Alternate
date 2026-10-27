@@ -11,6 +11,8 @@
     home: 'Home',
     welcome: 'Welcome',
     profile: 'Profile',
+    accounts: 'Discord accounts',
+    mirror: 'Message mirror',
     chat: 'Kizzey Chat',
     voice: 'Voice',
     moments: 'Moments',
@@ -460,9 +462,13 @@
   K.actions['retry-login'] = () => K.loginSheet();
 
   K.actions['logout'] = function () {
+    const count = Array.isArray(K.get('accounts', [])) ? K.get('accounts', []).length : 0;
+    const fallback = count > 1;
     K.confirm({
-      title: 'Sign out of Discord?',
-      subtitle: 'Presence updates stop and the saved token is removed from this server.',
+      title: 'Sign out this account?',
+      subtitle: fallback
+        ? 'The active token is removed and Kizzey switches to the next saved account. Remove all accounts from Discord accounts to leave every session.'
+        : 'Presence updates stop and the active token is removed from this server.',
       confirm: 'Sign out',
       danger: true,
       onConfirm: async () => {
@@ -470,7 +476,12 @@
           await K.flush();
           const data = await K.api('/api/auth/logout', { method: 'POST', body: {} });
           K.receiveState(data.state);
-          K.toast('Signed out', 'Your token was removed.', 'ok');
+          const next = K.get('account');
+          K.toast(
+            next ? 'Switched account' : 'Signed out',
+            next ? `Kizzey is now using ${next.displayName || 'another saved account'}.` : 'Your token was removed.',
+            'ok'
+          );
           K.render();
         } catch (error) { K.toast('Could not sign out', error.message, 'error'); }
       },
@@ -1115,6 +1126,8 @@
       items: [
         { route: 'home', icon: 'home', title: 'Home', sub: 'Your stage, at a glance' },
         { route: 'profile', icon: 'user', title: 'Your profile', sub: 'How you appear to the community' },
+        { route: 'accounts', icon: 'users', title: 'Discord accounts', sub: 'Switch saved identities on this server' },
+        { route: 'mirror', icon: 'repeat', title: 'Message mirror', sub: 'Forward new messages between channels' },
         { route: 'chat', icon: 'message-circle', title: 'Kizzey Chat', sub: 'Talk with the community', badge: 'LIVE', badgeClass: 'good' },
         { route: 'moments', icon: 'sparkles', title: 'Moments', sub: 'Small updates, shared' },
         { route: 'leaderboard', icon: 'trophy', title: 'Leaderboard', sub: 'Top members and supporters' },
@@ -1185,6 +1198,7 @@
       ? `<div class="drawer-profile">
           ${K.avatar({ name: account.displayName, url: account.avatarUrl, cls: '' })}
           <div style="flex:1;min-width:0"><div class="dp-name ellipsis">${K.esc(account.displayName)}</div><div class="dp-sub"><span class="dot ${status.color === 'good' ? '' : 'off'}" style="width:5px;height:5px"></span>${K.esc(account.username ? '@' + account.username : 'Discord')}</div></div>
+          <button class="icon-btn" data-route="accounts" title="Manage accounts">${K.icon('users', 'sm')}</button>
           <button class="icon-btn" data-action="logout" title="Sign out">${K.icon('logout', 'sm')}</button>
         </div>`
       : `<button class="drawer-profile" data-action="retry-login" style="width:100%;text-align:left;border:1px solid var(--hairline)">

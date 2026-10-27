@@ -1,10 +1,10 @@
 /* Kizzey Web — installable shell, network-first for live files */
-const CACHE = 'kizzey-shell-v2';
+const CACHE = 'kizzey-shell-v3';
 const SHELL = [
   '/', '/styles.css', '/core.js', '/screens-rpc.js', '/screens-tools.js',
   '/screens-tools2.js', '/screens-social.js', '/screens-social2.js',
-  '/screens-settings.js', '/app.js', '/icon.png', '/icon-512.png',
-  '/icon-fg-512.png', '/manifest.webmanifest'
+  '/screens-settings.js', '/screens-accounts.js', '/app.js', '/icon.png',
+  '/icon-512.png', '/icon-fg-512.png', '/manifest.webmanifest'
 ];
 
 self.addEventListener('install', event => {

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -72,6 +73,12 @@ KIZZEY_REPO = "https://codeberg.org/UnpackedX/Kizzey"
 
 MAX_BODY = 64 * 1024 * 1024
 MAX_CHAT = 250
+ACCOUNT_LIMIT = 8
+MIRROR_RULE_LIMIT = 20
+MIRROR_SEEN_LIMIT = 180
+MIRROR_MARK = "\u2063"
+MIRROR_DEFAULT_INTERVAL = 12
+MIRROR_MAX_MESSAGES = 30
 SERVER_STARTED = time.monotonic()
 
 MIME_OVERRIDES = {
@@ -190,15 +197,28 @@ HOST_DEVICE = read_device_info()
 
 def _scrub(text: str) -> str:
     text = str(text)
-    token = ""
+    tokens: list[str] = []
     try:
         if STORE is not None:
-            token = STORE.secret.get("token", "")
+            if STORE.secret.get("token"):
+                tokens.append(str(STORE.secret["token"]))
+            for account in STORE.secret.get("accounts", []) or []:
+                if isinstance(account, dict) and account.get("token"):
+                    tokens.append(str(account["token"]))
     except Exception:
         pass
-    if token and len(token) > 8:
-        text = text.replace(token, "••••••••")
+    for token in sorted(set(tokens), key=len, reverse=True):
+        if len(token) > 8:
+            text = text.replace(token, "••••••••")
     text = re.sub(r"[\w-]{20,}\.[\w-]{5,}\.[\w-]{20,}", "••••••••", text)
+    return text
+
+
+def safe_auth_error(message: str, token: str = "") -> str:
+    text = _scrub(message)
+    submitted = clean_discord_token(token)
+    if submitted:
+        text = text.replace(submitted, "••••••••")
     return text
 
 
@@ -568,6 +588,13 @@ def default_state() -> dict:
             "capturedAt": None,
         },
         "bulk": {"channel": "", "query": "", "limit": 100},
+        "mirror": {
+            "enabled": False,
+            "interval": MIRROR_DEFAULT_INTERVAL,
+            "rules": [],
+            "lastRunAt": None,
+            "lastError": "",
+        },
         "automation": {
             "rules": [
                 {
@@ -633,6 +660,235 @@ def default_state() -> dict:
     }
 
 
+def clean_discord_token(token: str) -> str:
+    token = str(token or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token
+
+
+def _account_public(account: dict) -> dict:
+    user = account.get("user") if isinstance(account.get("user"), dict) else {}
+    display = str(user.get("displayName") or user.get("globalName") or user.get("username") or "Discord account")
+    return {
+        "id": str(account.get("id") or ""),
+        "userId": str(user.get("id") or ""),
+        "username": str(user.get("username") or ""),
+        "displayName": display,
+        "avatar": str(user.get("avatar") or ""),
+        "avatarUrl": str(user.get("avatarUrl") or ""),
+        "tokenSet": bool(account.get("token")),
+        "needsAuth": bool(account.get("needsAuth")),
+        "authError": _scrub(str(account.get("authError") or ""))[:220],
+        "addedAt": account.get("addedAt"),
+        "lastUsedAt": account.get("lastUsedAt"),
+    }
+
+
+def _mirror_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+    return default
+
+
+def _snowflake_text(value, limit: int = 32) -> str:
+    text = str(value or "").strip()
+    return text if text.isdigit() and len(text) <= limit else ""
+
+
+def _nonneg_int(value, default: int = 0, cap: int = 1_000_000_000) -> int:
+    try:
+        number = int(float(value))
+    except Exception:
+        return default
+    return max(0, min(cap, number))
+
+
+def _default_mirror_state() -> dict:
+    return {
+        "enabled": False,
+        "interval": MIRROR_DEFAULT_INTERVAL,
+        "rules": [],
+        "lastRunAt": None,
+        "lastError": "",
+    }
+
+
+def normalize_mirror_rule(raw: dict, *, fresh: bool = False) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    rule_id = str(raw.get("id") or "").strip()
+    if not rule_id.startswith("mirror_") or len(rule_id) > 40:
+        rule_id = "mirror_" + uuid.uuid4().hex[:12]
+    source_account = str(raw.get("sourceAccountId") or "").strip()[:64]
+    dest_account = str(raw.get("destAccountId") or "").strip()[:64]
+    source_channel = _snowflake_text(raw.get("sourceChannel"))
+    dest_channel = _snowflake_text(raw.get("destChannel"))
+    if not source_account or not dest_account or not source_channel or not dest_channel:
+        return None
+    if source_channel == dest_channel:
+        return None
+    now = now_ms()
+    name = str(raw.get("name") or "").strip()[:80]
+    source_label = str(raw.get("sourceLabel") or "").strip()[:120]
+    dest_label = str(raw.get("destLabel") or "").strip()[:120]
+    rule = {
+        "id": rule_id,
+        "name": name or "Message relay",
+        "enabled": _mirror_bool(raw.get("enabled"), True),
+        "sourceAccountId": source_account,
+        "sourceChannel": source_channel,
+        "sourceLabel": source_label or ("#" + source_channel),
+        "destAccountId": dest_account,
+        "destChannel": dest_channel,
+        "destLabel": dest_label or ("#" + dest_channel),
+        "includeOwn": _mirror_bool(raw.get("includeOwn"), False),
+        "includeBots": _mirror_bool(raw.get("includeBots"), False),
+        "includeAttachments": _mirror_bool(raw.get("includeAttachments"), True),
+        "includeEmbeds": _mirror_bool(raw.get("includeEmbeds"), True),
+        "primed": _mirror_bool(raw.get("primed"), False),
+        "lastSeenId": _snowflake_text(raw.get("lastSeenId")),
+        "lastRunAt": raw.get("lastRunAt") if isinstance(raw.get("lastRunAt"), (int, float)) else None,
+        "lastMirroredAt": raw.get("lastMirroredAt") if isinstance(raw.get("lastMirroredAt"), (int, float)) else None,
+        "lastError": str(raw.get("lastError") or "")[:260],
+        "mirrored": _nonneg_int(raw.get("mirrored")),
+        "skipped": _nonneg_int(raw.get("skipped")),
+        "failures": _nonneg_int(raw.get("failures")),
+        "retryAfter": _nonneg_int(raw.get("retryAfter")),
+        "createdAt": raw.get("createdAt") if isinstance(raw.get("createdAt"), (int, float)) else now,
+        "updatedAt": raw.get("updatedAt") if isinstance(raw.get("updatedAt"), (int, float)) else now,
+    }
+    if fresh:
+        rule["primed"] = False
+        rule["lastSeenId"] = ""
+        rule["lastError"] = ""
+        rule["mirrored"] = 0
+        rule["skipped"] = 0
+        rule["failures"] = 0
+        rule["retryAfter"] = 0
+        rule["lastMirroredAt"] = None
+        rule["createdAt"] = now
+    return rule
+
+
+def normalize_mirror_state(raw) -> dict:
+    state = _default_mirror_state()
+    if not isinstance(raw, dict):
+        return state
+    state["enabled"] = _mirror_bool(raw.get("enabled"), False)
+    try:
+        state["interval"] = int(clamp(int(raw.get("interval") or MIRROR_DEFAULT_INTERVAL), 5, 300))
+    except Exception:
+        state["interval"] = MIRROR_DEFAULT_INTERVAL
+    state["lastRunAt"] = raw.get("lastRunAt") if isinstance(raw.get("lastRunAt"), (int, float)) else None
+    state["lastError"] = str(raw.get("lastError") or "")[:260]
+    rules = []
+    seen = set()
+    for item in (raw.get("rules") if isinstance(raw.get("rules"), list) else [])[:MIRROR_RULE_LIMIT]:
+        rule = normalize_mirror_rule(item)
+        if not rule or rule["id"] in seen:
+            continue
+        rules.append(rule)
+        seen.add(rule["id"])
+    state["rules"] = rules
+    return state
+
+
+def prepare_imported_mirror(value) -> tuple[dict, list[str]]:
+    """Imported relays never run until the operator reviews them."""
+    mirror = normalize_mirror_state(value)
+    raw_rules = value.get("rules") if isinstance(value, dict) else []
+    raw_count = len(raw_rules) if isinstance(raw_rules, list) else 0
+    mirror["enabled"] = False
+    mirror["lastError"] = ""
+    mirror["lastRunAt"] = None
+    for rule in mirror.get("rules", []):
+        rule["enabled"] = False
+        rule["lastError"] = "Imported paused. Review the relay, then enable it."
+    notes = []
+    if mirror.get("rules"):
+        count = len(mirror["rules"])
+        notes.append(
+            f"{count} message mirror rule{'s were' if count != 1 else ' was'} imported paused."
+        )
+    dropped = max(0, raw_count - len(mirror.get("rules", [])))
+    if dropped:
+        notes.append(f"{dropped} malformed message mirror rule{'s were' if dropped != 1 else ' was'} dropped.")
+    return mirror, notes
+
+
+def _coerce_account_record(raw: dict, fallback_token: str = "", fallback_at=None) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    user = raw.get("user") if isinstance(raw.get("user"), dict) else {}
+    flat = {
+        "id": raw.get("userId") or raw.get("id_") or "",
+        "username": raw.get("username") or "",
+        "globalName": raw.get("globalName") or "",
+        "displayName": raw.get("displayName") or "",
+        "avatar": raw.get("avatar") or "",
+        "avatarUrl": raw.get("avatarUrl") or "",
+    }
+    merged_user = dict(user)
+    for key, value in flat.items():
+        if value and not merged_user.get(key):
+            merged_user[key] = value
+    token = clean_discord_token(raw.get("token") or fallback_token)
+    uid = str(merged_user.get("id") or raw.get("userId") or "")
+    username = str(merged_user.get("username") or "")
+    display = str(
+        merged_user.get("displayName")
+        or merged_user.get("globalName")
+        or username
+        or "Discord account"
+    )
+    avatar = str(merged_user.get("avatar") or "")
+    avatar_url = str(merged_user.get("avatarUrl") or "")
+    if not avatar_url and uid:
+        if avatar:
+            ext = "gif" if avatar.startswith("a_") else "png"
+            avatar_url = f"https://cdn.discordapp.com/avatars/{uid}/{avatar}.{ext}?size=128"
+        else:
+            try:
+                index = (int(uid) >> 22) % 6
+            except Exception:
+                index = 0
+            avatar_url = f"https://cdn.discordapp.com/embed/avatars/{index}.png"
+    merged_user.update({
+        "id": uid,
+        "username": username,
+        "globalName": str(merged_user.get("globalName") or ""),
+        "displayName": display,
+        "avatar": avatar,
+        "avatarUrl": avatar_url,
+        "email": "",
+    })
+    if not token and not uid and not username:
+        return None
+    account_id = str(raw.get("id") or "")
+    if not account_id.startswith("acct_") or len(account_id) < 8:
+        account_id = "acct_" + uuid.uuid4().hex[:12]
+    now = now_ms()
+    return {
+        "id": account_id,
+        "token": token,
+        "tokenSetAt": raw.get("tokenSetAt") if token else None,
+        "addedAt": raw.get("addedAt") or fallback_at or now,
+        "lastUsedAt": raw.get("lastUsedAt"),
+        "needsAuth": not bool(token),
+        "authError": str(raw.get("authError") or "")[:220],
+        "user": merged_user,
+    }
+
+
 class Store:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -647,6 +903,10 @@ class Store:
     def load(self) -> None:
         self.state = self._read_json(STATE_FILE, default_state())
         self.secret = self._read_json(SECRET_FILE, {"token": "", "tokenSetAt": None})
+        if not isinstance(self.state, dict):
+            self.state = default_state()
+        if not isinstance(self.secret, dict):
+            self.secret = {"token": "", "tokenSetAt": None}
         self.state["host"] = HOST_DEVICE
         self.state["device"] = HOST_DEVICE
         self.history = self._read_json(HISTORY_FILE, [])
@@ -664,8 +924,10 @@ class Store:
         self.state.setdefault("gateway", {"connected": False, "state": "offline"})
         self.state["gateway"]["connected"] = False
         self.state["gateway"]["state"] = "offline"
+        self.state["mirror"] = normalize_mirror_state(self.state.get("mirror"))
         self.state["version"] = VERSION
         self.state["logs"] = []
+        self._normalize_accounts()
         self.save()
 
     @staticmethod
@@ -695,6 +957,293 @@ class Store:
             except OSError:
                 pass
             self._atomic_write(HISTORY_FILE, self.history[-300:])
+
+    # -- accounts --------------------------------------------------------
+    def _normalize_accounts(self) -> None:
+        """Migrate the single-token file into a private account list."""
+        with self.lock:
+            raw_accounts = self.secret.get("accounts")
+            if not isinstance(raw_accounts, list):
+                raw_accounts = []
+            accounts: list[dict] = []
+            by_user: dict[str, dict] = {}
+            by_token: dict[str, dict] = {}
+            for raw in raw_accounts:
+                account = _coerce_account_record(raw)
+                if not account:
+                    continue
+                user_id = str(account["user"].get("id") or "")
+                token = str(account.get("token") or "")
+                existing = by_user.get(user_id) if user_id else None
+                if not existing and token:
+                    existing = by_token.get(token)
+                if existing:
+                    if token:
+                        existing["token"] = token
+                        existing["tokenSetAt"] = account.get("tokenSetAt") or existing.get("tokenSetAt")
+                        existing["needsAuth"] = False
+                        existing["authError"] = ""
+                        by_token[token] = existing
+                    if account.get("lastUsedAt"):
+                        existing["lastUsedAt"] = account.get("lastUsedAt")
+                    existing["user"].update({k: v for k, v in account["user"].items() if v})
+                    continue
+                accounts.append(account)
+                if user_id:
+                    by_user[user_id] = account
+                if token:
+                    by_token[token] = account
+
+            legacy_token = clean_discord_token(self.secret.get("token") or "")
+            legacy_user = self.state.get("account") if isinstance(self.state.get("account"), dict) else {}
+            if legacy_token and legacy_token not in by_token:
+                legacy_id = str(legacy_user.get("id") or "")
+                match = by_user.get(legacy_id) if legacy_id else None
+                if match:
+                    match["token"] = legacy_token
+                    match["tokenSetAt"] = self.secret.get("tokenSetAt") or now_ms()
+                    match["needsAuth"] = False
+                    match["authError"] = ""
+                    by_token[legacy_token] = match
+                else:
+                    account = _coerce_account_record(
+                        {
+                            "token": legacy_token,
+                            "tokenSetAt": self.secret.get("tokenSetAt"),
+                            "addedAt": self.secret.get("tokenSetAt") or now_ms(),
+                            "user": legacy_user,
+                        }
+                    )
+                    if account:
+                        accounts.append(account)
+                        by_token[legacy_token] = account
+                        if account["user"].get("id"):
+                            by_user[str(account["user"]["id"])] = account
+
+            if len(accounts) > ACCOUNT_LIMIT:
+                active_hint = str(self.secret.get("activeId") or "")
+                keep = [
+                    account for account in accounts[:ACCOUNT_LIMIT]
+                ]
+                if active_hint:
+                    active_record = next((account for account in accounts if account["id"] == active_hint), None)
+                    if active_record and active_record not in keep:
+                        keep[-1] = active_record
+                accounts = keep
+
+            active_id = str(self.secret.get("activeId") or "")
+            active = next((account for account in accounts if account["id"] == active_id), None)
+            if not active and legacy_token:
+                active = by_token.get(legacy_token)
+            if not active or not clean_discord_token(active.get("token")):
+                active = next(
+                    (account for account in accounts if clean_discord_token(account.get("token"))),
+                    None,
+                )
+            if active:
+                self.secret["activeId"] = active["id"]
+                self.secret["token"] = active.get("token") or ""
+                self.secret["tokenSetAt"] = active.get("tokenSetAt")
+                if active.get("token"):
+                    self.secret["authError"] = ""
+                    self.state["account"] = copy.deepcopy(active["user"])
+                else:
+                    self.state["account"] = None
+            else:
+                self.secret["activeId"] = ""
+                self.secret["token"] = ""
+                self.secret["tokenSetAt"] = None
+                self.state["account"] = None
+            self.secret["accounts"] = accounts
+            self.state["gateway"] = self.state.get("gateway") or {}
+            self.state["gateway"]["tokenSet"] = bool(self.secret.get("token"))
+            self.secret.setdefault("authError", "")
+
+    def public_accounts(self) -> list[dict]:
+        with self.lock:
+            return [_account_public(account) for account in self.secret.get("accounts", []) or []]
+
+    def active_account_id(self) -> str:
+        with self.lock:
+            active_id = str(self.secret.get("activeId") or "")
+            for account in self.secret.get("accounts", []) or []:
+                if account.get("id") == active_id and clean_discord_token(account.get("token")):
+                    return active_id
+            return ""
+
+    def active_account(self, include_token: bool = False) -> dict | None:
+        with self.lock:
+            active_id = str(self.secret.get("activeId") or "")
+            for account in self.secret.get("accounts", []) or []:
+                if account.get("id") == active_id:
+                    result = copy.deepcopy(account)
+                    if not include_token:
+                        result.pop("token", None)
+                    return result
+            return None
+
+    def account_by_id(self, account_id: str, include_token: bool = False) -> dict | None:
+        account_id = str(account_id or "")
+        with self.lock:
+            for account in self.secret.get("accounts", []) or []:
+                if account.get("id") == account_id:
+                    result = copy.deepcopy(account)
+                    if not include_token:
+                        result.pop("token", None)
+                    return result
+            return None
+
+    def active_token(self) -> str:
+        with self.lock:
+            account = self.active_account(include_token=True)
+            if account and clean_discord_token(account.get("token")):
+                return clean_discord_token(account.get("token"))
+            # A designated but credential-less account must never fall through
+            # to the legacy compatibility token of a different identity.
+            if str(self.secret.get("activeId") or ""):
+                return ""
+            return clean_discord_token(self.secret.get("token") or "")
+
+    def upsert_account(self, token: str, user: dict) -> tuple[dict, bool]:
+        token = clean_discord_token(token)
+        if not token:
+            raise ValueError("Paste a Discord account token first.")
+        user = dict(user or {})
+        user_id = str(user.get("id") or "")
+        with self.lock:
+            accounts = self.secret.setdefault("accounts", [])
+            existing = None
+            for account in accounts:
+                if user_id and str((account.get("user") or {}).get("id") or "") == user_id:
+                    existing = account
+                    break
+                if clean_discord_token(account.get("token")) == token:
+                    existing = account
+                    break
+            if existing is None:
+                if len(accounts) >= ACCOUNT_LIMIT:
+                    raise ValueError(f"You can save up to {ACCOUNT_LIMIT} Discord accounts.")
+                existing = _coerce_account_record({"token": token, "user": user})
+                if existing is None:
+                    raise ValueError("Discord did not return a usable account.")
+                accounts.append(existing)
+                created = True
+            else:
+                created = False
+                old_token = clean_discord_token(existing.get("token"))
+                existing["token"] = token
+                if old_token != token or not existing.get("tokenSetAt"):
+                    existing["tokenSetAt"] = now_ms()
+                existing["user"] = {**(existing.get("user") or {}), **user, "email": ""}
+                existing["needsAuth"] = False
+                existing["authError"] = ""
+            self.save()
+            return copy.deepcopy(existing), created
+
+    def activate_account(self, account_id: str, user: dict | None = None) -> dict:
+        with self.lock:
+            account = next(
+                (row for row in self.secret.get("accounts", []) or [] if row.get("id") == account_id),
+                None,
+            )
+            if not account or not clean_discord_token(account.get("token")):
+                raise ValueError("That account has no saved token. Add it again.")
+            if user:
+                account["user"] = {**(account.get("user") or {}), **user, "email": ""}
+            account["needsAuth"] = False
+            account["authError"] = ""
+            account["lastUsedAt"] = now_ms()
+            self.secret["activeId"] = account["id"]
+            self.secret["token"] = clean_discord_token(account.get("token"))
+            self.secret["tokenSetAt"] = account.get("tokenSetAt")
+            self.secret["authError"] = ""
+            self.state["account"] = copy.deepcopy(account.get("user") or {})
+            gateway = self.state.setdefault("gateway", {})
+            gateway["tokenSet"] = True
+            gateway["error"] = ""
+            self.save()
+            return copy.deepcopy(account)
+
+    def mark_account_auth_failed(self, account_id: str, message: str) -> None:
+        with self.lock:
+            account = next(
+                (row for row in self.secret.get("accounts", []) or [] if row.get("id") == account_id),
+                None,
+            )
+            safe = safe_auth_error(
+                message or "Discord rejected this token.",
+                clean_discord_token((account or {}).get("token")),
+            )[:220]
+            if account:
+                account["token"] = ""
+                account["tokenSetAt"] = None
+                account["needsAuth"] = True
+                account["authError"] = safe
+            if str(self.secret.get("activeId") or "") == account_id:
+                self.secret["token"] = ""
+                self.secret["tokenSetAt"] = None
+                self.secret["activeId"] = ""
+                self.secret["authError"] = safe
+                self.state["account"] = None
+                gateway = self.state.setdefault("gateway", {})
+                gateway["tokenSet"] = False
+                gateway["error"] = safe
+            self.save()
+
+    def remove_account(self, account_id: str) -> dict | None:
+        with self.lock:
+            accounts = self.secret.get("accounts", []) or []
+            removed = next((row for row in accounts if row.get("id") == account_id), None)
+            if not removed:
+                return None
+            was_active = str(self.secret.get("activeId") or "") == account_id
+            self.secret["accounts"] = [row for row in accounts if row.get("id") != account_id]
+            rules = self.state.setdefault("mirror", {}).get("rules", []) or []
+            for rule in rules:
+                if account_id in (rule.get("sourceAccountId"), rule.get("destAccountId")):
+                    rule["enabled"] = False
+                    rule["lastError"] = "A Discord account used by this rule was removed."
+            if was_active:
+                next_account = next(
+                    (row for row in self.secret["accounts"] if clean_discord_token(row.get("token"))),
+                    None,
+                )
+                if next_account:
+                    self.secret["activeId"] = next_account["id"]
+                    self.secret["token"] = clean_discord_token(next_account.get("token"))
+                    self.secret["tokenSetAt"] = next_account.get("tokenSetAt")
+                    self.secret["authError"] = ""
+                    self.state["account"] = copy.deepcopy(next_account.get("user") or {})
+                    self.state["gateway"]["tokenSet"] = True
+                else:
+                    self.secret["activeId"] = ""
+                    self.secret["token"] = ""
+                    self.secret["tokenSetAt"] = None
+                    self.secret["authError"] = ""
+                    self.state["account"] = None
+                    self.state["gateway"]["tokenSet"] = False
+            self.save()
+            return {
+                "removed": _account_public(removed),
+                "wasActive": was_active,
+                "nextId": str(self.secret.get("activeId") or ""),
+            }
+
+    def remove_all_accounts(self) -> int:
+        with self.lock:
+            count = len(self.secret.get("accounts", []) or [])
+            self.secret["accounts"] = []
+            self.secret["activeId"] = ""
+            self.secret["token"] = ""
+            self.secret["tokenSetAt"] = None
+            self.secret["authError"] = ""
+            self.state["account"] = None
+            self.state["gateway"]["tokenSet"] = False
+            for rule in self.state.setdefault("mirror", {}).get("rules", []) or []:
+                rule["enabled"] = False
+                rule["lastError"] = "No Discord account is available."
+            self.save()
+            return count
 
     # -- events ----------------------------------------------------------
     def subscribe(self) -> queue.Queue:
@@ -782,12 +1331,18 @@ def public_state() -> dict:
     if STORE is None:
         return {}
     with STORE.lock:
-        # the token lives only in secret.json and is never handed to the browser
+        # Tokens live only in secret.json and are never handed to the browser.
         data = json.loads(json.dumps(STORE.state, ensure_ascii=False))
-        data["tokenSet"] = bool(STORE.secret.get("token"))
+        accounts = STORE.public_accounts()
+        data["accounts"] = accounts
+        data["accountCount"] = len(accounts)
+        data["accountLimit"] = ACCOUNT_LIMIT
+        data["mirrorRuleLimit"] = MIRROR_RULE_LIMIT
+        data["activeAccountId"] = STORE.active_account_id()
+        data["tokenSet"] = bool(STORE.active_token())
         data["serverTime"] = now_ms()
         data["version"] = VERSION
-        data["gateway"]["tokenSet"] = bool(STORE.secret.get("token"))
+        data["gateway"]["tokenSet"] = bool(STORE.active_token())
         data["host"] = HOST_DEVICE
         data["logs"] = list(STORE.logs)[:120]
         return data
@@ -809,6 +1364,9 @@ def deep_merge(dst: dict, src: dict, depth: int = 0) -> dict:
 
 PROTECTED_PATCH_KEYS = {
     "account",
+    "accounts",
+    "accountCount",
+    "activeAccountId",
     "gateway",
     "presence",
     "history",
@@ -820,6 +1378,7 @@ PROTECTED_PATCH_KEYS = {
     "startedIso",
     "firstRun",
     "chat",
+    "mirror",
     "tokenSet",
     "tokenHint",
     "serverTime",
@@ -837,7 +1396,7 @@ IMPORTABLE_STATE_GROUPS = {
     "multiple", "health", "location", "weather", "navigation", "androidAuto",
     "samsung", "emulation", "screenRead", "automation", "drawer", "chatProfile",
     "wallet", "premium", "quickControls", "ui", "recent", "usage", "savedConfigs",
-    "bulk", "plugins", "gallery", "appCatalog",
+    "bulk", "plugins", "gallery", "appCatalog", "mirror",
 }
 
 
@@ -2613,6 +3172,11 @@ class DiscordGateway:
                 if STORE:
                     STORE.log("ERROR" if fatal else "WARN", "Gateway", f"Connection lost: {msg}")
                     if fatal:
+                        active_id = STORE.active_account_id()
+                        if active_id:
+                            STORE.mark_account_auth_failed(
+                                active_id, "Discord rejected the saved token. Add a fresh token."
+                            )
                         with STORE.lock:
                             STORE.secret["token"] = ""
                             STORE.secret["tokenSetAt"] = None
@@ -2621,8 +3185,9 @@ class DiscordGateway:
                                 {
                                     "connected": False,
                                     "state": "error",
-                                    "error": "Discord rejected the saved token. Sign in again.",
+                                    "error": "Discord rejected the saved token. Add a fresh token in Discord accounts.",
                                     "latency": None,
+                                    "tokenSet": False,
                                 }
                             )
                             STORE.save()
@@ -2869,6 +3434,556 @@ class DiscordGateway:
 
 
 GATEWAY = DiscordGateway()
+
+
+# ---------------------------------------------------------------------------
+# Message mirror
+# ---------------------------------------------------------------------------
+
+
+def fetch_mirror_channel(token: str, channel_id: str) -> dict:
+    channel_id = _snowflake_text(channel_id)
+    if not channel_id:
+        raise ValueError("Channel IDs are numeric. Enable Developer Mode in Discord and copy the ID.")
+    channel = discord_api(f"/channels/{channel_id}", token)
+    if not isinstance(channel, dict):
+        raise DiscordError(404, "Discord did not return that channel.")
+    channel_type = channel.get("type")
+    allowed = {0, 1, 3, 5, 10, 11, 12, 15}
+    if channel_type not in allowed:
+        raise ValueError("Choose a text channel, announcement channel, thread or direct message.")
+    recipients = channel.get("recipients") or []
+    if channel_type in (1, 3):
+        names = [
+            str(item.get("global_name") or item.get("username") or "Unknown")
+            for item in recipients
+            if isinstance(item, dict)
+        ]
+        if channel_type == 1:
+            label = "DM · " + (names[0] if names else "Direct message")
+        else:
+            label = "Group DM · " + (channel.get("name") or ", ".join(names[:3]) or "Group")
+    else:
+        name = str(channel.get("name") or channel_id)
+        label = "#" + name
+    return {
+        "id": str(channel.get("id") or channel_id),
+        "label": label[:120],
+        "name": str(channel.get("name") or ""),
+        "type": channel_type,
+        "guildId": str(channel.get("guild_id") or ""),
+    }
+
+
+def mirror_should_skip(message: dict, rule: dict, source_user_id: str = "") -> tuple[bool, str]:
+    if not isinstance(message, dict):
+        return True, "malformed"
+    author = message.get("author") if isinstance(message.get("author"), dict) else {}
+    content = str(message.get("content") or "")
+    if MIRROR_MARK in content:
+        return True, "loop"
+    if int(message.get("type") or 0) not in (0, 19):
+        return True, "system"
+    if not rule.get("includeBots") and (author.get("bot") or author.get("system")):
+        return True, "bot"
+    if not rule.get("includeOwn") and source_user_id and str(author.get("id") or "") == source_user_id:
+        return True, "own"
+    return False, ""
+
+
+def build_mirror_content(message: dict, rule: dict) -> str:
+    author = message.get("author") if isinstance(message.get("author"), dict) else {}
+    display = str(author.get("global_name") or author.get("username") or "Discord user").strip()
+    username = str(author.get("username") or "").strip()
+    label = display
+    if username and username.lower() not in display.lower():
+        label += f" (@{username})"
+    body = str(message.get("content") or "").strip()
+    extras: list[str] = []
+    if rule.get("includeAttachments", True):
+        for attachment in message.get("attachments") or []:
+            if not isinstance(attachment, dict):
+                continue
+            url = str(attachment.get("url") or attachment.get("proxy_url") or "").strip()
+            if url and url not in body:
+                extras.append(f"<{url}>")
+    if rule.get("includeEmbeds", True):
+        for embed in message.get("embeds") or []:
+            if not isinstance(embed, dict):
+                continue
+            url = str(embed.get("url") or "").strip()
+            if url and url not in body and all(url not in item for item in extras):
+                extras.append(f"<{url}>")
+    stickers = []
+    for sticker in message.get("sticker_items") or []:
+        if isinstance(sticker, dict) and sticker.get("name"):
+            stickers.append(str(sticker["name"]))
+    if stickers:
+        extras.append("[Sticker: " + ", ".join(stickers[:3]) + "]")
+    parts = [f"**{label}**"]
+    if body:
+        parts.append(body)
+    parts.extend(extras)
+    content = "\n".join(part for part in parts if part).strip()
+    if not content or not body and not extras:
+        return ""
+    limit = 1988 - len(MIRROR_MARK)
+    if len(content) > limit:
+        content = content[:limit].rstrip()
+    return content + MIRROR_MARK
+
+
+class MessageMirror:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.run_lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.wake = threading.Event()
+        self.thread: threading.Thread | None = None
+        self._last_post_at = 0.0
+
+    def start(self) -> None:
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return
+            self.stop_event.clear()
+            self.thread = threading.Thread(target=self._run, name="message-mirror", daemon=True)
+            self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.wake.set()
+        thread = self.thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=3)
+        self.thread = None
+
+    def kick(self) -> None:
+        self.wake.set()
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            wait = MIRROR_DEFAULT_INTERVAL
+            try:
+                with STORE.lock:
+                    mirror = normalize_mirror_state(STORE.state.get("mirror"))
+                    wait = int(mirror.get("interval") or MIRROR_DEFAULT_INTERVAL)
+                    enabled = bool(mirror.get("enabled"))
+                    rule_ids = [rule["id"] for rule in mirror.get("rules", []) if rule.get("enabled")]
+                if enabled:
+                    for rule_id in rule_ids:
+                        if self.stop_event.is_set():
+                            break
+                        try:
+                            self.run_rule(rule_id, manual=False)
+                        except Exception as exc:
+                            rule = _mirror_rule_by_id(rule_id) or {}
+                            if STORE:
+                                STORE.log(
+                                    "WARN",
+                                    "Mirror",
+                                    f"{rule.get('name') or 'Relay'}: {_scrub(exc)}",
+                                )
+                self.wake.wait(timeout=max(5, min(300, wait)))
+                self.wake.clear()
+            except Exception as exc:
+                if STORE:
+                    STORE.log("ERROR", "Mirror", f"Mirror loop failed: {_scrub(exc)}")
+                if self.stop_event.wait(15):
+                    break
+
+    def _rule_snapshot(self, rule_id: str) -> dict | None:
+        with STORE.lock:
+            for rule in STORE.state.setdefault("mirror", _default_mirror_state()).get("rules", []):
+                if rule.get("id") == rule_id:
+                    result = copy.deepcopy(rule)
+                    source = STORE.account_by_id(result.get("sourceAccountId", ""), include_token=True)
+                    dest = STORE.account_by_id(result.get("destAccountId", ""), include_token=True)
+                    result["_sourceToken"] = clean_discord_token((source or {}).get("token"))
+                    result["_destToken"] = clean_discord_token((dest or {}).get("token"))
+                    result["_sourceUserId"] = str(((source or {}).get("user") or {}).get("id") or "")
+                    result["_sourceName"] = str(((source or {}).get("user") or {}).get("displayName") or "Source account")
+                    result["_destName"] = str(((dest or {}).get("user") or {}).get("displayName") or "Destination account")
+                    return result
+        return None
+
+    def _update_rule(self, rule_id: str, **changes) -> dict | None:
+        with STORE.lock:
+            for rule in STORE.state.setdefault("mirror", _default_mirror_state()).get("rules", []):
+                if rule.get("id") == rule_id:
+                    rule.update(changes)
+                    rule["updatedAt"] = now_ms()
+                    mirror = STORE.state.setdefault("mirror", _default_mirror_state())
+                    mirror["lastRunAt"] = now_ms()
+                    if changes.get("lastError") == "":
+                        mirror["lastError"] = ""
+                    STORE.save()
+                    return copy.deepcopy(rule)
+        return None
+
+    def _record_error(self, rule: dict, message: str, *, retry_seconds: float | None = None) -> dict:
+        message = _scrub(message)
+        failures = int(rule.get("failures") or 0) + 1
+        if retry_seconds is None:
+            retry_seconds = min(300, 15 * (2 ** min(4, failures - 1)))
+        retry_after = now_ms() + int(max(5, retry_seconds) * 1000)
+        previous = str(rule.get("lastError") or "")
+        updated = self._update_rule(
+            rule["id"],
+            lastError=message[:260],
+            failures=failures,
+            retryAfter=retry_after,
+            lastRunAt=now_ms(),
+        ) or rule
+        with STORE.lock:
+            mirror = STORE.state.setdefault("mirror", _default_mirror_state())
+            mirror["lastError"] = message[:260]
+            mirror["lastRunAt"] = now_ms()
+            STORE.save()
+        if STORE and message != previous:
+            STORE.log("WARN", "Mirror", f"{rule.get('name') or 'Relay'}: {message}")
+        return updated
+
+    def prime_rule(self, rule_id: str) -> dict:
+        snapshot = self._rule_snapshot(rule_id)
+        if not snapshot:
+            raise ValueError("That mirror rule no longer exists.")
+        if not snapshot.get("_sourceToken"):
+            raise ValueError("The source account needs a Discord token.")
+        source = snapshot["sourceChannel"]
+        token = snapshot["_sourceToken"]
+        try:
+            rows = discord_api(f"/channels/{source}/messages?limit=1", token, timeout=15)
+        except DiscordError as exc:
+            self._record_error(snapshot, f"Could not read the source channel: {exc.message}", retry_seconds=20)
+            raise
+        latest = ""
+        if isinstance(rows, list) and rows:
+            latest = _snowflake_text((rows[0] or {}).get("id"))
+        self._update_rule(
+            rule_id,
+            primed=True,
+            lastSeenId=latest,
+            lastRunAt=now_ms(),
+            lastError="",
+            failures=0,
+            retryAfter=0,
+        )
+        return {"ruleId": rule_id, "primed": True, "lastSeenId": latest, "mirrored": 0, "skipped": 0}
+
+    def run_rule(self, rule_id: str, manual: bool = False) -> dict:
+        with self.run_lock:
+            snapshot = self._rule_snapshot(rule_id)
+            if not snapshot:
+                raise ValueError("That mirror rule no longer exists.")
+            if not manual:
+                if not snapshot.get("enabled"):
+                    return {"ruleId": rule_id, "mirrored": 0, "skipped": 0, "disabled": True}
+                retry_after = int(snapshot.get("retryAfter") or 0)
+                if retry_after and retry_after > now_ms():
+                    return {"ruleId": rule_id, "mirrored": 0, "skipped": 0, "cooldown": retry_after}
+            if not snapshot.get("_sourceToken"):
+                self._record_error(snapshot, "The source account needs a token.", retry_seconds=60)
+                raise ValueError("The source account needs a Discord token.")
+            if not snapshot.get("_destToken"):
+                self._record_error(snapshot, "The destination account needs a token.", retry_seconds=60)
+                raise ValueError("The destination account needs a Discord token.")
+            if not snapshot.get("primed"):
+                result = self.prime_rule(rule_id)
+                result["manual"] = manual
+                return result
+
+            source = snapshot["sourceChannel"]
+            cursor = snapshot.get("lastSeenId") or ""
+            path = f"/channels/{source}/messages?limit=50"
+            if cursor:
+                path += f"&after={cursor}"
+            try:
+                rows = discord_api(path, snapshot["_sourceToken"], timeout=15)
+            except DiscordError as exc:
+                retry = None
+                if exc.status == 429 and isinstance(exc.data, dict):
+                    try:
+                        retry = float(exc.data.get("retry_after") or 0)
+                    except Exception:
+                        retry = None
+                updated = self._record_error(snapshot, f"Could not read the source channel: {exc.message}", retry_seconds=retry)
+                return {"ruleId": rule_id, "mirrored": 0, "skipped": 0, "error": updated.get("lastError"), "retryAfter": updated.get("retryAfter")}
+            if not isinstance(rows, list):
+                rows = []
+            rows = [row for row in rows if isinstance(row, dict) and _snowflake_text(row.get("id"))]
+            rows.sort(key=lambda row: int(row.get("id")))
+            rows = rows[:MIRROR_MAX_MESSAGES]
+            mirrored = 0
+            skipped = 0
+            current_cursor = cursor
+            for message in rows:
+                message_id = _snowflake_text(message.get("id"))
+                if not message_id:
+                    continue
+                skip, reason = mirror_should_skip(message, snapshot, snapshot.get("_sourceUserId", ""))
+                content = "" if skip else build_mirror_content(message, snapshot)
+                if skip or not content:
+                    current_cursor = message_id
+                    skipped += 1
+                    self._update_rule(
+                        rule_id,
+                        lastSeenId=current_cursor,
+                        skipped=int(snapshot.get("skipped") or 0) + skipped,
+                        lastRunAt=now_ms(),
+                        lastError="",
+                        failures=0,
+                        retryAfter=0,
+                    )
+                    continue
+                # A message being posted must still belong to the active rule
+                # configuration and its accounts must still hold the same
+                # tokens; removing or replacing an account mid-run must stop
+                # further delivery immediately.
+                delay = 1.05 - (time.monotonic() - self._last_post_at)
+                if delay > 0 and len(rows) > 1:
+                    time.sleep(delay)
+                latest_rule = self._rule_snapshot(rule_id)
+                if (
+                    not latest_rule
+                    or (not manual and not latest_rule.get("enabled"))
+                    or latest_rule.get("sourceChannel") != source
+                    or latest_rule.get("destChannel") != snapshot.get("destChannel")
+                    or latest_rule.get("_sourceToken") != snapshot.get("_sourceToken")
+                    or latest_rule.get("_destToken") != snapshot.get("_destToken")
+                ):
+                    break
+                try:
+                    discord_api(
+                        f"/channels/{snapshot['destChannel']}/messages",
+                        snapshot["_destToken"],
+                        method="POST",
+                        body={"content": content, "allowed_mentions": {"parse": []}},
+                        timeout=20,
+                    )
+                    self._last_post_at = time.monotonic()
+                    mirrored += 1
+                    current_cursor = message_id
+                    self._update_rule(
+                        rule_id,
+                        lastSeenId=current_cursor,
+                        mirrored=int(snapshot.get("mirrored") or 0) + mirrored,
+                        lastMirroredAt=now_ms(),
+                        lastRunAt=now_ms(),
+                        lastError="",
+                        failures=0,
+                        retryAfter=0,
+                    )
+                except DiscordError as exc:
+                    retry = None
+                    if exc.status == 429 and isinstance(exc.data, dict):
+                        try:
+                            retry = float(exc.data.get("retry_after") or 0)
+                        except Exception:
+                            retry = None
+                    updated = self._record_error(snapshot, f"Could not post to the destination channel: {exc.message}", retry_seconds=retry)
+                    return {
+                        "ruleId": rule_id,
+                        "mirrored": mirrored,
+                        "skipped": skipped,
+                        "error": updated.get("lastError"),
+                        "retryAfter": updated.get("retryAfter"),
+                    }
+                except Exception as exc:
+                    updated = self._record_error(snapshot, f"Mirror delivery failed: {_scrub(exc)}")
+                    return {
+                        "ruleId": rule_id,
+                        "mirrored": mirrored,
+                        "skipped": skipped,
+                        "error": updated.get("lastError"),
+                        "retryAfter": updated.get("retryAfter"),
+                    }
+            self._update_rule(rule_id, lastRunAt=now_ms(), lastError="", failures=0, retryAfter=0)
+            if mirrored and STORE:
+                STORE.log(
+                    "INFO",
+                    "Mirror",
+                    f"{snapshot.get('name') or 'Relay'} forwarded {mirrored} message(s) to {snapshot.get('destLabel')}.",
+                )
+            return {
+                "ruleId": rule_id,
+                "mirrored": mirrored,
+                "skipped": skipped,
+                "lastSeenId": current_cursor,
+                "manual": manual,
+            }
+
+    def run_rule_public(self, rule_id: str, manual: bool = True) -> dict:
+        return self.run_rule(rule_id, manual=manual)
+
+
+MIRROR = MessageMirror()
+
+
+def _mirror_rule_by_id(rule_id: str) -> dict | None:
+    with STORE.lock:
+        for rule in STORE.state.setdefault("mirror", _default_mirror_state()).get("rules", []):
+            if rule.get("id") == rule_id:
+                return copy.deepcopy(rule)
+    return None
+
+
+def save_mirror_rule(data: dict) -> tuple[dict, str]:
+    if not isinstance(data, dict):
+        raise ValueError("A mirror rule object is required.")
+    rule_id = str(data.get("id") or "").strip()
+    existing = _mirror_rule_by_id(rule_id) if rule_id else None
+    if rule_id and not existing:
+        raise ValueError("That mirror rule no longer exists.")
+    source_account_id = str(data.get("sourceAccountId") or (existing or {}).get("sourceAccountId") or "")
+    dest_account_id = str(data.get("destAccountId") or (existing or {}).get("destAccountId") or "")
+    source_account = STORE.account_by_id(source_account_id, include_token=True)
+    dest_account = STORE.account_by_id(dest_account_id, include_token=True)
+    if not source_account:
+        raise ValueError("Choose a saved source account.")
+    if not dest_account:
+        raise ValueError("Choose a saved destination account.")
+    source_token = clean_discord_token(source_account.get("token"))
+    dest_token = clean_discord_token(dest_account.get("token"))
+    if not source_token:
+        raise ValueError("The source account needs a fresh Discord token.")
+    if not dest_token:
+        raise ValueError("The destination account needs a fresh Discord token.")
+    source_channel = _snowflake_text(data.get("sourceChannel") or (existing or {}).get("sourceChannel"))
+    dest_channel = _snowflake_text(data.get("destChannel") or (existing or {}).get("destChannel"))
+    if not source_channel or not dest_channel:
+        raise ValueError("Enter numeric channel IDs for both sides of the mirror.")
+    if source_channel == dest_channel:
+        raise ValueError("Source and destination must be different channels.")
+    source_info = fetch_mirror_channel(source_token, source_channel)
+    dest_info = fetch_mirror_channel(dest_token, dest_channel)
+    base = existing or {}
+    enabled = _mirror_bool(data.get("enabled"), bool(base.get("enabled", True)))
+    source_changed = (
+        not existing
+        or source_channel != str(existing.get("sourceChannel") or "")
+        or source_account_id != str(existing.get("sourceAccountId") or "")
+    )
+    draft = {
+        **base,
+        "sourceAccountId": source_account_id,
+        "sourceChannel": source_channel,
+        "sourceLabel": source_info["label"],
+        "destAccountId": dest_account_id,
+        "destChannel": dest_channel,
+        "destLabel": dest_info["label"],
+        "enabled": enabled,
+        "includeOwn": _mirror_bool(data.get("includeOwn"), bool(base.get("includeOwn", False))),
+        "includeBots": _mirror_bool(data.get("includeBots"), bool(base.get("includeBots", False))),
+        "includeAttachments": _mirror_bool(
+            data.get("includeAttachments"), bool(base.get("includeAttachments", True))
+        ),
+        "includeEmbeds": _mirror_bool(data.get("includeEmbeds"), bool(base.get("includeEmbeds", True))),
+    }
+    if "name" in data:
+        draft["name"] = str(data.get("name") or "").strip()[:80]
+    if not draft.get("name"):
+        draft["name"] = f"{source_info['label']} → {dest_info['label']}"[:80]
+    if source_changed:
+        draft["primed"] = False
+        draft["lastSeenId"] = ""
+        draft["lastError"] = ""
+        draft["lastMirroredAt"] = None
+        draft["mirrored"] = 0
+        draft["skipped"] = 0
+        draft["failures"] = 0
+        draft["retryAfter"] = 0
+    rule = normalize_mirror_rule(draft, fresh=not existing)
+    if not rule:
+        raise ValueError("Mirror rule details are invalid.")
+    with STORE.lock:
+        mirror = normalize_mirror_state(STORE.state.get("mirror"))
+        rules = mirror["rules"]
+        if existing:
+            rules = [rule if item.get("id") == rule["id"] else item for item in rules]
+        else:
+            if len(rules) >= MIRROR_RULE_LIMIT:
+                raise ValueError(f"You can save up to {MIRROR_RULE_LIMIT} mirror rules.")
+            rules.append(rule)
+        mirror["rules"] = rules
+        mirror["lastError"] = ""
+        STORE.state["mirror"] = mirror
+        STORE.save()
+    warning = ""
+    if source_changed or not rule.get("primed"):
+        try:
+            MIRROR.prime_rule(rule["id"])
+        except (DiscordError, ValueError) as exc:
+            message = exc.message if isinstance(exc, DiscordError) else str(exc)
+            warning = f"Rule saved, but the source could not be read yet: {_scrub(message)}"
+    MIRROR.kick()
+    STORE.log(
+        "INFO",
+        "Mirror",
+        f"{'Updated' if existing else 'Added'} relay “{rule['name']}” ({source_info['label']} → {dest_info['label']}).",
+    )
+    STORE.broadcast_state()
+    return _mirror_rule_by_id(rule["id"]) or rule, warning
+
+
+def set_mirror_settings(data: dict) -> dict:
+    with STORE.lock:
+        mirror = normalize_mirror_state(STORE.state.get("mirror"))
+        old_enabled = mirror["enabled"]
+        if "enabled" in data:
+            mirror["enabled"] = _mirror_bool(data.get("enabled"), mirror["enabled"])
+        if "interval" in data:
+            try:
+                mirror["interval"] = int(clamp(int(data.get("interval") or mirror["interval"]), 5, 300))
+            except Exception:
+                raise ValueError("Mirror interval must be between 5 and 300 seconds.")
+        STORE.state["mirror"] = mirror
+        STORE.save()
+    if mirror["enabled"] != old_enabled:
+        STORE.log(
+            "INFO",
+            "Mirror",
+            "Automatic mirroring enabled." if mirror["enabled"] else "Automatic mirroring paused.",
+        )
+    if mirror["enabled"]:
+        MIRROR.kick()
+    STORE.broadcast_state()
+    return mirror
+
+
+def delete_mirror_rule(rule_id: str) -> None:
+    with STORE.lock:
+        mirror = normalize_mirror_state(STORE.state.get("mirror"))
+        before = len(mirror["rules"])
+        mirror["rules"] = [rule for rule in mirror["rules"] if rule.get("id") != rule_id]
+        if len(mirror["rules"]) == before:
+            raise ValueError("That mirror rule no longer exists.")
+        STORE.state["mirror"] = mirror
+        STORE.save()
+    STORE.log("INFO", "Mirror", "A message relay was removed.")
+    STORE.broadcast_state()
+
+
+def toggle_mirror_rule(rule_id: str, enabled: bool) -> dict:
+    warning = ""
+    with STORE.lock:
+        mirror = normalize_mirror_state(STORE.state.get("mirror"))
+        rule = next((item for item in mirror["rules"] if item.get("id") == rule_id), None)
+        if not rule:
+            raise ValueError("That mirror rule no longer exists.")
+        rule["enabled"] = bool(enabled)
+        STORE.state["mirror"] = mirror
+        STORE.save()
+    if enabled and not (_mirror_rule_by_id(rule_id) or {}).get("primed"):
+        try:
+            MIRROR.prime_rule(rule_id)
+        except (DiscordError, ValueError) as exc:
+            warning = _scrub(exc.message if isinstance(exc, DiscordError) else str(exc))
+    MIRROR.kick()
+    STORE.log("INFO", "Mirror", f"Relay {'resumed' if enabled else 'paused'}.")
+    STORE.broadcast_state()
+    updated = _mirror_rule_by_id(rule_id) or {}
+    return {"rule": updated, "warning": warning}
 
 
 # ---------------------------------------------------------------------------
@@ -3558,7 +4673,7 @@ class Ticker:
         is never replaced, so a hand-started card always wins over a schedule.
         """
         assert STORE is not None
-        if not STORE.secret.get("token"):
+        if not STORE.active_token():
             return
         data = STORE.state.get("automation") or {}
         if not data.get("enabled"):
@@ -3600,35 +4715,114 @@ TICKER = Ticker()
 # ---------------------------------------------------------------------------
 
 
-def sign_in(token: str) -> dict:
+def _validated_account_user(token: str, account_id: str = "") -> dict:
+    try:
+        return validate_token(token)
+    except DiscordError as exc:
+        safe = safe_auth_error(exc.message, token)
+        if exc.status == 401 and account_id:
+            STORE.mark_account_auth_failed(
+                account_id, "Discord rejected this token. Add a fresh token for the account."
+            )
+        raise DiscordError(exc.status, safe, exc.data) from None
+
+
+def save_discord_account(token: str, make_active: bool = True) -> tuple[dict, bool, dict]:
     assert STORE is not None
-    token = token.strip()
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
+    token = clean_discord_token(token)
     if not token:
         raise DiscordError(401, "Paste a Discord account token first.")
-    user = validate_token(token)
-    with STORE.lock:
-        STORE.secret["token"] = token
-        STORE.secret["tokenSetAt"] = now_ms()
-        STORE.secret["authError"] = ""
-        STORE.state["account"] = user
-        STORE.state["gateway"]["error"] = ""
-        STORE.state["gateway"]["tokenSet"] = True
-    STORE.save()
-    STORE.log("INFO", "Account", f"Signed in as {user['displayName']}.")
+    user = _validated_account_user(token)
+    account, created = STORE.upsert_account(token, user)
+    if make_active or STORE.active_account_id() == account["id"]:
+        # Replacing the token of the live account must restart the gateway even
+        # when the caller did not ask to switch; otherwise the old socket would
+        # keep using credentials that no longer exist.
+        activate_discord_account(account["id"], user=user, verify=False)
+    else:
+        STORE.broadcast_state()
+    action = "Added" if created else "Updated"
+    STORE.log("INFO", "Account", f"{action} Discord account {user['displayName']}.")
+    return account, created, user
+
+
+def activate_discord_account(account_id: str, user: dict | None = None, verify: bool = True) -> dict:
+    assert STORE is not None
+    account = STORE.account_by_id(account_id, include_token=True)
+    if not account:
+        raise DiscordError(404, "That Discord account is not saved.")
+    token = clean_discord_token(account.get("token"))
+    if not token:
+        raise DiscordError(401, "That account needs a fresh Discord token.")
+    if verify or not user:
+        try:
+            user = _validated_account_user(token, account_id)
+        except DiscordError:
+            # The failed account was marked as needing a fresh token; push the
+            # updated public account list so every open client drops the stale row.
+            STORE.broadcast_state()
+            raise
+    stop_presence(None, quiet=True)
+    GATEWAY.stop()
+    account = STORE.activate_account(account_id, user=user)
     GATEWAY.start(token)
+    display = (account.get("user") or {}).get("displayName") or "Discord account"
+    STORE.log("INFO", "Account", f"Switched to {display}.")
     STORE.broadcast_state()
+    return account
+
+
+def sign_in(token: str) -> dict:
+    account, _created, user = save_discord_account(token, make_active=True)
+    STORE.log("INFO", "Account", f"Signed in as {user['displayName']}.")
     return user
+
+
+def remove_discord_account(account_id: str) -> dict:
+    assert STORE is not None
+    account = STORE.account_by_id(account_id)
+    if not account:
+        raise ValueError("That Discord account is not saved.")
+    active_id = STORE.active_account_id()
+    was_active = account_id == active_id
+    if was_active:
+        stop_presence(None, quiet=True)
+        GATEWAY.stop()
+    result = STORE.remove_account(account_id) or {}
+    next_account = STORE.account_by_id(result.get("nextId", ""), include_token=True) if result.get("nextId") else None
+    if was_active and next_account:
+        token = clean_discord_token(next_account.get("token"))
+        if token:
+            GATEWAY.start(token)
+    if was_active and not next_account:
+        with STORE.lock:
+            STORE.state["gateway"].update(
+                {"connected": False, "state": "offline", "error": "", "latency": None}
+            )
+        STORE.save()
+    display = (account.get("user") or {}).get("displayName") or "Discord account"
+    if was_active and next_account:
+        next_name = (next_account.get("user") or {}).get("displayName") or "the next account"
+        STORE.log("INFO", "Account", f"Removed {display}; switched to {next_name}.")
+    elif was_active:
+        STORE.log("INFO", "Account", f"Removed {display}; no Discord account is active.")
+    else:
+        STORE.log("INFO", "Account", f"Removed saved Discord account {display}.")
+    STORE.broadcast_state()
+    return result
 
 
 def sign_out() -> None:
     assert STORE is not None
+    active_id = STORE.active_account_id()
+    if active_id:
+        remove_discord_account(active_id)
+        return
     GATEWAY.stop()
-    stop_presence(None, quiet=True)
     with STORE.lock:
         STORE.secret["token"] = ""
         STORE.secret["tokenSetAt"] = None
+        STORE.secret["activeId"] = ""
         STORE.state["account"] = None
         STORE.state["gateway"].update(
             {"connected": False, "state": "offline", "error": "", "latency": None}
@@ -3673,7 +4867,7 @@ def stop_presence(kind: str | None = None, quiet: bool = False) -> bool:
 
 def start_presence(kind: str, payload: dict | None = None) -> dict:
     assert STORE is not None
-    if not STORE.secret.get("token"):
+    if not STORE.active_token():
         raise DiscordError(401, "Sign in to Discord in Settings before starting a presence.")
     if kind not in PRESENCE_KINDS:
         raise ValueError("Unknown RPC type.")
@@ -4008,7 +5202,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def send_error_json(self, message: str, status: int = 400, **extra):
-        self.send_json({"ok": False, "error": message, **extra}, status=status)
+        self.send_json({"ok": False, "error": _scrub(message), **extra}, status=status)
 
     def read_json(self, allow_list: bool = False):
         length = int(self.headers.get("Content-Length") or 0)
@@ -4035,6 +5229,19 @@ class Handler(BaseHTTPRequestHandler):
         path = self.route_path()
         if path == "/api/state":
             return self.send_json({"ok": True, "state": public_state()})
+        if path == "/api/accounts":
+            return self.send_json(
+                {
+                    "ok": True,
+                    "accounts": STORE.public_accounts(),
+                    "activeAccountId": STORE.active_account_id(),
+                    "limit": ACCOUNT_LIMIT,
+                }
+            )
+        if path == "/api/mirror":
+            with STORE.lock:
+                mirror = normalize_mirror_state(STORE.state.get("mirror"))
+            return self.send_json({"ok": True, "mirror": mirror, "limit": MIRROR_RULE_LIMIT})
         if path == "/api/events":
             return self.handle_events()
         if path == "/api/update":
@@ -4095,28 +5302,132 @@ class Handler(BaseHTTPRequestHandler):
                     user = sign_in(token)
                     return self.send_json({"ok": True, "user": user, "state": public_state()})
                 except DiscordError as exc:
-                    STORE.log("WARN", "Account", f"Discord sign-in failed: {exc.message}")
-                    return self.send_error_json(exc.message, exc.status or 401)
+                    safe = safe_auth_error(exc.message, token)
+                    STORE.log("WARN", "Account", f"Discord sign-in failed: {safe}")
+                    return self.send_error_json(safe, exc.status or 401)
             if path == "/api/auth/logout":
                 sign_out()
                 return self.send_json({"ok": True, "state": public_state()})
+            if path == "/api/accounts/add":
+                data = self.read_json()
+                make_active = _mirror_bool(data.get("makeActive"), True)
+                submitted = clean_discord_token(str(data.get("token") or ""))
+                try:
+                    account, created, user = save_discord_account(submitted, make_active=make_active)
+                except DiscordError as exc:
+                    safe = safe_auth_error(exc.message, submitted)
+                    STORE.log("WARN", "Account", f"Account validation failed: {safe}")
+                    return self.send_error_json(safe, exc.status or 401)
+                return self.send_json(
+                    {
+                        "ok": True,
+                        "account": _account_public(account),
+                        "created": created,
+                        "user": user,
+                        "state": public_state(),
+                    }
+                )
+            if path == "/api/accounts/switch":
+                data = self.read_json()
+                account = activate_discord_account(str(data.get("id") or ""), verify=True)
+                return self.send_json(
+                    {
+                        "ok": True,
+                        "account": _account_public(account),
+                        "state": public_state(),
+                    }
+                )
+            if path == "/api/accounts/remove":
+                data = self.read_json()
+                result = remove_discord_account(str(data.get("id") or ""))
+                return self.send_json({"ok": True, **result, "state": public_state()})
+            if path == "/api/accounts/remove-all":
+                data = self.read_json()
+                if str(data.get("confirm") or "") != "REMOVE ALL":
+                    return self.send_error_json("Type REMOVE ALL to clear every saved account.", 400)
+                stop_presence(None, quiet=True)
+                GATEWAY.stop()
+                count = STORE.remove_all_accounts()
+                with STORE.lock:
+                    STORE.state["gateway"].update(
+                        {"connected": False, "state": "offline", "error": "", "latency": None, "tokenSet": False}
+                    )
+                    STORE.save()
+                STORE.log("INFO", "Account", f"Removed all {count} saved Discord account(s).")
+                MIRROR.kick()
+                STORE.broadcast_state()
+                return self.send_json({"ok": True, "count": count, "state": public_state()})
             if path == "/api/account/refresh":
-                if not STORE.secret.get("token"):
+                token = STORE.active_token()
+                active_id = STORE.active_account_id()
+                if not token or not active_id:
                     return self.send_error_json("Not signed in.", 401)
                 try:
-                    me = normalize_user(discord_api("/users/@me", STORE.secret["token"]))
+                    me = _validated_account_user(token, active_id)
                 except DiscordError as exc:
+                    STORE.broadcast_state()
                     return self.send_error_json(exc.message, exc.status or 401)
-                STORE.state["account"] = me
-                STORE.touch()
+                STORE.activate_account(active_id, user=me)
                 STORE.broadcast_state()
                 return self.send_json({"ok": True, "user": me, "state": public_state()})
             if path == "/api/gateway/reconnect":
-                if not STORE.secret.get("token"):
+                token = STORE.active_token()
+                if not token:
                     return self.send_error_json("Not signed in.", 401)
-                GATEWAY.start(STORE.secret["token"])
+                GATEWAY.start(token)
                 STORE.log("INFO", "Gateway", "Connection restart requested from the web UI.")
                 return self.send_json({"ok": True, "state": public_state()})
+            if path == "/api/mirror/settings":
+                data = self.read_json()
+                mirror = set_mirror_settings(data)
+                return self.send_json({"ok": True, "mirror": mirror, "state": public_state()})
+            if path == "/api/mirror/rules":
+                data = self.read_json()
+                rule, warning = save_mirror_rule(data)
+                return self.send_json({"ok": True, "rule": rule, "warning": warning, "state": public_state()})
+            if path == "/api/mirror/rules/toggle":
+                data = self.read_json()
+                rule_id = str(data.get("id") or "")
+                result = toggle_mirror_rule(rule_id, _mirror_bool(data.get("enabled"), True))
+                return self.send_json({"ok": True, **result, "state": public_state()})
+            if path == "/api/mirror/rules/delete":
+                data = self.read_json()
+                delete_mirror_rule(str(data.get("id") or ""))
+                return self.send_json({"ok": True, "state": public_state()})
+            if path == "/api/mirror/run":
+                data = self.read_json()
+                rule_id = str(data.get("id") or "").strip()
+                if rule_id:
+                    summaries = [MIRROR.run_rule(rule_id, manual=True)]
+                else:
+                    with STORE.lock:
+                        ids = [
+                            rule["id"]
+                            for rule in normalize_mirror_state(STORE.state.get("mirror")).get("rules", [])
+                            if rule.get("enabled")
+                        ]
+                    summaries = []
+                    for item in ids:
+                        try:
+                            summaries.append(MIRROR.run_rule(item, manual=True))
+                        except Exception as exc:
+                            rule = _mirror_rule_by_id(item) or {}
+                            summaries.append(
+                                {
+                                    "ruleId": item,
+                                    "mirrored": 0,
+                                    "skipped": 0,
+                                    "error": f"{rule.get('name') or 'Relay'}: {exc}",
+                                }
+                            )
+                return self.send_json(
+                    {
+                        "ok": True,
+                        "results": summaries,
+                        "mirrored": sum(int(item.get("mirrored") or 0) for item in summaries),
+                        "state": public_state(),
+                    }
+                )
             if path == "/api/rpc/start":
                 data = self.read_json()
                 kind = str(data.get("kind") or "custom")
@@ -4484,10 +5795,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_friends(self):
         assert STORE is not None
-        if not STORE.secret.get("token"):
+        token = STORE.active_token()
+        if not token:
             return self.send_json({"ok": True, "friends": [], "signedIn": False})
         try:
-            rows = discord_api("/users/@me/relationships", STORE.secret["token"])
+            rows = discord_api("/users/@me/relationships", token)
             friends = [normalize_relationship(r) for r in (rows or []) if isinstance(r, dict)]
             friends = [f for f in friends if f.get("user", {}).get("username")]
             return self.send_json({"ok": True, "friends": friends, "signedIn": True})
@@ -4537,9 +5849,19 @@ class Handler(BaseHTTPRequestHandler):
             incoming = payload.get("state") if isinstance(payload, dict) and isinstance(payload.get("state"), dict) else payload
             if not isinstance(incoming, dict):
                 return self.send_error_json("That backup does not contain a state object.", 400)
+            web_warnings = []
             with STORE.lock:
-                for key, value in visible_patch(incoming).items():
+                # Import only the whitelisted setting groups. Do not route this
+                # through visible_patch: mirror is protected from direct client
+                # patches, but web backups deliberately carry it and must pass
+                # through prepare_imported_mirror below.
+                for key, value in incoming.items():
                     if key not in IMPORTABLE_STATE_GROUPS:
+                        continue
+                    if key == "mirror":
+                        imported_mirror, mirror_notes = prepare_imported_mirror(value)
+                        STORE.state["mirror"] = imported_mirror
+                        web_warnings.extend(mirror_notes)
                         continue
                     if isinstance(value, dict) and isinstance(STORE.state.get(key), dict):
                         deep_merge(STORE.state[key], value)
@@ -4548,6 +5870,8 @@ class Handler(BaseHTTPRequestHandler):
                 STORE.save()
                 saved_count = len(STORE.state.get("savedConfigs") or [])
             STORE.log("INFO", "Backup", "Settings imported from a Kizzey Web backup.")
+            for warning in web_warnings[:KIZZEY_WARNING_LIMIT]:
+                STORE.log("WARN", "Import", warning)
             STORE.broadcast_state()
             return self.send_json(
                 {
@@ -4559,7 +5883,7 @@ class Handler(BaseHTTPRequestHandler):
                         "settings": 0,
                         "presets": saved_count,
                         "images": 0,
-                        "warnings": [],
+                        "warnings": web_warnings[:KIZZEY_WARNING_LIMIT],
                     },
                 }
             )
@@ -4578,6 +5902,13 @@ class Handler(BaseHTTPRequestHandler):
         with STORE.lock:
             for key, value in bundle["updates"].items():
                 if key not in IMPORTABLE_STATE_GROUPS or key == "savedConfigs":
+                    continue
+                if key == "mirror":
+                    imported_mirror, mirror_notes = prepare_imported_mirror(value)
+                    STORE.state["mirror"] = imported_mirror
+                    for note in mirror_notes:
+                        if note not in report["warnings"]:
+                            report["warnings"] = (report["warnings"] + [note])[:KIZZEY_WARNING_LIMIT]
                     continue
                 if isinstance(value, dict) and isinstance(STORE.state.get(key), dict):
                     deep_merge(STORE.state[key], value)
@@ -4631,7 +5962,8 @@ class Handler(BaseHTTPRequestHandler):
     # -- bulk message removal --------------------------------------------
     def handle_bulk(self, delete: bool = False):
         assert STORE is not None
-        if not STORE.secret.get("token"):
+        token = STORE.active_token()
+        if not token:
             return self.send_error_json("Sign in to Discord first.", 401)
         data = self.read_json()
         if delete:
@@ -4649,11 +5981,11 @@ class Handler(BaseHTTPRequestHandler):
             failed = []
             for mid in ids[:100]:
                 try:
-                    discord_api(f"/channels/{channel}/messages/{mid}", STORE.secret["token"], method="DELETE")
+                    discord_api(f"/channels/{channel}/messages/{mid}", token, method="DELETE")
                     deleted += 1
                     time.sleep(0.55)
                 except DiscordError as exc:
-                    failed.append({"id": mid, "error": exc.message})
+                    failed.append({"id": mid, "error": _scrub(exc.message)})
             STORE.log("INFO", "Bulk", f"Deleted {deleted} message(s) from the user's own account.")
             return self.send_json({"ok": True, "deleted": deleted, "failed": failed})
         channel = str(data.get("channel") or "").strip()
@@ -4669,7 +6001,7 @@ class Handler(BaseHTTPRequestHandler):
                 qs = f"?limit={min(100, limit - len(messages))}"
                 if before:
                     qs += f"&before={before}"
-                rows = discord_api(f"/channels/{channel}/messages{qs}", STORE.secret["token"]) or []
+                rows = discord_api(f"/channels/{channel}/messages{qs}", token) or []
                 if not rows:
                     break
                 before = rows[-1].get("id")
@@ -4744,30 +6076,72 @@ def main() -> int:
 
     STORE = Store()
     STORE.log("INFO", "Server", f"Kizzey Web {VERSION} starting on {args.host}:{args.port}.")
-    if STORE.secret.get("token") and not args.no_gateway:
-        try:
-            me = validate_token(STORE.secret["token"])
-            STORE.state["account"] = me
+    if not args.no_gateway:
+        accounts = STORE.secret.get("accounts", []) or []
+        active_id = STORE.active_account_id()
+        candidates = sorted(
+            [row for row in accounts if clean_discord_token(row.get("token"))],
+            key=lambda row: 0 if row.get("id") == active_id else 1,
+        )
+        restored = False
+        for account in candidates:
+            token = clean_discord_token(account.get("token"))
+            try:
+                me = validate_token(token)
+            except DiscordError as exc:
+                if exc.status == 401:
+                    STORE.mark_account_auth_failed(
+                        account.get("id", ""), "Discord rejected this saved token. Add a fresh token."
+                    )
+                    STORE.log(
+                        "WARN",
+                        "Account",
+                        f"Saved account “{(account.get('user') or {}).get('displayName') or 'Discord'}” needs a fresh token.",
+                    )
+                    continue
+                STORE.log("WARN", "Account", f"Saved Discord session could not be verified: {exc.message}")
+                STORE.activate_account(account.get("id", ""))
+                if STORE.state.get("settings", {}).get("autoStart", True):
+                    GATEWAY.start(token)
+                restored = True
+                break
+            except Exception as exc:
+                STORE.log("WARN", "Account", f"Saved Discord session could not be verified: {_scrub(exc)}")
+                STORE.activate_account(account.get("id", ""))
+                if STORE.state.get("settings", {}).get("autoStart", True):
+                    GATEWAY.start(token)
+                restored = True
+                break
+            STORE.activate_account(account.get("id", ""), user=me)
             STORE.log("INFO", "Account", f"Restored Discord session for {me['displayName']}.")
             if STORE.state.get("settings", {}).get("autoStart", True):
-                GATEWAY.start(STORE.secret["token"])
-        except Exception as exc:
-            STORE.log("WARN", "Account", f"Saved Discord session could not be restored: {exc}")
+                GATEWAY.start(token)
+            restored = True
+            break
+        if not restored and candidates:
             with STORE.lock:
                 STORE.secret["token"] = ""
+                STORE.secret["tokenSetAt"] = None
                 STORE.state["account"] = None
-                STORE.state["gateway"]["error"] = str(exc)
+                STORE.state["gateway"].update(
+                    {
+                        "tokenSet": False,
+                        "error": "Every saved Discord token was rejected. Add a fresh token in Discord accounts.",
+                    }
+                )
             STORE.save()
     if STORE.state.get("presence", {}).get("active"):
         # A previous server run did not stop its presence; start clean.
         STORE.state["presence"] = {"active": None, "startedAt": None, "activities": [], "updatedAt": now_ms()}
         STORE.save()
     TICKER.start()
+    MIRROR.start()
 
     try:
         httpd = build_server(args.host, args.port)
     except OSError as exc:
         print(f"Could not bind {args.host}:{args.port}: {exc}", file=sys.stderr)
+        MIRROR.stop()
         return 1
     banner(args.host, args.port)
     try:
@@ -4775,6 +6149,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n  Stopping…")
     finally:
+        MIRROR.stop()
         try:
             GATEWAY.send_presence(None)
             GATEWAY.stop()
