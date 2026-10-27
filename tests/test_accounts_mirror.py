@@ -120,6 +120,11 @@ class FakeDiscord:
                 "type": 0,
                 "guild_id": "900000000000000002",
             },
+            "555555555555555555": {
+                "id": "555555555555555555",
+                "type": 1,
+                "recipients": [{"id": "100000000000000001", "username": "alpha", "global_name": "Alpha"}],
+            },
         }
         self.messages = [
             {
@@ -133,10 +138,16 @@ class FakeDiscord:
         self.channel_tokens = []
         self.message_tokens = []
         self.fail_post = None
+        self.webhooks = {}
+        self.webhook_creates = []
+        self.webhook_posts = []
+        self.webhook_deletes = []
+        self.webhook_counter = 0
+        self.fail_webhook = None
 
     @staticmethod
-    def author(user_id, username, display, bot=False):
-        return {"id": user_id, "username": username, "global_name": display, "bot": bot}
+    def author(user_id, username, display, bot=False, avatar=""):
+        return {"id": user_id, "username": username, "global_name": display, "bot": bot, "avatar": avatar}
 
     def add_message(self, message):
         self.messages.append(message)
@@ -165,6 +176,41 @@ class FakeDiscord:
                 raise server.DiscordError(403, "Wrong destination token")
             self.posts.append({"token": token, "body": copy.deepcopy(body)})
             return {"id": str(9000 + len(self.posts)), "content": (body or {}).get("content", "")}
+        parts = route.strip("/").split("/")
+        if method == "POST" and len(parts) == 3 and parts[0] == "channels" and parts[2] == "webhooks":
+            if token != "tok-beta-222":
+                raise server.DiscordError(403, "Wrong destination token")
+            self.webhook_counter += 1
+            webhook = {
+                "id": str(700000000000000000 + self.webhook_counter),
+                "token": f"wh_token_{self.webhook_counter}_abcdefghijklmnop",
+                "channel_id": parts[1],
+                "name": (body or {}).get("name") or "Relay",
+            }
+            self.webhooks[webhook["id"]] = webhook
+            self.webhook_creates.append({"token": token, "body": copy.deepcopy(body), "webhook": copy.deepcopy(webhook)})
+            return copy.deepcopy(webhook)
+        if len(parts) == 3 and parts[0] == "webhooks":
+            webhook = self.webhooks.get(parts[1])
+            if not webhook or webhook.get("token") != parts[2]:
+                raise server.DiscordError(404, "Unknown Webhook")
+            if method == "POST":
+                if self.fail_webhook:
+                    raise self.fail_webhook
+                if token:
+                    raise server.DiscordError(401, "Webhook execution must not use an account token")
+                self.webhook_posts.append(
+                    {
+                        "token": token,
+                        "webhook": copy.deepcopy(webhook),
+                        "body": copy.deepcopy(body),
+                    }
+                )
+                return {"id": str(9500 + len(self.webhook_posts)), "content": (body or {}).get("content", "")}
+            if method == "DELETE":
+                self.webhook_deletes.append(webhook["id"])
+                self.webhooks.pop(parts[1], None)
+                return None
         raise server.DiscordError(404, f"Fake Discord has no route for {method} {path}")
 
 
@@ -213,6 +259,11 @@ def account_named(state, username):
 def mirror_rule(state):
     rows = (state.get("mirror") or {}).get("rules") or []
     return rows[0] if rows else None
+
+
+def mirror_rule_by_id(state, rule_id):
+    rows = (state.get("mirror") or {}).get("rules") or []
+    return next((row for row in rows if row.get("id") == rule_id), None)
 
 
 def tokens_present(blob, tokens):
@@ -340,6 +391,7 @@ def main():
                 "id": "8001",
                 "type": 0,
                 "content": "hello from source",
+                "timestamp": "2026-10-27T12:00:00+00:00",
                 "author": FakeDiscord.author("300000000000000001", "delta", "Delta"),
                 "attachments": [{"url": "https://cdn.example/one.png"}],
                 "embeds": [],
@@ -395,6 +447,7 @@ def main():
         first_post = fake_discord.posts[0]["body"]
         second_post = fake_discord.posts[1]["body"]
         check("**Delta**" in first_post.get("content", ""), "author attribution is included")
+        check("<t:" in first_post.get("content", "") and ":f>" in first_post.get("content", ""), "the original sent time is included")
         check("hello from source" in first_post.get("content", ""), "message text is forwarded")
         check("https://cdn.example/one.png" in first_post.get("content", ""), "attachment URL is forwarded")
         check("https://example.com/read" in second_post.get("content", ""), "embed URL is forwarded")
@@ -520,6 +573,115 @@ def main():
         check(status == 200 and mirror_rule(state_of(toggled)).get("enabled") is True, "a mirror rule can be resumed")
         check(not tokens_present(toggled, ["tok-alpha-111", "tok-beta-222"]), "rule toggle response has no tokens")
 
+        # Webhook mode recreates the source identity at the destination. The
+        # managed webhook URL is a secret: only the server holds it.
+        status, dm_rejected = request(
+            "POST",
+            "/api/mirror/rules",
+            {
+                "name": "Webhook into a DM",
+                "sourceAccountId": alpha_row.get("id"),
+                "sourceChannel": "111111111111111111",
+                "destAccountId": beta_row.get("id"),
+                "destChannel": "555555555555555555",
+                "mode": "webhook",
+                "enabled": False,
+            },
+        )
+        check(status == 400 and "webhook mode needs a server" in dm_rejected.get("error", "").lower(), "webhook mode rejects private destinations", str(dm_rejected)[:300])
+        check(fake_discord.webhook_creates == [], "a rejected webhook destination creates no webhook")
+
+        status, hook_created = request(
+            "POST",
+            "/api/mirror/rules",
+            {
+                "name": "Identity relay",
+                "sourceAccountId": alpha_row.get("id"),
+                "sourceChannel": "111111111111111111",
+                "destAccountId": beta_row.get("id"),
+                "destChannel": "222222222222222222",
+                "mode": "webhook",
+                "enabled": False,
+            },
+        )
+        hook_state = state_of(hook_created)
+        hook_rule = mirror_rule_by_id(hook_state, (hook_created.get("rule") or {}).get("id"))
+        hook_id = (hook_rule or {}).get("id")
+        check(status == 200 and hook_rule and hook_rule.get("mode") == "webhook", "a webhook relay is created", str(hook_created)[:400])
+        check(hook_rule and hook_rule.get("webhookSet") is True, "the public rule reports a ready webhook")
+        check(len(fake_discord.webhook_creates) == 1 and fake_discord.webhook_creates[0]["token"] == "tok-beta-222", "the destination account creates the webhook")
+        check(fake_discord.webhook_creates[0]["webhook"]["channel_id"] == "222222222222222222", "the webhook belongs to the destination channel")
+        secret = json.loads((DATA / "secret.json").read_text())
+        private_hook = (secret.get("mirrorWebhooks") or {}).get(hook_id) or {}
+        check(bool(private_hook.get("token")), "the webhook token is stored privately")
+        check(private_hook.get("token") not in json.dumps(hook_created), "the webhook token is not returned to the browser")
+
+        fake_discord.add_message(
+            {
+                "id": "8012",
+                "type": 0,
+                "content": "webhook post",
+                "author": FakeDiscord.author(
+                    "300000000000000001", "delta", "Delta", avatar="abc123avatar"
+                ),
+            }
+        )
+        status, hook_run = request("POST", "/api/mirror/run", {"id": hook_id})
+        check(status == 200 and hook_run.get("mirrored") == 1, "webhook mode forwards a message", str(hook_run)[:300])
+        check(len(fake_discord.webhook_posts) == 1 and len(fake_discord.posts) == 6, "webhook mode does not post with the account")
+        hook_post = fake_discord.webhook_posts[0]
+        check(hook_post["token"] == "", "webhook execution sends no account token")
+        check(hook_post["body"].get("username") == "Delta", "the webhook name is the sender display name")
+        check("abc123avatar" in hook_post["body"].get("avatar_url", ""), "the webhook avatar is the sender avatar")
+        check(hook_post["body"].get("content", "").startswith("webhook post") and hook_post["body"].get("content", "").endswith(loop_mark), "the webhook body is the message with the loop marker")
+        check("**Delta**" not in hook_post["body"].get("content", ""), "webhook mode omits the normal author header")
+        check(hook_post["body"].get("allowed_mentions") == {"parse": []}, "webhook posts disable mentions")
+        hook_public = mirror_rule_by_id(state_of(request("GET", "/api/state")[1]), hook_id) or {}
+        check(hook_public.get("webhookSet") is True, "public state confirms the webhook without a URL")
+        check(private_hook.get("token") not in json.dumps(hook_public), "public state never contains the webhook token")
+
+        fake_discord.add_message(
+            {
+                "id": "8013",
+                "type": 0,
+                "content": "webhook rate limited",
+                "author": FakeDiscord.author("300000000000000001", "delta", "Delta"),
+            }
+        )
+        secret_url = f"https://discord.com/api/webhooks/{private_hook.get('id')}/{private_hook.get('token')}"
+        fake_discord.fail_webhook = server.DiscordError(
+            429, f"You are being rate limited at {secret_url}", {"retry_after": 0.25}
+        )
+        status, hook_failed = request("POST", "/api/mirror/run", {"id": hook_id})
+        failed_blob = json.dumps(hook_failed)
+        check(status == 200 and (hook_failed.get("results") or [{}])[0].get("error"), "webhook rate limits are reported", failed_blob[:300])
+        check(private_hook.get("token") not in failed_blob and secret_url not in failed_blob, "webhook errors scrub the private URL")
+        failed_public = json.dumps(state_of(request("GET", "/api/state")[1]))
+        check(private_hook.get("token") not in failed_public and secret_url not in failed_public, "webhook state scrubs the private URL")
+        log_text = (DATA / "kizzey.log").read_text() if (DATA / "kizzey.log").exists() else ""
+        check(private_hook.get("token") not in log_text and secret_url not in log_text, "webhook logs scrub the private URL")
+        fake_discord.fail_webhook = None
+
+        status, normal_edit = request("POST", "/api/mirror/rules", {"id": hook_id, "mode": "normal"})
+        normal_rule = mirror_rule_by_id(state_of(normal_edit), hook_id)
+        check(status == 200 and normal_rule and normal_rule.get("mode") == "normal", "a relay can switch back to normal mode", str(normal_edit)[:300])
+        check(normal_rule and normal_rule.get("webhookSet") is False, "normal mode reports no managed webhook")
+        check(fake_discord.webhook_deletes == [private_hook.get("id")], "switching to normal mode deletes the webhook")
+        secret = json.loads((DATA / "secret.json").read_text())
+        check(hook_id not in (secret.get("mirrorWebhooks") or {}), "switching to normal mode forgets the webhook token")
+
+        status, hook_again = request("POST", "/api/mirror/rules", {"id": hook_id, "mode": "webhook"})
+        again_rule = mirror_rule_by_id(state_of(hook_again), hook_id)
+        again_hook = (json.loads((DATA / "secret.json").read_text()).get("mirrorWebhooks") or {}).get(hook_id) or {}
+        check(status == 200 and again_rule and again_rule.get("webhookSet") is True, "switching back to webhook mode recreates the webhook")
+        check(again_hook.get("id") and again_hook.get("id") != private_hook.get("id"), "recreated webhooks use a fresh identity")
+
+        status, hook_deleted = request("POST", "/api/mirror/rules/delete", {"id": hook_id})
+        check(status == 200 and mirror_rule_by_id(state_of(hook_deleted), hook_id) is None, "a webhook relay can be deleted")
+        secret = json.loads((DATA / "secret.json").read_text())
+        check(hook_id not in (secret.get("mirrorWebhooks") or {}), "deleting a relay removes its webhook token")
+        check(again_hook.get("id") in fake_discord.webhook_deletes, "deleting a relay removes its Discord webhook")
+
         status, exported = request("GET", "/api/export")
         check(status == 200 and exported.get("format") == "kizzey-web-backup", "web backup remains available")
         blob = json.dumps(exported)
@@ -593,6 +755,7 @@ def main():
                     "sourceChannel": "111111111111111111",
                     "destAccountId": "acct_missing2",
                     "destChannel": "222222222222222222",
+                    "mode": "webhook",
                     "primed": True,
                     "lastSeenId": "8011",
                 }
@@ -612,6 +775,7 @@ def main():
         check(imported_state.get("mirror", {}).get("enabled") is False, "imported auto mirror stays paused")
         check(imported_rule and imported_rule.get("enabled") is False, "imported relay stays paused")
         check(imported_rule and "imported paused" in imported_rule.get("lastError", "").lower(), "imported relay explains the pause")
+        check(imported_rule and imported_rule.get("mode") == "webhook" and imported_rule.get("webhookSet") is False, "an imported webhook relay has no webhook until reviewed")
         check(any("mirror rule" in warning.lower() for warning in (imported.get("import") or {}).get("warnings", [])), "import reports the paused relay")
         check(imported_rule and imported_rule.get("lastSeenId") == "8011", "import preserves the cursor for review")
 

@@ -186,6 +186,7 @@ function accountsState(overrides = {}) {
   check(html.includes('1 relay enabled') && html.includes('1 of 20 relays used'), 'mirror screen shows usage against the rule limit');
   check(html.includes('Support relay') && html.includes('#source-room') && html.includes('#dest-room'), 'mirror rule shows its route');
   check(html.includes('Alpha') && html.includes('Beta'), 'mirror routes name both account owners');
+  check(html.includes('Normal message'), 'a relay defaults to the normal message format');
   check(html.includes('Run now') && html.includes('Edit') && html.includes('aria-label="Delete relay"'), 'mirror rule offers run, edit and delete actions');
   check((html.match(/aria-pressed="true"/g) || []).length >= 2, 'global and per-rule switches reflect their enabled state');
   check(html.includes('data-action="mirror-interval" data-value="20"') && html.includes('>20s</button>'), 'active mirror interval is shown as a chip');
@@ -198,6 +199,15 @@ function accountsState(overrides = {}) {
   check(html.includes('Auto mirror is off') && html.includes('Automatic mirroring is paused'), 'mirror screen shows paused auto mode');
   check(html.includes('Queued'), 'an enabled relay waits while auto mirror is off');
   check(html.includes('&lt;b&gt;rate limit&lt;/b&gt;'), 'relay errors are HTML escaped');
+
+  state = accountsState();
+  state.mirror.rules[0].mode = 'webhook';
+  state.mirror.rules[0].webhookSet = true;
+  html = K.screens.mirror.render();
+  check(html.includes('Webhook identity') && !html.includes('relay webhook is not ready'), 'a ready webhook relay is shown as webhook mode');
+  state.mirror.rules[0].webhookSet = false;
+  html = K.screens.mirror.render();
+  check(html.includes('relay webhook is not ready'), 'an unprovisioned webhook relay is flagged');
 
   state = accountsState();
   state.mirrorRuleLimit = 1;
@@ -295,6 +305,8 @@ function accountsState(overrides = {}) {
   check(sheet.body.includes('id="mirror-include-embeds" type="checkbox" checked'), 'embeds are copied by default');
   check(sheet.body.includes('id="mirror-enabled" type="checkbox" checked'), 'new relays are enabled by default');
   check(sheet.body.includes('Copy numeric channel IDs'), 'relay sheet explains how to find channel IDs');
+  check(sheet.body.includes('id="mirror-mode"') && sheet.body.includes('value="normal" selected'), 'relay sheet offers normal mode by default');
+  check(sheet.body.includes('value="webhook"') && sheet.body.includes('Manage Webhooks'), 'relay sheet explains webhook mode requirements');
 
   state = accountsState();
   state.mirror.rules[0].includeOwn = true;
@@ -306,12 +318,20 @@ function accountsState(overrides = {}) {
   check(sheet.body.includes('id="mirror-include-own" type="checkbox" checked') && sheet.body.includes('id="mirror-include-bots" type="checkbox" checked'), 'relay edit preserves filter choices');
 
   state = accountsState();
+  state.mirror.rules[0].mode = 'webhook';
+  state.mirror.rules[0].webhookSet = true;
+  K.actions['mirror-edit']({ dataset: { id: 'mirror_rule1' } });
+  sheet = calls.sheets.at(-1);
+  check(sheet.body.includes('value="webhook" selected'), 'relay edit preserves webhook mode');
+
+  state = accountsState();
   fields = {
     'mirror-name': input('Edited relay'),
     'mirror-source-account': input('acct_alpha1'),
     'mirror-source-channel': input('111111111111111111'),
     'mirror-dest-account': input('acct_beta22'),
     'mirror-dest-channel': input('222222222222222222'),
+    'mirror-mode': input('webhook'),
     'mirror-include-own': input('', true),
     'mirror-include-bots': input('', false),
     'mirror-include-attachments': input('', true),
@@ -330,6 +350,7 @@ function accountsState(overrides = {}) {
   check(calls.api.at(-1).endpoint === '/api/mirror/rules', 'relay save posts to the mirror API');
   check(savedBody.id === 'mirror_rule1' && savedBody.sourceChannel === '111111111111111111' && savedBody.destChannel === '222222222222222222', 'relay save sends IDs and channels');
   check(savedBody.includeOwn === true && savedBody.includeBots === false && savedBody.includeEmbeds === false, 'relay save sends filter choices');
+  check(savedBody.mode === 'webhook', 'relay save sends the post format');
   check(calls.toasts.at(-1).title === 'Relay updated' && calls.renders >= 1, 'relay save reports success and refreshes');
 
   fields = {
@@ -356,6 +377,20 @@ function accountsState(overrides = {}) {
   calls.api.length = 0;
   await K.actions['mirror-rule-toggle']({ dataset: { id: 'mirror_rule1' }, disabled: false });
   check(calls.api.at(-1).endpoint === '/api/mirror/rules/toggle' && calls.api.at(-1).options.body.enabled === false, 'rule switch posts the inverse state');
+
+  state = accountsState();
+  state.mirror.rules[0].enabled = false;
+  state.mirror.rules[0].mode = 'webhook';
+  state.mirror.rules[0].webhookSet = false;
+  apiReply = {
+    ok: true,
+    warning: 'Webhook mode could not create a webhook in the destination channel.',
+    rule: { id: 'mirror_rule1', enabled: false, mode: 'webhook', webhookSet: false },
+    state: accountsState(),
+  };
+  calls.toasts.length = 0;
+  await K.actions['mirror-rule-toggle']({ dataset: { id: 'mirror_rule1' }, disabled: false });
+  check(calls.toasts.at(-1).title === 'Relay could not start' && calls.toasts.at(-1).type === 'error', 'a failed webhook enablement stays paused');
 
   state = accountsState();
   apiReply = {

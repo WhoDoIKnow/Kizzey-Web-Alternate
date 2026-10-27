@@ -72,9 +72,22 @@ saved-account switching plus the message forwarder below.
 ## Message mirror
 
 **Settings → Message mirror** forwards new messages from a source channel to a destination
-channel. Each rule selects a source account, source channel ID, destination account and
-destination channel ID, and can include or skip your own messages, bots/webhooks, attachment
-links and embed links. Copy numeric channel IDs from Discord with Developer Mode enabled.
+channel. Each rule selects a source account, source channel ID, destination account, destination
+channel ID, a post format and optional own-message, bot, attachment and embed filters. Copy
+numeric channel IDs from Discord with Developer Mode enabled.
+
+Two post formats are available per rule:
+
+- **Normal message** posts with the destination account. The post shows the sender's display
+  name and username, the original sent time as a Discord timestamp, then the message text and
+  links. It works with server channels, threads, DMs and group DMs.
+- **Webhook identity** posts each message through a webhook managed by Kizzey. The webhook uses
+  the sender's display name and avatar, and the webhook content is the message text and links.
+  Discord displays the relay's post time. The destination must be a server text or announcement
+  channel, and the destination account needs **Manage Webhooks**. The webhook is created when the
+  rule is saved, reused on later checks, deleted when the rule switches to normal mode or is
+  removed, and purged when every account is removed. DMs, group DMs and threads cannot use
+  webhook mode.
 
 The server is a poller, not a gateway listener. A new rule records the newest source message as
 its starting cursor, so existing history is never backfilled. Only messages after that cursor
@@ -84,17 +97,19 @@ responses set a retry cooldown. Background checks need both the global auto-mirr
 individual rule enabled. **Run now** bypasses both pause switches and the retry cooldown so an
 operator can test a rule deliberately.
 
-Forwarded posts include an author label, message text, attachment URLs, embed URLs and sticker
-names, use `allowed_mentions: {parse: []}` so text cannot ping anyone, and end with an invisible
-`U+2063` marker. System messages, bots and the source account's own messages are skipped by
-default; the marker prevents a relay from forwarding its own output again. Edits, deletes,
-reactions, replies, threads and voice state are not synchronised.
+Forwarded posts include message text, attachment URLs, embed URLs and sticker names, use
+`allowed_mentions: {parse: []}` so text cannot ping anyone, and end with an invisible `U+2063`
+marker. System messages, bots and the source account's own messages are skipped by default; the
+marker prevents a relay from forwarding its own output again. Edits, deletes, reactions, replies,
+threads and voice state are not synchronised.
 
 The limits are 20 rules, a 5–300 second interval (default 12), and eight saved accounts. Rules
-store account IDs, channel IDs, labels, counters and the last message ID — never tokens. A web
-backup can carry mirror configuration, but every imported rule is restored paused until it is
-reviewed. Forwarding with user tokens is self-bot behaviour and may conflict with Discord's
-terms; use relays only in channels you control.
+store account IDs, channel IDs, labels, the post format, counters and the last message ID — never
+tokens or webhook URLs. Managed webhook URLs are stored only in `data/secret.json`; public state
+exposes a `webhookSet` flag. A web backup can carry mirror configuration, but every imported rule
+is restored paused until it is reviewed. Imported webhook rules have no webhook until they are
+saved or enabled. Forwarding with user tokens is self-bot behaviour and may conflict with
+Discord's terms; use relays only in channels you control.
 
 ## Importing from Kizzey for Android
 
@@ -156,7 +171,7 @@ against a stubbed Material runtime.
 - Persistent history, server logs and usage counters
 - Saved presets, a gallery with local submissions, and automation schedules
 - Up to eight saved Discord accounts with server-side token isolation and active fallback
-- A real, rate-limited message mirror between channels and saved accounts
+- A real, rate-limited message mirror with normal and managed-webhook identity formats
 - Optional album-art backdrop and artwork-sampled accent colour in Display settings
 - Custom CSS variables, text scaling, themes, AMOLED mode and Material You-style accents
 
@@ -205,7 +220,7 @@ State is JSON under `data/`:
 
 ```text
 data/state.json     settings, presets, mirror rules, chat, history, wallet, UI state
-data/secret.json    private Discord tokens and active-account ID
+data/secret.json    private Discord tokens, active-account ID and managed webhook URLs
 data/history.json   presence-history mirror
 data/kizzey.log     server event log
 data/uploads/       local chat images, avatars and screen captures

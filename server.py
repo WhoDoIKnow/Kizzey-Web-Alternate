@@ -79,6 +79,8 @@ MIRROR_SEEN_LIMIT = 180
 MIRROR_MARK = "\u2063"
 MIRROR_DEFAULT_INTERVAL = 12
 MIRROR_MAX_MESSAGES = 30
+MIRROR_MODES = ("normal", "webhook")
+MIRROR_WEBHOOK_LOCK = threading.RLock()
 SERVER_STARTED = time.monotonic()
 
 MIME_OVERRIDES = {
@@ -205,12 +207,22 @@ def _scrub(text: str) -> str:
             for account in STORE.secret.get("accounts", []) or []:
                 if isinstance(account, dict) and account.get("token"):
                     tokens.append(str(account["token"]))
+            webhooks = STORE.secret.get("mirrorWebhooks")
+            if isinstance(webhooks, dict):
+                for webhook in webhooks.values():
+                    if isinstance(webhook, dict) and webhook.get("token"):
+                        tokens.append(str(webhook["token"]))
     except Exception:
         pass
     for token in sorted(set(tokens), key=len, reverse=True):
         if len(token) > 8:
             text = text.replace(token, "••••••••")
     text = re.sub(r"[\w-]{20,}\.[\w-]{5,}\.[\w-]{20,}", "••••••••", text)
+    text = re.sub(
+        r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_.-]+",
+        "••••••••",
+        text,
+    )
     return text
 
 
@@ -704,6 +716,34 @@ def _snowflake_text(value, limit: int = 32) -> str:
     return text if text.isdigit() and len(text) <= limit else ""
 
 
+def normalize_mirror_mode(value) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in MIRROR_MODES else "normal"
+
+
+def _coerce_mirror_webhook(raw) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    webhook_id = _snowflake_text(raw.get("id"))
+    channel_id = _snowflake_text(raw.get("channelId"))
+    token = str(raw.get("token") or "").strip()
+    if not webhook_id or not channel_id or not token:
+        return None
+    if len(token) > 200 or not re.fullmatch(r"[A-Za-z0-9_.-]{10,200}", token):
+        return None
+    name = str(raw.get("name") or "Kizzey mirror").strip()[:80] or "Kizzey mirror"
+    created = raw.get("createdAt")
+    if not isinstance(created, (int, float)):
+        created = now_ms()
+    return {
+        "id": webhook_id,
+        "token": token,
+        "channelId": channel_id,
+        "name": name,
+        "createdAt": created,
+    }
+
+
 def _nonneg_int(value, default: int = 0, cap: int = 1_000_000_000) -> int:
     try:
         number = int(float(value))
@@ -750,6 +790,7 @@ def normalize_mirror_rule(raw: dict, *, fresh: bool = False) -> dict | None:
         "destAccountId": dest_account,
         "destChannel": dest_channel,
         "destLabel": dest_label or ("#" + dest_channel),
+        "mode": normalize_mirror_mode(raw.get("mode")),
         "includeOwn": _mirror_bool(raw.get("includeOwn"), False),
         "includeBots": _mirror_bool(raw.get("includeBots"), False),
         "includeAttachments": _mirror_bool(raw.get("includeAttachments"), True),
@@ -762,7 +803,7 @@ def normalize_mirror_rule(raw: dict, *, fresh: bool = False) -> dict | None:
         "mirrored": _nonneg_int(raw.get("mirrored")),
         "skipped": _nonneg_int(raw.get("skipped")),
         "failures": _nonneg_int(raw.get("failures")),
-        "retryAfter": _nonneg_int(raw.get("retryAfter")),
+        "retryAfter": _nonneg_int(raw.get("retryAfter"), cap=10**15),
         "createdAt": raw.get("createdAt") if isinstance(raw.get("createdAt"), (int, float)) else now,
         "updatedAt": raw.get("updatedAt") if isinstance(raw.get("updatedAt"), (int, float)) else now,
     }
@@ -925,6 +966,14 @@ class Store:
         self.state["gateway"]["connected"] = False
         self.state["gateway"]["state"] = "offline"
         self.state["mirror"] = normalize_mirror_state(self.state.get("mirror"))
+        raw_webhooks = self.secret.get("mirrorWebhooks")
+        webhooks = {}
+        if isinstance(raw_webhooks, dict):
+            for rule_id, raw in raw_webhooks.items():
+                record = _coerce_mirror_webhook(raw)
+                if record and str(rule_id).startswith("mirror_"):
+                    webhooks[str(rule_id)] = record
+        self.secret["mirrorWebhooks"] = webhooks
         self.state["version"] = VERSION
         self.state["logs"] = []
         self._normalize_accounts()
@@ -1335,6 +1384,7 @@ def public_state() -> dict:
         data = json.loads(json.dumps(STORE.state, ensure_ascii=False))
         accounts = STORE.public_accounts()
         data["accounts"] = accounts
+        data["mirror"] = public_mirror_state()
         data["accountCount"] = len(accounts)
         data["accountLimit"] = ACCOUNT_LIMIT
         data["mirrorRuleLimit"] = MIRROR_RULE_LIMIT
@@ -3475,6 +3525,170 @@ def fetch_mirror_channel(token: str, channel_id: str) -> dict:
     }
 
 
+def _mirror_webhook_for(rule_id: str) -> dict | None:
+    if not rule_id or STORE is None:
+        return None
+    with STORE.lock:
+        webhooks = STORE.secret.get("mirrorWebhooks")
+        raw = webhooks.get(rule_id) if isinstance(webhooks, dict) else None
+        record = _coerce_mirror_webhook(raw)
+        return copy.deepcopy(record) if record else None
+
+
+def _store_mirror_webhook(rule_id: str, record: dict) -> None:
+    assert STORE is not None
+    with STORE.lock:
+        webhooks = STORE.secret.setdefault("mirrorWebhooks", {})
+        if not isinstance(webhooks, dict):
+            webhooks = {}
+            STORE.secret["mirrorWebhooks"] = webhooks
+        webhooks[rule_id] = copy.deepcopy(record)
+        STORE.save()
+
+
+def _forget_mirror_webhook(rule_id: str) -> None:
+    assert STORE is not None
+    with STORE.lock:
+        webhooks = STORE.secret.get("mirrorWebhooks")
+        if isinstance(webhooks, dict) and rule_id in webhooks:
+            webhooks.pop(rule_id, None)
+            STORE.save()
+
+
+def _delete_discord_webhook(record: dict) -> bool:
+    """Delete a webhook with its own token. True means local cleanup is safe."""
+    webhook_id = _snowflake_text((record or {}).get("id"))
+    token = str((record or {}).get("token") or "").strip()
+    if not webhook_id or not token:
+        return True
+    try:
+        discord_api(f"/webhooks/{webhook_id}/{token}", "", method="DELETE", timeout=6)
+        return True
+    except DiscordError as exc:
+        if exc.status in (401, 403, 404):
+            return True
+        if STORE:
+            STORE.log("WARN", "Mirror", f"Could not delete a managed webhook: {_scrub(exc.message)}")
+        return False
+    except Exception as exc:
+        if STORE:
+            STORE.log("WARN", "Mirror", f"Could not delete a managed webhook: {_scrub(exc)}")
+        return False
+
+
+def delete_mirror_webhook(rule_id: str, *, remote: bool = True, forget_on_failure: bool = False) -> None:
+    with MIRROR_WEBHOOK_LOCK:
+        record = _mirror_webhook_for(rule_id)
+        if not record:
+            return
+        if remote and not _delete_discord_webhook(record):
+            if forget_on_failure:
+                _forget_mirror_webhook(rule_id)
+            return
+        _forget_mirror_webhook(rule_id)
+
+
+def purge_mirror_webhooks(*, forget_on_failure: bool = False) -> int:
+    count = 0
+    with MIRROR_WEBHOOK_LOCK:
+        if STORE is None:
+            return 0
+        with STORE.lock:
+            webhooks = STORE.secret.get("mirrorWebhooks")
+            rule_ids = list(webhooks.keys()) if isinstance(webhooks, dict) else []
+        for rule_id in rule_ids:
+            delete_mirror_webhook(str(rule_id), remote=True, forget_on_failure=forget_on_failure)
+            count += 1
+    return count
+
+
+def execute_discord_webhook(record: dict, payload: dict) -> dict | None:
+    webhook_id = _snowflake_text((record or {}).get("id"))
+    token = str((record or {}).get("token") or "").strip()
+    if not webhook_id or not token:
+        raise ValueError("The relay webhook is missing. Edit the relay and save it again.")
+    return discord_api(
+        f"/webhooks/{webhook_id}/{token}?wait=true",
+        "",
+        method="POST",
+        body=payload,
+        timeout=20,
+    )
+
+
+def ensure_mirror_webhook(rule: dict, dest_token: str, dest_info: dict | None = None) -> dict:
+    assert STORE is not None
+    rule_id = str((rule or {}).get("id") or "")
+    dest_channel = _snowflake_text((rule or {}).get("destChannel"))
+    if not rule_id or not dest_channel:
+        raise ValueError("That mirror rule is missing its destination.")
+    with MIRROR_WEBHOOK_LOCK:
+        existing = _mirror_webhook_for(rule_id)
+        if existing and str(existing.get("channelId") or "") == dest_channel:
+            return existing
+        if existing:
+            delete_mirror_webhook(rule_id, remote=True)
+            if _mirror_webhook_for(rule_id):
+                raise ValueError("The old relay webhook could not be removed. Delete it in Discord and try again.")
+        if not dest_token:
+            raise ValueError("The destination account needs a Discord token for webhook mode.")
+        if dest_info is None:
+            dest_info = fetch_mirror_channel(dest_token, dest_channel)
+        if int(dest_info.get("type") or 0) not in (0, 5):
+            raise ValueError(
+                "Webhook mode needs a server text or announcement channel as the destination. "
+                "Use normal mode for DMs, group DMs and threads."
+            )
+        name = re.sub(r"[\x00-\x1f\x7f]", "", f"Kizzey · {rule.get('name') or 'Message relay'}")
+        name = " ".join(name.split()).strip()[:80] or "Kizzey mirror"
+        try:
+            created = discord_api(
+                f"/channels/{dest_channel}/webhooks",
+                dest_token,
+                method="POST",
+                body={"name": name},
+                timeout=15,
+            )
+        except DiscordError as exc:
+            if exc.status in (401, 403, 404):
+                raise ValueError(
+                    "Webhook mode could not create a webhook in the destination channel. "
+                    "The destination account needs Manage Webhooks permission."
+                ) from None
+            raise
+        record = _coerce_mirror_webhook(
+            {
+                "id": (created or {}).get("id") if isinstance(created, dict) else "",
+                "token": (created or {}).get("token") if isinstance(created, dict) else "",
+                "channelId": (created or {}).get("channel_id") if isinstance(created, dict) else dest_channel,
+                "name": (created or {}).get("name") if isinstance(created, dict) else name,
+            }
+        )
+        if not record:
+            raise DiscordError(0, "Discord did not return a usable webhook.")
+        _store_mirror_webhook(rule_id, record)
+        STORE.log("INFO", "Mirror", "Created a managed webhook for a relay.")
+        return copy.deepcopy(record)
+
+
+def public_mirror_rule(rule: dict) -> dict:
+    result = copy.deepcopy(rule or {})
+    result["mode"] = normalize_mirror_mode(result.get("mode"))
+    rule_id = str(result.get("id") or "")
+    record = _mirror_webhook_for(rule_id) if result["mode"] == "webhook" else None
+    result["webhookSet"] = bool(
+        record and str(record.get("channelId") or "") == str(result.get("destChannel") or "")
+    )
+    return result
+
+
+def public_mirror_state() -> dict:
+    with STORE.lock:
+        mirror = normalize_mirror_state(STORE.state.get("mirror"))
+    mirror["rules"] = [public_mirror_rule(rule) for rule in mirror.get("rules", [])]
+    return mirror
+
+
 def mirror_should_skip(message: dict, rule: dict, source_user_id: str = "") -> tuple[bool, str]:
     if not isinstance(message, dict):
         return True, "malformed"
@@ -3491,13 +3705,43 @@ def mirror_should_skip(message: dict, rule: dict, source_user_id: str = "") -> t
     return False, ""
 
 
-def build_mirror_content(message: dict, rule: dict) -> str:
-    author = message.get("author") if isinstance(message.get("author"), dict) else {}
-    display = str(author.get("global_name") or author.get("username") or "Discord user").strip()
-    username = str(author.get("username") or "").strip()
-    label = display
-    if username and username.lower() not in display.lower():
-        label += f" (@{username})"
+def mirror_author(message: dict) -> dict:
+    author = message.get("author") if isinstance(message, dict) else None
+    return author if isinstance(author, dict) else {}
+
+
+def mirror_sent_markup(message: dict) -> str:
+    sent = parse_timestamp((message or {}).get("timestamp"))
+    if not sent:
+        return ""
+    return f"<t:{int(sent / 1000)}:f>"
+
+
+def mirror_author_avatar_url(message: dict) -> str:
+    author = mirror_author(message)
+    user_id = str(author.get("id") or "").strip()
+    avatar = str(author.get("avatar") or "").strip()
+    if not user_id:
+        return ""
+    if avatar:
+        ext = "gif" if avatar.startswith("a_") else "png"
+        return f"https://cdn.discordapp.com/avatars/{user_id}/{avatar}.{ext}?size=128"
+    try:
+        index = (int(user_id) >> 22) % 6
+    except Exception:
+        index = 0
+    return f"https://cdn.discordapp.com/embed/avatars/{index}.png"
+
+
+def mirror_webhook_username(message: dict) -> str:
+    author = mirror_author(message)
+    name = str(author.get("global_name") or author.get("username") or "Discord user")
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name)
+    name = " ".join(name.split()).strip()[:80]
+    return name or "Discord user"
+
+
+def mirror_extra_parts(message: dict, rule: dict) -> list[str]:
     body = str(message.get("content") or "").strip()
     extras: list[str] = []
     if rule.get("includeAttachments", True):
@@ -3520,17 +3764,52 @@ def build_mirror_content(message: dict, rule: dict) -> str:
             stickers.append(str(sticker["name"]))
     if stickers:
         extras.append("[Sticker: " + ", ".join(stickers[:3]) + "]")
-    parts = [f"**{label}**"]
-    if body:
-        parts.append(body)
-    parts.extend(extras)
+    return extras
+
+
+def _finish_mirror_content(parts: list[str]) -> str:
     content = "\n".join(part for part in parts if part).strip()
-    if not content or not body and not extras:
+    if not content:
         return ""
     limit = 1988 - len(MIRROR_MARK)
     if len(content) > limit:
         content = content[:limit].rstrip()
     return content + MIRROR_MARK
+
+
+def build_mirror_content(message: dict, rule: dict) -> str:
+    author = mirror_author(message)
+    display = str(author.get("global_name") or author.get("username") or "Discord user").strip()
+    username = str(author.get("username") or "").strip()
+    label = display or "Discord user"
+    if username and username.lower() not in label.lower():
+        label += f" (@{username})"
+    sent = mirror_sent_markup(message)
+    header = f"**{label}**" + (f" · {sent}" if sent else "")
+    body = str(message.get("content") or "").strip()
+    extras = mirror_extra_parts(message, rule)
+    if not body and not extras:
+        return ""
+    return _finish_mirror_content([header, body, *extras])
+
+
+def build_mirror_webhook_payload(message: dict, rule: dict) -> dict | None:
+    body = str(message.get("content") or "").strip()
+    extras = mirror_extra_parts(message, rule)
+    if not body and not extras:
+        return None
+    content = _finish_mirror_content([body, *extras])
+    if not content:
+        return None
+    payload = {
+        "username": mirror_webhook_username(message),
+        "content": content,
+        "allowed_mentions": {"parse": []},
+    }
+    avatar = mirror_author_avatar_url(message)
+    if avatar:
+        payload["avatar_url"] = avatar
+    return payload
 
 
 class MessageMirror:
@@ -3693,6 +3972,24 @@ class MessageMirror:
                 result["manual"] = manual
                 return result
 
+            mode = normalize_mirror_mode(snapshot.get("mode"))
+            webhook = None
+            if mode == "webhook":
+                try:
+                    webhook = ensure_mirror_webhook(snapshot, snapshot["_destToken"])
+                except (DiscordError, ValueError) as exc:
+                    message = exc.message if isinstance(exc, DiscordError) else str(exc)
+                    updated = self._record_error(
+                        snapshot, f"Webhook mode is not ready: {_scrub(message)}", retry_seconds=30
+                    )
+                    return {
+                        "ruleId": rule_id,
+                        "mirrored": 0,
+                        "skipped": 0,
+                        "error": updated.get("lastError"),
+                        "retryAfter": updated.get("retryAfter"),
+                    }
+
             source = snapshot["sourceChannel"]
             cursor = snapshot.get("lastSeenId") or ""
             path = f"/channels/{source}/messages?limit=50"
@@ -3722,7 +4019,14 @@ class MessageMirror:
                 if not message_id:
                     continue
                 skip, reason = mirror_should_skip(message, snapshot, snapshot.get("_sourceUserId", ""))
-                content = "" if skip else build_mirror_content(message, snapshot)
+                payload = None
+                content = ""
+                if not skip:
+                    if mode == "webhook":
+                        payload = build_mirror_webhook_payload(message, snapshot)
+                        content = str((payload or {}).get("content") or "")
+                    else:
+                        content = build_mirror_content(message, snapshot)
                 if skip or not content:
                     current_cursor = message_id
                     skipped += 1
@@ -3749,18 +4053,22 @@ class MessageMirror:
                     or (not manual and not latest_rule.get("enabled"))
                     or latest_rule.get("sourceChannel") != source
                     or latest_rule.get("destChannel") != snapshot.get("destChannel")
+                    or normalize_mirror_mode(latest_rule.get("mode")) != mode
                     or latest_rule.get("_sourceToken") != snapshot.get("_sourceToken")
                     or latest_rule.get("_destToken") != snapshot.get("_destToken")
                 ):
                     break
                 try:
-                    discord_api(
-                        f"/channels/{snapshot['destChannel']}/messages",
-                        snapshot["_destToken"],
-                        method="POST",
-                        body={"content": content, "allowed_mentions": {"parse": []}},
-                        timeout=20,
-                    )
+                    if mode == "webhook":
+                        execute_discord_webhook(webhook, payload)
+                    else:
+                        discord_api(
+                            f"/channels/{snapshot['destChannel']}/messages",
+                            snapshot["_destToken"],
+                            method="POST",
+                            body={"content": content, "allowed_mentions": {"parse": []}},
+                            timeout=20,
+                        )
                     self._last_post_at = time.monotonic()
                     mirrored += 1
                     current_cursor = message_id
@@ -3781,7 +4089,10 @@ class MessageMirror:
                             retry = float(exc.data.get("retry_after") or 0)
                         except Exception:
                             retry = None
-                    updated = self._record_error(snapshot, f"Could not post to the destination channel: {exc.message}", retry_seconds=retry)
+                    if mode == "webhook" and exc.status == 404:
+                        delete_mirror_webhook(rule_id, remote=False)
+                    where = "the relay webhook" if mode == "webhook" else "the destination channel"
+                    updated = self._record_error(snapshot, f"Could not post to {where}: {exc.message}", retry_seconds=retry)
                     return {
                         "ruleId": rule_id,
                         "mirrored": mirrored,
@@ -3858,6 +4169,7 @@ def save_mirror_rule(data: dict) -> tuple[dict, str]:
     source_info = fetch_mirror_channel(source_token, source_channel)
     dest_info = fetch_mirror_channel(dest_token, dest_channel)
     base = existing or {}
+    mode = normalize_mirror_mode(data.get("mode") if "mode" in data else base.get("mode"))
     enabled = _mirror_bool(data.get("enabled"), bool(base.get("enabled", True)))
     source_changed = (
         not existing
@@ -3872,6 +4184,7 @@ def save_mirror_rule(data: dict) -> tuple[dict, str]:
         "destAccountId": dest_account_id,
         "destChannel": dest_channel,
         "destLabel": dest_info["label"],
+        "mode": mode,
         "enabled": enabled,
         "includeOwn": _mirror_bool(data.get("includeOwn"), bool(base.get("includeOwn", False))),
         "includeBots": _mirror_bool(data.get("includeBots"), bool(base.get("includeBots", False))),
@@ -3896,6 +4209,19 @@ def save_mirror_rule(data: dict) -> tuple[dict, str]:
     rule = normalize_mirror_rule(draft, fresh=not existing)
     if not rule:
         raise ValueError("Mirror rule details are invalid.")
+    if not existing:
+        with STORE.lock:
+            if len(normalize_mirror_state(STORE.state.get("mirror")).get("rules", [])) >= MIRROR_RULE_LIMIT:
+                raise ValueError(f"You can save up to {MIRROR_RULE_LIMIT} mirror rules.")
+    if rule.get("mode") == "webhook":
+        if int(dest_info.get("type") or 0) not in (0, 5):
+            raise ValueError(
+                "Webhook mode needs a server text or announcement channel as the destination. "
+                "Use normal mode for DMs, group DMs and threads."
+            )
+        # Create or reuse the managed webhook before committing the rule, so a
+        # permissions failure leaves the old rule untouched.
+        ensure_mirror_webhook(rule, dest_token, dest_info)
     with STORE.lock:
         mirror = normalize_mirror_state(STORE.state.get("mirror"))
         rules = mirror["rules"]
@@ -3909,6 +4235,8 @@ def save_mirror_rule(data: dict) -> tuple[dict, str]:
         mirror["lastError"] = ""
         STORE.state["mirror"] = mirror
         STORE.save()
+    if rule.get("mode") != "webhook" and _mirror_webhook_for(rule["id"]):
+        delete_mirror_webhook(rule["id"], remote=True)
     warning = ""
     if source_changed or not rule.get("primed"):
         try:
@@ -3923,7 +4251,7 @@ def save_mirror_rule(data: dict) -> tuple[dict, str]:
         f"{'Updated' if existing else 'Added'} relay “{rule['name']}” ({source_info['label']} → {dest_info['label']}).",
     )
     STORE.broadcast_state()
-    return _mirror_rule_by_id(rule["id"]) or rule, warning
+    return public_mirror_rule(_mirror_rule_by_id(rule["id"]) or rule), warning
 
 
 def set_mirror_settings(data: dict) -> dict:
@@ -3948,7 +4276,7 @@ def set_mirror_settings(data: dict) -> dict:
     if mirror["enabled"]:
         MIRROR.kick()
     STORE.broadcast_state()
-    return mirror
+    return public_mirror_state()
 
 
 def delete_mirror_rule(rule_id: str) -> None:
@@ -3960,6 +4288,7 @@ def delete_mirror_rule(rule_id: str) -> None:
             raise ValueError("That mirror rule no longer exists.")
         STORE.state["mirror"] = mirror
         STORE.save()
+    delete_mirror_webhook(rule_id, remote=True)
     STORE.log("INFO", "Mirror", "A message relay was removed.")
     STORE.broadcast_state()
 
@@ -3971,7 +4300,28 @@ def toggle_mirror_rule(rule_id: str, enabled: bool) -> dict:
         rule = next((item for item in mirror["rules"] if item.get("id") == rule_id), None)
         if not rule:
             raise ValueError("That mirror rule no longer exists.")
+        mode = normalize_mirror_mode(rule.get("mode"))
+    if enabled and mode == "webhook":
+        snapshot = MIRROR._rule_snapshot(rule_id)
+        if not snapshot:
+            raise ValueError("That mirror rule no longer exists.")
+        try:
+            ensure_mirror_webhook(snapshot, snapshot.get("_destToken") or "")
+        except (DiscordError, ValueError) as exc:
+            warning = _scrub(exc.message if isinstance(exc, DiscordError) else str(exc))
+            enabled = False
+    with STORE.lock:
+        mirror = normalize_mirror_state(STORE.state.get("mirror"))
+        rule = next((item for item in mirror["rules"] if item.get("id") == rule_id), None)
+        if not rule:
+            raise ValueError("That mirror rule no longer exists.")
         rule["enabled"] = bool(enabled)
+        if enabled:
+            rule["lastError"] = ""
+            rule["failures"] = 0
+            rule["retryAfter"] = 0
+        elif warning:
+            rule["lastError"] = warning[:260]
         STORE.state["mirror"] = mirror
         STORE.save()
     if enabled and not (_mirror_rule_by_id(rule_id) or {}).get("primed"):
@@ -3982,7 +4332,7 @@ def toggle_mirror_rule(rule_id: str, enabled: bool) -> dict:
     MIRROR.kick()
     STORE.log("INFO", "Mirror", f"Relay {'resumed' if enabled else 'paused'}.")
     STORE.broadcast_state()
-    updated = _mirror_rule_by_id(rule_id) or {}
+    updated = public_mirror_rule(_mirror_rule_by_id(rule_id) or {})
     return {"rule": updated, "warning": warning}
 
 
@@ -5239,9 +5589,7 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
         if path == "/api/mirror":
-            with STORE.lock:
-                mirror = normalize_mirror_state(STORE.state.get("mirror"))
-            return self.send_json({"ok": True, "mirror": mirror, "limit": MIRROR_RULE_LIMIT})
+            return self.send_json({"ok": True, "mirror": public_mirror_state(), "limit": MIRROR_RULE_LIMIT})
         if path == "/api/events":
             return self.handle_events()
         if path == "/api/update":
@@ -5347,6 +5695,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_error_json("Type REMOVE ALL to clear every saved account.", 400)
                 stop_presence(None, quiet=True)
                 GATEWAY.stop()
+                purge_mirror_webhooks(forget_on_failure=True)
                 count = STORE.remove_all_accounts()
                 with STORE.lock:
                     STORE.state["gateway"].update(
@@ -5850,6 +6199,8 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(incoming, dict):
                 return self.send_error_json("That backup does not contain a state object.", 400)
             web_warnings = []
+            if "mirror" in incoming and "mirror" in IMPORTABLE_STATE_GROUPS:
+                purge_mirror_webhooks(forget_on_failure=True)
             with STORE.lock:
                 # Import only the whitelisted setting groups. Do not route this
                 # through visible_patch: mirror is protected from direct client
@@ -5899,6 +6250,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_error_json(str(exc), 400)
 
         report = bundle["report"]
+        if "mirror" in bundle["updates"]:
+            purge_mirror_webhooks(forget_on_failure=True)
         with STORE.lock:
             for key, value in bundle["updates"].items():
                 if key not in IMPORTABLE_STATE_GROUPS or key == "savedConfigs":

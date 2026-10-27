@@ -356,6 +356,8 @@
     const destAccount = accountById(rule.destAccountId);
     const missingSource = !sourceAccount || !sourceAccount.tokenSet || sourceAccount.needsAuth;
     const missingDest = !destAccount || !destAccount.tokenSet || destAccount.needsAuth;
+    const webhookMode = rule.mode === 'webhook';
+    const webhookMissing = webhookMode && !rule.webhookSet;
     const counts = [
       rule.mirrored ? `${rule.mirrored} forwarded` : 'No messages yet',
       rule.skipped ? `${rule.skipped} skipped` : '',
@@ -366,7 +368,7 @@
         <div class="mirror-rule-icon">${K.icon('repeat')}</div>
         <div class="mirror-rule-title">
           <div class="card-title">${h(rule.name || 'Message relay')}</div>
-          <div class="card-sub">${ruleStatus(rule, mirror)}${mirror.enabled && rule.enabled ? ` · checks every ${mirror.interval}s` : ''}</div>
+          <div class="card-sub">${ruleStatus(rule, mirror)} · ${webhookMode ? 'Webhook identity' : 'Normal message'}${mirror.enabled && rule.enabled ? ` · checks every ${mirror.interval}s` : ''}</div>
         </div>
         ${mirrorSwitch(rule.enabled, 'mirror-rule-toggle', rule.id, true)}
       </div>
@@ -387,6 +389,7 @@
       </div>
       <div class="mirror-meta">${h(counts)}${rule.lastRunAt ? ` · checked ${K.relTime(rule.lastRunAt)}` : ''}</div>
       ${missingSource || missingDest ? `<div class="mirror-error">${missingSource ? 'The source account needs a token. ' : ''}${missingDest ? 'The destination account needs a token.' : ''}</div>` : ''}
+      ${webhookMissing ? '<div class="mirror-error">The relay webhook is not ready yet. Enable or save this relay to create it.</div>' : ''}
       ${rule.lastError ? `<div class="mirror-error">${h(rule.lastError)}</div>` : ''}
       <div class="mirror-rule-actions">
         <button class="btn btn-ghost btn-sm" data-action="mirror-run" data-id="${h(rule.id)}">${K.icon('play', 'sm')}Run now</button>
@@ -445,8 +448,9 @@
           <button class="btn btn-ghost" data-action="mirror-run-all" ${!mirror.rules.some(rule => rule.enabled) ? 'disabled' : ''}>${K.icon('play', 'sm')}Check enabled</button>
         </div>
         ${K.settingGroup('What gets forwarded', `
-          <div class="account-info-row">${K.icon('message-circle', 'sm')}<div><b>New messages only</b><span>Each rule starts at the newest message in the source. Edits, deletes, reactions and typing do not sync. Use Run now to check immediately.</span></div></div>
-          <div class="account-info-row">${K.icon('paperclip', 'sm')}<div><b>Content and links</b><span>Author names, message text, attachment URLs, embed URLs and sticker names are included. Long posts are trimmed to Discord's 2,000-character limit.</span></div></div>
+          <div class="account-info-row">${K.icon('message-circle', 'sm')}<div><b>Two post formats</b><span>Normal messages show the sender name, sent time and message with the destination account. Webhook identity recreates the sender avatar and display name and posts the message through a managed webhook.</span></div></div>
+          <div class="account-info-row">${K.icon('paperclip', 'sm')}<div><b>New messages only</b><span>Each rule starts at the newest message in the source. Edits, deletes, reactions and typing do not sync. Use Run now to check immediately.</span></div></div>
+          <div class="account-info-row">${K.icon('clock', 'sm')}<div><b>Content and links</b><span>Message text, attachment URLs, embed URLs and sticker names are included. Long posts are trimmed to Discord's 2,000-character limit.</span></div></div>
           <div class="account-info-row">${K.icon('shield-check', 'sm')}<div><b>No mention pings</b><span>Mentions are disabled on forwarded posts. An invisible marker stops the same message bouncing between relays.</span></div></div>
           <div class="account-info-row">${K.icon('clock', 'sm')}<div><b>Rate limits respected</b><span>Posts are paced, errors back off automatically, and the last delivered message ID survives a server restart.</span></div></div>
         `)}
@@ -503,6 +507,11 @@
       ${K.select({ id: 'mirror-dest-account', label: 'Destination account', value: destAccount, options: accountList().filter(row => row.tokenSet && !row.needsAuth).map(row => ({ value: row.id, label: `${accountName(row)}${row.username ? ' (@' + row.username + ')' : ''}` })) })}
       ${K.field({ id: 'mirror-dest-channel', label: 'Destination channel ID', value: current.destChannel || '', placeholder: '987654321098765432', attrs: 'inputmode="numeric" spellcheck="false"' })}
     </div>
+    ${K.select({ id: 'mirror-mode', label: 'Post format', value: current.mode || 'normal', options: [
+      { value: 'normal', label: 'Normal message — sender, sent time, then text' },
+      { value: 'webhook', label: 'Webhook identity — sender avatar and name' },
+    ] })}
+    <div class="field-hint" style="margin-top:-4px;margin-bottom:12px">Webhook identity needs the destination account to have Manage Webhooks in a server text or announcement channel. Kizzey creates one private relay webhook and keeps its URL off the browser.</div>
     <div class="mirror-form-options">
       ${mirrorOption('mirror-include-own', 'Include your own messages', 'Forward messages written by the source account as well as everyone else.', !!current.includeOwn)}
       ${mirrorOption('mirror-include-bots', 'Include bots and webhooks', 'Bots are skipped by default to keep relay noise down.', !!current.includeBots)}
@@ -552,6 +561,7 @@
       sourceChannel: read('mirror-source-channel')?.value.trim() || '',
       destAccountId: read('mirror-dest-account')?.value || '',
       destChannel: read('mirror-dest-channel')?.value.trim() || '',
+      mode: read('mirror-mode')?.value || 'normal',
       includeOwn: !!read('mirror-include-own')?.checked,
       includeBots: !!read('mirror-include-bots')?.checked,
       includeAttachments: !!read('mirror-include-attachments')?.checked,
@@ -572,14 +582,14 @@
       return;
     }
     const button = el || read('mirror-save-btn');
-    if (button) { button.disabled = true; button.textContent = 'Checking channels…'; }
+    if (button) { button.disabled = true; button.textContent = draft.mode === 'webhook' ? 'Preparing webhook…' : 'Checking channels…'; }
     try {
       const data = await K.api('/api/mirror/rules', { method: 'POST', body: draft });
       if (data.state) K.receiveState(data.state);
       K.closeSheet();
       K.toast(
         data.warning ? 'Relay saved with a warning' : draft.id ? 'Relay updated' : 'Relay created',
-        data.warning || (draft.id ? 'The rule changes are live.' : 'Watching begins at the newest source message.'),
+        data.warning || (draft.id ? 'The rule changes are live.' : draft.mode === 'webhook' ? 'The relay webhook is ready. Watching begins at the newest source message.' : 'Watching begins at the newest source message.'),
         data.warning ? '' : 'ok'
       );
       K.render();
@@ -631,7 +641,10 @@
     try {
       const data = await K.api('/api/mirror/rules/toggle', { method: 'POST', body: { id, enabled: !rule.enabled } });
       if (data.state) K.receiveState(data.state);
-      K.toast(rule.enabled ? 'Relay paused' : 'Relay enabled', data.warning || rule.name || '', data.warning ? '' : 'ok');
+      const isOn = !!(data.rule && data.rule.enabled);
+      if (data.warning && !isOn) K.toast('Relay could not start', data.warning, 'error');
+      else if (data.warning) K.toast('Relay enabled with a warning', data.warning, '');
+      else K.toast(isOn ? 'Relay enabled' : 'Relay paused', rule.name || '', 'ok');
       K.render();
     } catch (error) {
       el.disabled = false;
@@ -707,14 +720,17 @@
       <p>It reads new messages from the source channel with the source account, then posts a plain-text copy into the destination channel with the destination account. One rule can cross servers or accounts.</p>
       <h3>Starting point</h3>
       <p>When a rule is created, Kizzey records the newest source message as a cursor. Only messages after that point are copied. Existing channel history is never backfilled, so adding a relay cannot dump an old conversation into another channel.</p>
+      <h3>Post formats</h3>
+      <p><b>Normal message</b> posts with the destination account and includes the sender's display name and username, the original sent time in Discord timestamp format, then the message text and any links.</p>
+      <p><b>Webhook identity</b> posts through a webhook managed by Kizzey. Each message uses the sender's display name and avatar, so the destination sees the original identity instead of the destination account. This mode only works in a server text or announcement channel and needs Manage Webhooks permission. Mirroring into a DM, group DM or thread must use normal mode.</p>
       <h3>What is copied</h3>
-      <p>Author display name and username, message text, attachment links, embed links and sticker names. System messages, bots and your own messages are skipped unless the rule says otherwise. Every forwarded post gets an invisible marker so another relay can recognise it and avoid a loop.</p>
+      <p>Message text, attachment links, embed links and sticker names. System messages, bots and your own messages are skipped unless the rule says otherwise. Every forwarded post gets an invisible marker so another relay can recognise it and avoid a loop.</p>
       <h3>What is not copied</h3>
       <p>Edits, deletions, reactions, reply chains, typing indicators, threads and voice state are not synchronised. A deleted source message stays in the destination. Mention parsing is disabled, so forwarded text cannot ping a role or user.</p>
       <h3>Limits and failures</h3>
       <p>The source is polled on the configured interval. Discord rate limits are paced; temporary failures back off up to five minutes. The destination account needs permission to send messages, and both accounts need to read their respective channels. Progress survives a server restart.</p>
       <h3>Privacy</h3>
-      <p>Rules store numeric channel IDs, account IDs, labels and the last processed message ID. They contain no Discord tokens. All credentials stay in <span class="mono-copy">data/secret.json</span> on the server.</p>
+      <p>Rules store numeric channel IDs, account IDs, labels, the post format and the last processed message ID. They contain no Discord tokens. Account tokens and managed webhook URLs stay in <span class="mono-copy">data/secret.json</span> on the server; the browser only receives a <span class="mono-copy">webhookSet</span> flag. Deleting a relay removes its managed webhook.</p>
     </div>
     <div class="modal-actions"><button class="btn btn-primary" data-close-sheet>Got it</button></div>`;
     K.sheet({ title: 'How message mirror works', subtitle: 'Forwarding, limits and the fine print.', body });
