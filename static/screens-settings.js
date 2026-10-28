@@ -170,6 +170,9 @@
           )
         : infoRow('user', 'No Discord identity yet', 'Sign in to confirm your account without pasting anything.');
       const saveLabel = oauth.hasSecret ? 'Replace secret' : 'Save credentials';
+      const redirect = String(oauth.redirectUri || '');
+      const insecureRedirect =
+        redirect.startsWith('http://') && !/^http:\/\/(localhost|127\.0\.0\.1)([:/]|$)/.test(redirect);
       return page(
         'Discord login',
         'One tap to prove who you are, with your own Discord application.',
@@ -187,6 +190,7 @@
             <button class="btn btn-ghost btn-sm" data-action="oauth-copy-redirect">${K.icon('copy', 'sm')}Copy redirect URI</button>
           </div>
           <div class="field-hint mt-12">Redirect URI: <span class="mono-copy">${h(oauth.redirectUri || 'Not available yet')}</span></div>
+          ${insecureRedirect ? `<div class="field-hint" style="color:var(--warn)">Discord only accepts HTTPS redirect URIs, or plain HTTP on localhost. Open Kizzey at <span class="mono-copy">http://127.0.0.1:8420</span>, or set <span class="mono-copy">KIZZEY_PUBLIC_URL</span> to a public HTTPS origin.</div>` : ''}
         </div>
         ${K.settingGroup('Application credentials', `
           ${identity}

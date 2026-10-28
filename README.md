@@ -97,7 +97,10 @@ chat tools and message mirroring explain that they need a user token for that ac
 token later keeps the OAuth identity linked to the same row.
 
 For a hosted instance, set `KIZZEY_PUBLIC_URL` (or use the exact host and port people open) so the
-redirect URI registered at Discord matches the one Kizzey sends.
+redirect URI registered at Discord matches the one Kizzey sends. Discord accepts HTTPS redirects and
+plain HTTP only on `localhost`, so a LAN address such as `http://192.168.1.14:8420` needs a TLS
+reverse proxy or a tunnel before the round trip can complete. The settings screen warns when the
+derived URI cannot be registered.
 
 ### Connect with a user token
 
