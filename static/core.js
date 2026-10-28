@@ -250,9 +250,11 @@
   K.avatarUrl = () => K.get('account.avatarUrl') || K.get('chatProfile.avatar') || '';
   K.gatewayConnected = () => !!K.get('gateway.connected');
   K.isSignedIn = () => !!K.get('account');
+  K.hasUserToken = () => !!K.get('tokenSet', false);
   K.discordStatus = function () {
     const g = K.get('gateway', {});
     if (!K.isSignedIn()) return { key: 'signedout', text: 'Not connected', color: 'off' };
+    if (!K.hasUserToken()) return { key: 'oauth', text: 'OAuth identity', color: 'warn' };
     if (g.connected) return { key: 'connected', text: 'Discord connected', color: 'good' };
     if (g.state === 'connecting') return { key: 'connecting', text: 'Connecting…', color: 'warn' };
     if (g.state === 'reconnecting') return { key: 'reconnecting', text: 'Reconnecting…', color: 'warn' };

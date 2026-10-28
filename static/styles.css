@@ -835,6 +835,14 @@ html[data-theme="light"] .map-card iframe { filter: saturate(.9); }
 .login-steps b { color: var(--text-soft); font-weight: 650; }
 .step-num { width: 17px; height: 17px; flex: none; border-radius: 50%; background: var(--surface-3); color: var(--text-dim); font-size: 0.5625rem; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; }
 .welcome-footer { display: flex; align-items: center; gap: 7px; justify-content: center; color: var(--faint); font-size: 0.625rem; margin-top: 17px; }
+.login-or { display: flex; align-items: center; gap: 10px; margin: 13px 0 11px; color: var(--faint); font-size: 0.6875rem; }
+.login-or::before, .login-or::after { content: ''; flex: 1; height: 1px; background: var(--hairline); }
+.login-token-block { margin-top: 4px; }
+.login-note { display: flex; gap: 8px; margin-top: 14px; color: var(--faint); font-size: 0.6875rem; line-height: 1.5; }
+.login-note .icon { width: 14px; height: 14px; flex: none; margin-top: 1px; }
+.login-hint { display: flex; gap: 10px; padding: 12px 13px; border-radius: 16px; background: var(--surface-2); color: var(--muted); font-size: 0.75rem; line-height: 1.5; }
+.login-hint .icon { width: 16px; height: 16px; flex: none; margin-top: 2px; color: var(--primary); }
+.login-hint b { display: block; color: var(--text); font-size: 0.8125rem; margin-bottom: 2px; }
 
 /* ---------- drawer ---------- */
 .scrim { position: fixed; inset: 0; background: rgba(5, 3, 8, .58); backdrop-filter: blur(3px); z-index: 40; opacity: 0; pointer-events: none; transition: opacity .24s var(--ease); }

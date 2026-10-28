@@ -30,6 +30,7 @@ import platform
 import queue
 import random
 import re
+import secrets
 import shutil
 import socket
 import ssl
@@ -82,6 +83,15 @@ MIRROR_MAX_MESSAGES = 30
 MIRROR_MODES = ("normal", "webhook")
 MIRROR_WEBHOOK_LOCK = threading.RLock()
 SERVER_STARTED = time.monotonic()
+
+# Discord OAuth2 sign-in. OAuth proves who the operator is; it cannot open a
+# gateway socket or read channels, so a user token remains necessary for RPC
+# and mirroring.
+OAUTH_SCOPES = ("identify",)
+OAUTH_STATE_TTL = 600
+OAUTH_PENDING: dict[str, dict] = {}
+OAUTH_PENDING_LOCK = threading.Lock()
+SERVER_PUBLIC_HOST = ""
 
 MIME_OVERRIDES = {
     ".js": "text/javascript; charset=utf-8",
@@ -682,6 +692,10 @@ def clean_discord_token(token: str) -> str:
 def _account_public(account: dict) -> dict:
     user = account.get("user") if isinstance(account.get("user"), dict) else {}
     display = str(user.get("displayName") or user.get("globalName") or user.get("username") or "Discord account")
+    token = clean_discord_token(account.get("token"))
+    oauth = account.get("oauth") if isinstance(account.get("oauth"), dict) else {}
+    oauth_linked = bool(oauth.get("accessToken") or oauth.get("refreshToken"))
+    auth_kind = "token" if token else ("oauth" if oauth_linked else "none")
     return {
         "id": str(account.get("id") or ""),
         "userId": str(user.get("id") or ""),
@@ -689,7 +703,10 @@ def _account_public(account: dict) -> dict:
         "displayName": display,
         "avatar": str(user.get("avatar") or ""),
         "avatarUrl": str(user.get("avatarUrl") or ""),
-        "tokenSet": bool(account.get("token")),
+        "tokenSet": bool(token),
+        "authKind": auth_kind,
+        "oauthLinked": oauth_linked,
+        "canGateway": bool(token) and not bool(account.get("needsAuth")),
         "needsAuth": bool(account.get("needsAuth")),
         "authError": _scrub(str(account.get("authError") or ""))[:220],
         "addedAt": account.get("addedAt"),
@@ -866,6 +883,30 @@ def prepare_imported_mirror(value) -> tuple[dict, list[str]]:
     return mirror, notes
 
 
+def _coerce_oauth_record(raw) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    access = str(raw.get("accessToken") or "").strip()
+    refresh = str(raw.get("refreshToken") or "").strip()
+    if not access and not refresh:
+        return None
+    if len(access) > 512 or len(refresh) > 512:
+        return None
+    expires = raw.get("expiresAt")
+    if not isinstance(expires, (int, float)):
+        expires = 0
+    scope = str(raw.get("scope") or "identify").strip()[:120]
+    token_type = str(raw.get("tokenType") or "Bearer").strip()[:32]
+    return {
+        "accessToken": access,
+        "refreshToken": refresh,
+        "scope": scope,
+        "tokenType": token_type or "Bearer",
+        "expiresAt": int(expires),
+        "linkedAt": raw.get("linkedAt") if isinstance(raw.get("linkedAt"), (int, float)) else now_ms(),
+    }
+
+
 def _coerce_account_record(raw: dict, fallback_token: str = "", fallback_at=None) -> dict | None:
     if not isinstance(raw, dict):
         return None
@@ -883,6 +924,7 @@ def _coerce_account_record(raw: dict, fallback_token: str = "", fallback_at=None
         if value and not merged_user.get(key):
             merged_user[key] = value
     token = clean_discord_token(raw.get("token") or fallback_token)
+    oauth = _coerce_oauth_record(raw.get("oauth"))
     uid = str(merged_user.get("id") or raw.get("userId") or "")
     username = str(merged_user.get("username") or "")
     display = str(
@@ -912,7 +954,7 @@ def _coerce_account_record(raw: dict, fallback_token: str = "", fallback_at=None
         "avatarUrl": avatar_url,
         "email": "",
     })
-    if not token and not uid and not username:
+    if not token and not oauth and not uid and not username:
         return None
     account_id = str(raw.get("id") or "")
     if not account_id.startswith("acct_") or len(account_id) < 8:
@@ -922,9 +964,11 @@ def _coerce_account_record(raw: dict, fallback_token: str = "", fallback_at=None
         "id": account_id,
         "token": token,
         "tokenSetAt": raw.get("tokenSetAt") if token else None,
+        "authKind": "token" if token else ("oauth" if oauth else "none"),
+        "oauth": oauth,
         "addedAt": raw.get("addedAt") or fallback_at or now,
         "lastUsedAt": raw.get("lastUsedAt"),
-        "needsAuth": not bool(token),
+        "needsAuth": bool(raw.get("needsAuth")) or (not token and not oauth),
         "authError": str(raw.get("authError") or "")[:220],
         "user": merged_user,
     }
@@ -1033,6 +1077,13 @@ class Store:
                         existing["needsAuth"] = False
                         existing["authError"] = ""
                         by_token[token] = existing
+                    if account.get("oauth"):
+                        existing["oauth"] = account["oauth"]
+                        existing["needsAuth"] = False
+                        existing["authError"] = ""
+                    existing["authKind"] = "token" if clean_discord_token(existing.get("token")) else (
+                        "oauth" if existing.get("oauth") else "none"
+                    )
                     if account.get("lastUsedAt"):
                         existing["lastUsedAt"] = account.get("lastUsedAt")
                     existing["user"].update({k: v for k, v in account["user"].items() if v})
@@ -1084,20 +1135,20 @@ class Store:
             active = next((account for account in accounts if account["id"] == active_id), None)
             if not active and legacy_token:
                 active = by_token.get(legacy_token)
-            if not active or not clean_discord_token(active.get("token")):
+            if not active or not (clean_discord_token(active.get("token")) or active.get("oauth")):
                 active = next(
                     (account for account in accounts if clean_discord_token(account.get("token"))),
                     None,
                 )
+            if not active:
+                active = next((account for account in accounts if account.get("oauth")), None)
             if active:
                 self.secret["activeId"] = active["id"]
-                self.secret["token"] = active.get("token") or ""
-                self.secret["tokenSetAt"] = active.get("tokenSetAt")
-                if active.get("token"):
+                self.secret["token"] = clean_discord_token(active.get("token"))
+                self.secret["tokenSetAt"] = active.get("tokenSetAt") if self.secret["token"] else None
+                self.state["account"] = copy.deepcopy(active["user"])
+                if active.get("token") or active.get("oauth"):
                     self.secret["authError"] = ""
-                    self.state["account"] = copy.deepcopy(active["user"])
-                else:
-                    self.state["account"] = None
             else:
                 self.secret["activeId"] = ""
                 self.secret["token"] = ""
@@ -1116,7 +1167,9 @@ class Store:
         with self.lock:
             active_id = str(self.secret.get("activeId") or "")
             for account in self.secret.get("accounts", []) or []:
-                if account.get("id") == active_id and clean_discord_token(account.get("token")):
+                if account.get("id") == active_id and (
+                    clean_discord_token(account.get("token")) or account.get("oauth")
+                ):
                     return active_id
             return ""
 
@@ -1128,6 +1181,7 @@ class Store:
                     result = copy.deepcopy(account)
                     if not include_token:
                         result.pop("token", None)
+                        result.pop("oauth", None)
                     return result
             return None
 
@@ -1139,6 +1193,7 @@ class Store:
                     result = copy.deepcopy(account)
                     if not include_token:
                         result.pop("token", None)
+                        result.pop("oauth", None)
                     return result
             return None
 
@@ -1184,10 +1239,90 @@ class Store:
                 if old_token != token or not existing.get("tokenSetAt"):
                     existing["tokenSetAt"] = now_ms()
                 existing["user"] = {**(existing.get("user") or {}), **user, "email": ""}
+                existing["authKind"] = "token"
                 existing["needsAuth"] = False
                 existing["authError"] = ""
             self.save()
             return copy.deepcopy(existing), created
+
+    def upsert_oauth_account(self, user: dict, oauth: dict) -> tuple[dict, bool]:
+        """Save (or refresh) an identity proven through Discord OAuth2."""
+        user = dict(user or {})
+        record = _coerce_oauth_record(oauth)
+        if not record:
+            raise ValueError("Discord did not return a usable OAuth session.")
+        user_id = str(user.get("id") or "")
+        if not user_id:
+            raise ValueError("Discord did not return a usable account.")
+        with self.lock:
+            accounts = self.secret.setdefault("accounts", [])
+            existing = next(
+                (
+                    account
+                    for account in accounts
+                    if str((account.get("user") or {}).get("id") or "") == user_id
+                ),
+                None,
+            )
+            if existing is None:
+                if len(accounts) >= ACCOUNT_LIMIT:
+                    raise ValueError(f"You can save up to {ACCOUNT_LIMIT} Discord accounts.")
+                existing = _coerce_account_record({"user": user, "oauth": record})
+                if existing is None:
+                    raise ValueError("Discord did not return a usable account.")
+                accounts.append(existing)
+                created = True
+            else:
+                created = False
+                existing["oauth"] = record
+                existing["user"] = {**(existing.get("user") or {}), **user, "email": ""}
+                existing["needsAuth"] = False
+                existing["authError"] = ""
+            existing["authKind"] = "token" if clean_discord_token(existing.get("token")) else "oauth"
+            existing["oauthLinkedAt"] = record["linkedAt"]
+            self.save()
+            return copy.deepcopy(existing), created
+
+    def update_oauth(self, account_id: str, oauth: dict | None = None, user: dict | None = None) -> dict | None:
+        with self.lock:
+            account = next(
+                (row for row in self.secret.get("accounts", []) or [] if row.get("id") == account_id),
+                None,
+            )
+            if not account:
+                return None
+            if oauth is not None:
+                record = _coerce_oauth_record(oauth)
+                if record:
+                    account["oauth"] = record
+                    account["oauthLinkedAt"] = record["linkedAt"]
+            if user:
+                account["user"] = {**(account.get("user") or {}), **user, "email": ""}
+            account["authKind"] = "token" if clean_discord_token(account.get("token")) else (
+                "oauth" if account.get("oauth") else "none"
+            )
+            if account.get("token") or account.get("oauth"):
+                account["needsAuth"] = False
+                account["authError"] = ""
+            if str(self.secret.get("activeId") or "") == account_id:
+                self.state["account"] = copy.deepcopy(account.get("user") or {})
+            self.save()
+            return copy.deepcopy(account)
+
+    def mark_oauth_failed(self, account_id: str, message: str) -> None:
+        with self.lock:
+            account = next(
+                (row for row in self.secret.get("accounts", []) or [] if row.get("id") == account_id),
+                None,
+            )
+            if account is None:
+                return
+            safe = _scrub(message)[:220] or "Discord rejected this sign-in."
+            account["needsAuth"] = True
+            account["authError"] = safe
+            if str(self.secret.get("activeId") or "") == account_id:
+                self.secret["authError"] = safe
+            self.save()
 
     def activate_account(self, account_id: str, user: dict | None = None) -> dict:
         with self.lock:
@@ -1195,20 +1330,21 @@ class Store:
                 (row for row in self.secret.get("accounts", []) or [] if row.get("id") == account_id),
                 None,
             )
-            if not account or not clean_discord_token(account.get("token")):
+            if not account or not (clean_discord_token(account.get("token")) or account.get("oauth")):
                 raise ValueError("That account has no saved token. Add it again.")
+            token = clean_discord_token(account.get("token"))
             if user:
                 account["user"] = {**(account.get("user") or {}), **user, "email": ""}
             account["needsAuth"] = False
             account["authError"] = ""
             account["lastUsedAt"] = now_ms()
             self.secret["activeId"] = account["id"]
-            self.secret["token"] = clean_discord_token(account.get("token"))
-            self.secret["tokenSetAt"] = account.get("tokenSetAt")
+            self.secret["token"] = token
+            self.secret["tokenSetAt"] = account.get("tokenSetAt") if token else None
             self.secret["authError"] = ""
             self.state["account"] = copy.deepcopy(account.get("user") or {})
             gateway = self.state.setdefault("gateway", {})
-            gateway["tokenSet"] = True
+            gateway["tokenSet"] = bool(token)
             gateway["error"] = ""
             self.save()
             return copy.deepcopy(account)
@@ -1389,6 +1525,7 @@ def public_state() -> dict:
         data["accountLimit"] = ACCOUNT_LIMIT
         data["mirrorRuleLimit"] = MIRROR_RULE_LIMIT
         data["activeAccountId"] = STORE.active_account_id()
+        data["auth"] = {"oauth": public_oauth_config()}
         data["tokenSet"] = bool(STORE.active_token())
         data["serverTime"] = now_ms()
         data["version"] = VERSION
@@ -4139,6 +4276,15 @@ def _mirror_rule_by_id(rule_id: str) -> dict | None:
     return None
 
 
+def _mirror_token_message(account: dict, role: str) -> str:
+    if account and account.get("oauth"):
+        return (
+            f"The {role} account signed in with Discord OAuth. OAuth cannot read or post messages, "
+            "so mirroring needs a user token for that account."
+        )
+    return f"The {role} account needs a fresh Discord token."
+
+
 def save_mirror_rule(data: dict) -> tuple[dict, str]:
     if not isinstance(data, dict):
         raise ValueError("A mirror rule object is required.")
@@ -4157,9 +4303,9 @@ def save_mirror_rule(data: dict) -> tuple[dict, str]:
     source_token = clean_discord_token(source_account.get("token"))
     dest_token = clean_discord_token(dest_account.get("token"))
     if not source_token:
-        raise ValueError("The source account needs a fresh Discord token.")
+        raise ValueError(_mirror_token_message(source_account, "source"))
     if not dest_token:
-        raise ValueError("The destination account needs a fresh Discord token.")
+        raise ValueError(_mirror_token_message(dest_account, "destination"))
     source_channel = _snowflake_text(data.get("sourceChannel") or (existing or {}).get("sourceChannel"))
     dest_channel = _snowflake_text(data.get("destChannel") or (existing or {}).get("destChannel"))
     if not source_channel or not dest_channel:
@@ -5102,8 +5248,28 @@ def activate_discord_account(account_id: str, user: dict | None = None, verify: 
     if not account:
         raise DiscordError(404, "That Discord account is not saved.")
     token = clean_discord_token(account.get("token"))
-    if not token:
+    if not token and not account.get("oauth"):
         raise DiscordError(401, "That account needs a fresh Discord token.")
+    if not token:
+        # OAuth-only accounts keep their identity but never touch the gateway.
+        if verify or not user:
+            try:
+                user = refresh_oauth_account(account_id)
+            except DiscordError:
+                STORE.broadcast_state()
+                raise
+        stop_presence(None, quiet=True)
+        GATEWAY.stop()
+        account = STORE.activate_account(account_id, user=user)
+        with STORE.lock:
+            STORE.state["gateway"].update(
+                {"connected": False, "state": "offline", "error": "", "latency": None, "tokenSet": False}
+            )
+            STORE.save()
+        display = (account.get("user") or {}).get("displayName") or "Discord account"
+        STORE.log("INFO", "Account", f"Switched to {display} (OAuth identity).")
+        STORE.broadcast_state()
+        return account
     if verify or not user:
         try:
             user = _validated_account_user(token, account_id)
@@ -5182,6 +5348,295 @@ def sign_out() -> None:
     STORE.broadcast_state()
 
 
+# ---------------------------------------------------------------------------
+# Discord OAuth2 ("Sign in with Discord")
+# ---------------------------------------------------------------------------
+
+OAUTH_CALLBACK_PATH = "/api/auth/oauth/callback"
+
+
+def _oauth_env(name: str) -> str:
+    return str(os.environ.get(name) or "").strip()
+
+
+def oauth_credentials() -> tuple[str, str]:
+    """Return the Discord application credentials, env/CLI first, saved config second."""
+    cfg: dict = {}
+    if STORE is not None and isinstance(STORE.secret.get("oauth"), dict):
+        cfg = STORE.secret["oauth"]
+    client_id = _oauth_env("KIZZEY_DISCORD_CLIENT_ID") or _oauth_env("DISCORD_CLIENT_ID") or str(
+        cfg.get("clientId") or ""
+    ).strip()
+    client_secret = _oauth_env("KIZZEY_DISCORD_CLIENT_SECRET") or _oauth_env("DISCORD_CLIENT_SECRET") or str(
+        cfg.get("clientSecret") or ""
+    ).strip()
+    return client_id, client_secret
+
+
+def oauth_authorize_endpoint() -> str:
+    return _oauth_env("KIZZEY_OAUTH_AUTHORIZE") or "https://discord.com/oauth2/authorize"
+
+
+def oauth_token_endpoint() -> str:
+    return _oauth_env("KIZZEY_OAUTH_TOKEN_URL") or "https://discord.com/api/oauth2/token"
+
+
+def oauth_redirect_uri() -> str:
+    base = _oauth_env("KIZZEY_PUBLIC_URL")
+    if base:
+        return base.rstrip("/") + OAUTH_CALLBACK_PATH
+    host = SERVER_PUBLIC_HOST or f"127.0.0.1:{DEFAULT_PORT}"
+    return f"http://{host}{OAUTH_CALLBACK_PATH}"
+
+
+def public_oauth_config() -> dict:
+    client_id, client_secret = oauth_credentials()
+    return {
+        "configured": bool(client_id and client_secret),
+        "clientId": client_id,
+        "hasSecret": bool(client_secret),
+        "redirectUri": oauth_redirect_uri(),
+        "scopes": list(OAUTH_SCOPES),
+        "callbackPath": OAUTH_CALLBACK_PATH,
+    }
+
+
+def save_oauth_config(client_id: str, client_secret: str) -> dict:
+    """Store the Discord application credentials. The secret never leaves the server."""
+    assert STORE is not None
+    client_id = str(client_id or "").strip()
+    client_secret = str(client_secret or "").strip()
+    if not client_id and not client_secret:
+        with STORE.lock:
+            STORE.secret["oauth"] = {"clientId": "", "clientSecret": ""}
+        STORE.save()
+        STORE.log("INFO", "Account", "Discord OAuth sign-in was turned off.")
+        return public_oauth_config()
+    if not re.fullmatch(r"\d{15,22}", client_id):
+        raise ValueError("A Discord application Client ID is a 15–22 digit number.")
+    if not client_secret:
+        with STORE.lock:
+            existing = STORE.secret.get("oauth") if isinstance(STORE.secret.get("oauth"), dict) else {}
+            client_secret = str(existing.get("clientSecret") or "").strip()
+        if not client_secret:
+            raise ValueError("Paste the Discord application Client Secret too.")
+    if len(client_secret) > 200 or not re.fullmatch(r"[A-Za-z0-9_.-]{10,200}", client_secret):
+        raise ValueError("That does not look like a Discord application Client Secret.")
+    with STORE.lock:
+        STORE.secret["oauth"] = {"clientId": client_id, "clientSecret": client_secret}
+    STORE.save()
+    STORE.log("INFO", "Account", "Saved Discord OAuth sign-in credentials.")
+    return public_oauth_config()
+
+
+def oauth_start() -> str:
+    """Build the Discord authorize URL with single-use state and PKCE."""
+    client_id, client_secret = oauth_credentials()
+    if not client_id or not client_secret:
+        raise ValueError(
+            "Add a Discord application Client ID and Client Secret in Settings → Discord login first."
+        )
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(32)
+    redirect_uri = oauth_redirect_uri()
+    now = time.time()
+    with OAUTH_PENDING_LOCK:
+        for key in [key for key, value in OAUTH_PENDING.items() if now - value["createdAt"] > OAUTH_STATE_TTL]:
+            OAUTH_PENDING.pop(key, None)
+        if len(OAUTH_PENDING) > 32:
+            OAUTH_PENDING.clear()
+        OAUTH_PENDING[state] = {
+            "verifier": verifier,
+            "createdAt": now,
+            "redirectUri": redirect_uri,
+        }
+    params = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": " ".join(OAUTH_SCOPES),
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "prompt": "consent",
+        }
+    )
+    return f"{oauth_authorize_endpoint()}?{params}"
+
+
+def oauth_take_state(state: str) -> dict | None:
+    with OAUTH_PENDING_LOCK:
+        pending = OAUTH_PENDING.pop(str(state or ""), None)
+    if not pending:
+        return None
+    if time.time() - float(pending.get("createdAt") or 0) > OAUTH_STATE_TTL:
+        return None
+    return pending
+
+
+def _oauth_post_form(url: str, fields: dict) -> dict:
+    data = urllib.parse.urlencode(fields).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": DISCORD_UA,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        info = {}
+        try:
+            info = json.loads(raw)
+        except Exception:
+            info = {}
+        message = str(info.get("error_description") or info.get("error") or f"Discord returned HTTP {exc.code}")
+        raise DiscordError(exc.code, message, info) from None
+    except urllib.error.URLError as exc:
+        raise DiscordError(0, f"Could not reach Discord: {exc.reason}") from None
+    except TimeoutError:
+        raise DiscordError(0, "Discord took too long to answer.") from None
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        raise DiscordError(502, "Discord returned an unreadable OAuth response.") from None
+    if not isinstance(payload, dict) or not payload.get("access_token"):
+        raise DiscordError(502, "Discord did not return an access token.")
+    return payload
+
+
+def oauth_exchange_code(code: str, verifier: str, redirect_uri: str) -> dict:
+    client_id, client_secret = oauth_credentials()
+    if not client_id or not client_secret:
+        raise DiscordError(400, "Discord OAuth sign-in is not configured on this server.")
+    return _oauth_post_form(
+        oauth_token_endpoint(),
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "authorization_code",
+            "code": str(code or ""),
+            "redirect_uri": redirect_uri,
+            "code_verifier": verifier,
+        },
+    )
+
+
+def oauth_refresh_session(refresh_token: str) -> dict:
+    client_id, client_secret = oauth_credentials()
+    if not client_id or not client_secret:
+        raise DiscordError(400, "Discord OAuth sign-in is not configured on this server.")
+    if not refresh_token:
+        raise DiscordError(401, "This Discord sign-in expired. Sign in with Discord again.")
+    return _oauth_post_form(
+        oauth_token_endpoint(),
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "refresh_token",
+            "refresh_token": str(refresh_token),
+        },
+    )
+
+
+def oauth_fetch_identity(access_token: str) -> dict:
+    me = discord_api("/users/@me", f"Bearer {access_token}")
+    if not isinstance(me, dict) or not me.get("id"):
+        raise DiscordError(401, "Discord did not return an account for this sign-in.")
+    return normalize_user(me)
+
+
+def oauth_session_from_tokens(tokens: dict, previous: dict | None = None) -> dict:
+    previous = previous or {}
+    expires_in = tokens.get("expires_in")
+    try:
+        expires_in = int(expires_in)
+    except Exception:
+        expires_in = 0
+    refresh = str(tokens.get("refresh_token") or previous.get("refreshToken") or "")
+    session = {
+        "accessToken": str(tokens.get("access_token") or ""),
+        "refreshToken": refresh,
+        "scope": str(tokens.get("scope") or previous.get("scope") or " ".join(OAUTH_SCOPES)),
+        "tokenType": str(tokens.get("token_type") or "Bearer"),
+        "expiresAt": now_ms() + expires_in * 1000 if expires_in else now_ms() + 3600 * 1000,
+        "linkedAt": previous.get("linkedAt") or now_ms(),
+    }
+    return session
+
+
+def oauth_access_token(account_id: str, force: bool = False) -> str:
+    assert STORE is not None
+    account = STORE.account_by_id(account_id, include_token=True) or {}
+    session = account.get("oauth") if isinstance(account.get("oauth"), dict) else {}
+    access = str(session.get("accessToken") or "")
+    expires_at = float(session.get("expiresAt") or 0)
+    if access and not force and expires_at - 60_000 > now_ms():
+        return access
+    refresh = str(session.get("refreshToken") or "")
+    try:
+        tokens = oauth_refresh_session(refresh)
+    except DiscordError as exc:
+        if exc.status in (400, 401):
+            STORE.mark_oauth_failed(account_id, "Discord sign-in expired. Sign in with Discord again.")
+        raise
+    updated = oauth_session_from_tokens(tokens, session)
+    STORE.update_oauth(account_id, oauth=updated)
+    return updated["accessToken"]
+
+
+def refresh_oauth_account(account_id: str, force: bool = False) -> dict:
+    access = oauth_access_token(account_id, force=force)
+    user = oauth_fetch_identity(access)
+    STORE.update_oauth(account_id, user=user)
+    return user
+
+
+def oauth_complete_sign_in(code: str, state: str) -> dict:
+    """Finish the callback: exchange the code, verify identity, save the account."""
+    assert STORE is not None
+    pending = oauth_take_state(state)
+    if not pending:
+        raise ValueError("That Discord sign-in link expired. Start again.")
+    if not code:
+        raise ValueError("Discord did not return an authorization code.")
+    tokens = oauth_exchange_code(code, pending["verifier"], pending["redirectUri"])
+    user = oauth_fetch_identity(tokens["access_token"])
+    session = oauth_session_from_tokens(tokens)
+    account, created = STORE.upsert_oauth_account(user, session)
+    activate_discord_account(account["id"], user=user, verify=False)
+    STORE.log(
+        "INFO",
+        "Account",
+        f"{'Added' if created else 'Refreshed'} Discord sign-in for {user['displayName']}.",
+    )
+    return {"account": account, "created": created, "user": user}
+
+
+def require_gateway_token() -> str:
+    """Return the active user token, or explain why Rich Presence is unavailable."""
+    assert STORE is not None
+    token = STORE.active_token()
+    if token:
+        return token
+    account = STORE.active_account(include_token=True)
+    if account and account.get("oauth"):
+        raise DiscordError(
+            401,
+            "This account signed in with Discord OAuth. Discord does not allow OAuth apps to open "
+            "the gateway, so Rich Presence and mirroring need a user token for this account.",
+        )
+    raise DiscordError(401, "Connect Discord before starting a presence.")
+
+
 def stop_presence(kind: str | None = None, quiet: bool = False) -> bool:
     assert STORE is not None
     with STORE.lock:
@@ -5217,8 +5672,7 @@ def stop_presence(kind: str | None = None, quiet: bool = False) -> bool:
 
 def start_presence(kind: str, payload: dict | None = None) -> dict:
     assert STORE is not None
-    if not STORE.active_token():
-        raise DiscordError(401, "Sign in to Discord in Settings before starting a presence.")
+    require_gateway_token()
     if kind not in PRESENCE_KINDS:
         raise ValueError("Unknown RPC type.")
     if payload and isinstance(payload, dict):
@@ -5576,7 +6030,19 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routing ----------------------------------------------------------
     def do_GET(self):
+        global SERVER_PUBLIC_HOST
+        SERVER_PUBLIC_HOST = str(self.headers.get("Host") or "").strip()[:120]
         path = self.route_path()
+        if path == "/api/auth/oauth/callback":
+            return self.handle_oauth_callback()
+        if path == "/api/auth/oauth/config":
+            return self.send_json({"ok": True, "oauth": public_oauth_config()})
+        if path == "/api/auth/oauth/start":
+            try:
+                url = oauth_start()
+            except ValueError as exc:
+                return self.send_error_json(str(exc), 400)
+            return self.send_json({"ok": True, "url": url, "oauth": public_oauth_config()})
         if path == "/api/state":
             return self.send_json({"ok": True, "state": public_state()})
         if path == "/api/accounts":
@@ -5639,6 +6105,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.handle_static(path)
 
     def do_POST(self):
+        global SERVER_PUBLIC_HOST
+        SERVER_PUBLIC_HOST = str(self.headers.get("Host") or "").strip()[:120]
         path = self.route_path()
         try:
             if path == "/api/patch":
@@ -5709,8 +6177,18 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/account/refresh":
                 token = STORE.active_token()
                 active_id = STORE.active_account_id()
-                if not token or not active_id:
+                if not active_id:
                     return self.send_error_json("Not signed in.", 401)
+                if not token:
+                    try:
+                        me = refresh_oauth_account(active_id, force=True)
+                    except DiscordError as exc:
+                        STORE.broadcast_state()
+                        return self.send_error_json(exc.message, exc.status or 401)
+                    except ValueError as exc:
+                        return self.send_error_json(str(exc), 401)
+                    STORE.broadcast_state()
+                    return self.send_json({"ok": True, "user": me, "state": public_state()})
                 try:
                     me = _validated_account_user(token, active_id)
                 except DiscordError as exc:
@@ -5720,12 +6198,23 @@ class Handler(BaseHTTPRequestHandler):
                 STORE.broadcast_state()
                 return self.send_json({"ok": True, "user": me, "state": public_state()})
             if path == "/api/gateway/reconnect":
-                token = STORE.active_token()
-                if not token:
-                    return self.send_error_json("Not signed in.", 401)
+                try:
+                    token = require_gateway_token()
+                except DiscordError as exc:
+                    return self.send_error_json(exc.message, exc.status or 401)
                 GATEWAY.start(token)
                 STORE.log("INFO", "Gateway", "Connection restart requested from the web UI.")
                 return self.send_json({"ok": True, "state": public_state()})
+            if path == "/api/auth/oauth/config":
+                data = self.read_json()
+                try:
+                    oauth = save_oauth_config(
+                        str(data.get("clientId") or ""),
+                        str(data.get("clientSecret") or ""),
+                    )
+                except ValueError as exc:
+                    return self.send_error_json(str(exc), 400)
+                return self.send_json({"ok": True, "oauth": oauth, "state": public_state()})
             if path == "/api/mirror/settings":
                 data = self.read_json()
                 mirror = set_mirror_settings(data)
@@ -5967,6 +6456,33 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     # -- SSE --------------------------------------------------------------
+    def redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+
+    def handle_oauth_callback(self):
+        query = self.query()
+        if query.get("error"):
+            message = query.get("error_description") or query.get("error") or "Discord sign-in was cancelled."
+            STORE.log("WARN", "Account", f"Discord OAuth sign-in was cancelled: {_scrub(message)[:160]}")
+            return self.redirect("/?oauth=error&message=" + urllib.parse.quote(_scrub(message)[:180]))
+        try:
+            oauth_complete_sign_in(query.get("code", ""), query.get("state", ""))
+        except (DiscordError, ValueError) as exc:
+            message = exc.message if isinstance(exc, DiscordError) else str(exc)
+            STORE.log("WARN", "Account", f"Discord OAuth sign-in failed: {_scrub(message)[:200]}")
+            return self.redirect("/?oauth=error&message=" + urllib.parse.quote(_scrub(message)[:180]))
+        except Exception as exc:
+            message = _scrub(str(exc))[:200] or "Unexpected sign-in error."
+            STORE.log("WARN", "Account", f"Discord OAuth sign-in failed: {message}")
+            return self.redirect("/?oauth=error&message=" + urllib.parse.quote(message[:180]))
+        STORE.broadcast_state()
+        return self.redirect("/?oauth=success#/accounts")
+
     def handle_events(self):
         q = STORE.subscribe() if STORE else None
         if not q:
@@ -6425,7 +6941,18 @@ def main() -> int:
     parser.add_argument("--host", default=os.environ.get("KIZZEY_HOST", "0.0.0.0"), help="Bind address (default 0.0.0.0)")
     parser.add_argument("--port", type=int, default=int(os.environ.get("KIZZEY_PORT", DEFAULT_PORT)), help="Port (default 8420)")
     parser.add_argument("--no-gateway", action="store_true", help="Do not auto-connect to Discord on startup")
+    parser.add_argument("--discord-client-id", default="", help="Discord application Client ID for OAuth sign-in")
+    parser.add_argument(
+        "--discord-client-secret",
+        default="",
+        help="Discord application Client Secret for OAuth sign-in",
+    )
     args = parser.parse_args()
+
+    if args.discord_client_id:
+        os.environ["KIZZEY_DISCORD_CLIENT_ID"] = args.discord_client_id.strip()
+    if args.discord_client_secret:
+        os.environ["KIZZEY_DISCORD_CLIENT_SECRET"] = args.discord_client_secret.strip()
 
     STORE = Store()
     STORE.log("INFO", "Server", f"Kizzey Web {VERSION} starting on {args.host}:{args.port}.")
@@ -6483,6 +7010,19 @@ def main() -> int:
                     }
                 )
             STORE.save()
+        if not restored and not candidates:
+            oauth_account = next(
+                (row for row in accounts if row.get("oauth") and row.get("user")),
+                None,
+            )
+            if oauth_account:
+                STORE.activate_account(str(oauth_account.get("id") or ""))
+                display = (oauth_account.get("user") or {}).get("displayName") or "Discord account"
+                STORE.log(
+                    "INFO",
+                    "Account",
+                    f"Restored OAuth identity for {display}. Add a user token for Rich Presence.",
+                )
     if STORE.state.get("presence", {}).get("active"):
         # A previous server run did not stop its presence; start clean.
         STORE.state["presence"] = {"active": None, "startedAt": None, "activities": [], "updatedAt": now_ms()}

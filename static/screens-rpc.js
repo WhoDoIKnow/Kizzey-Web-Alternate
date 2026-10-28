@@ -139,7 +139,12 @@
       K.render();
     } catch (error) {
       if (error.status === 401 || error.data?.loginRequired) {
-        K.loginSheet(() => K.rpcStart(kind), { subtitle: 'Connect Discord to send this presence.' });
+        K.loginSheet(() => K.rpcStart(kind), {
+          subtitle: K.isSignedIn() && !K.hasUserToken()
+            ? K.esc(error.message)
+            : 'Connect Discord to send this presence.',
+          tokenOpen: K.isSignedIn() && !K.hasUserToken(),
+        });
         return;
       }
       K.toast('Could not start presence', error.message, 'error');

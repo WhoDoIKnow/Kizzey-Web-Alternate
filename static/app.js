@@ -5,7 +5,6 @@
 
   K.updateInfo = null;
   K.updatePromise = null;
-  K.loginSuccessCallback = null;
   K.liveRoutes = new Set(['home', 'logs', 'history', 'usage', 'kizzey-stats', 'leaderboard', 'gallery', 'trending', 'presences']);
   K.routeTitles = {
     home: 'Home',
@@ -45,6 +44,7 @@
     plugins: 'Plugins',
     logs: 'Logs',
     'rpc-settings': 'RPC Settings',
+    'discord-login': 'Discord login',
     display: 'Display',
     language: 'Language',
     about: 'About',
@@ -117,6 +117,26 @@
         <div class="mt-20">${K.btn('Try again', { cls: 'btn-primary btn-lg', action: 'reload' })}</div>
       </div>`;
       return;
+    }
+    const params = new URLSearchParams(location.search);
+    const oauthResult = params.get('oauth');
+    if (oauthResult) {
+      const message = params.get('message') || '';
+      history.replaceState(null, '', location.pathname + location.hash);
+      if (oauthResult === 'success') {
+        K.setLocal('ui.onboarded', true);
+        K.queuePatch({ ui: { onboarded: true } }, 0).catch(() => {});
+        K.navigate('accounts');
+        setTimeout(
+          () => K.toast('Signed in with Discord', `Welcome, ${K.displayName()}. Add a user token for Rich Presence.`, 'ok'),
+          140
+        );
+      } else {
+        setTimeout(
+          () => K.toast('Discord sign-in failed', message || 'Discord did not confirm the sign-in.', 'error'),
+          140
+        );
+      }
     }
     const parsed = parseHash();
     K.current = parsed;
@@ -334,100 +354,36 @@
   // login helpers
   // ---------------------------------------------------------------------
   K.loginSheet = function loginSheet(onSuccess, opts = {}) {
-    K.loginSuccessCallback = onSuccess || null;
-    K.loginBusy = false;
-    const body = `<div class="login-card" style="margin-top:0">
-      <div class="field">
-        <label for="login-token"><span>Discord account token</span><span class="optional">stays on this server</span></label>
-        <div class="input-wrap">
-          <input id="login-token" class="input" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your token">
-          <span class="input-suffix"><button class="icon-btn small" data-action="toggle-login-token" aria-label="Show token">${K.icon('eye', 'sm')}</button></span>
-        </div>
-        <div class="field-hint">Sent only to your Kizzey server. The browser never receives it back.</div>
-      </div>
-      <div id="login-error" class="field-error hidden"></div>
-      <button class="btn btn-primary btn-block btn-lg" data-action="login-sheet-connect" id="login-connect-btn">Connect Discord</button>
-      <div class="login-steps">
-        <span><b class="step-num">1</b><span>Open <a href="https://discord.com/login" target="_blank" rel="noopener">discord.com/login</a> and sign in.</span></span>
-        <span><b class="step-num">2</b><span>In desktop DevTools, open <b>Application → Local Storage → discord.com</b> and copy the <b>token</b> value.</span></span>
-        <span><b class="step-num">3</b><span>Paste it above. Kizzey keeps it in <span class="mono-copy">data/secret.json</span>.</span></span>
-      </div>
-    </div>
-    <div class="text-center"><button class="btn btn-ghost" data-action="login-help">Where do I find my token?</button></div>`;
+    K.onLoginSuccess = typeof onSuccess === 'function' ? onSuccess : null;
     K.sheet({
-      title: 'Sign in to Discord',
+      title: opts.title || 'Sign in to Discord',
       subtitle: opts.subtitle || 'Your presence, sent from this server.',
-      body,
+      body: `${K.loginPanel('sheet', opts)}
+        <div class="text-center mt-12"><button class="btn btn-ghost" data-action="login-help">Where do I find my token?</button></div>`,
       onMount(root) {
-        const input = root.querySelector('#login-token');
-        input?.focus({ preventScroll: true });
-        input?.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); K.actions['login-sheet-connect'](); } });
+        const panel = root.querySelector('[data-login-panel]');
+        const block = panel?.querySelector('[data-token-block]');
+        if (block && !block.classList.contains('hidden')) {
+          panel.querySelector('input')?.focus({ preventScroll: true });
+        }
       },
     });
   };
 
-  K.actions['toggle-login-token'] = () => {
-    const input = document.querySelector('#login-token');
-    if (!input) return;
-    input.type = input.type === 'password' ? 'text' : 'password';
-  };
-
-  K.actions['login-help'] = () => {
-    K.sheet({
-      title: 'Finding your token',
-      subtitle: 'The same sign-in the Android app uses.',
-      body: `<div class="setting-group" style="padding:16px">
-        <p style="font-size:0.8125rem;line-height:1.6;color:var(--text-dim);margin:0 0 12px">Kizzey needs an account token, not a bot token. It connects to Discord's user gateway and sends presence updates as you.</p>
-        <div class="login-steps">
-          <span><b class="step-num">1</b><span>Open Discord in a desktop browser and sign in.</span></span>
-          <span><b class="step-num">2</b><span>Press <kbd>F12</kbd> (or <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>I</kbd>), choose <b>Application</b>, then <b>Local Storage → https://discord.com</b>.</span></span>
-          <span><b class="step-num">3</b><span>Copy the value of the key named <b>token</b>. It is a long string of letters, numbers and dots.</span></span>
-          <span><b class="step-num">4</b><span>Paste it into Kizzey. The server validates it with Discord and stores it privately.</span></span>
-        </div>
-        <div class="danger-zone" style="margin-top:16px">
-          <div class="dz-title">Keep it private</div>
-          <p style="margin-bottom:0">A user token grants full access to the account. Only paste it into a Kizzey server you control, over a trusted connection.</p>
-        </div>
-      </div>
-      <div class="modal-actions"><button class="btn btn-primary" data-close-sheet>Got it</button></div>`,
-    });
-  };
-
-  K.actions['login-sheet-connect'] = async function () {
-    const input = document.querySelector('#login-token');
-    const errorBox = document.querySelector('#login-error');
-    const button = document.querySelector('#login-connect-btn');
-    if (!input || !errorBox) return;
-    const token = input.value.trim();
-    if (!token) { showLoginError('Paste your Discord token first.'); return; }
-    K.loginBusy = true;
-    if (button) { button.disabled = true; button.textContent = 'Checking with Discord…'; }
-    try {
-      const data = await K.api('/api/auth/token', { method: 'POST', body: { token } });
-      K.receiveState(data.state || await K.refresh());
-      K.closeSheet();
-      K.toast('Discord connected', `Signed in as ${K.displayName()}.`, 'ok');
-      const cb = K.loginSuccessCallback;
-      K.loginSuccessCallback = null;
-      if (cb) cb();
-      else K.render();
-    } catch (error) {
-      K.loginBusy = false;
-      if (button) { button.disabled = false; button.textContent = 'Connect Discord'; }
-      showLoginError(error.message);
-    }
-  };
-
-  function showLoginError(message) {
-    const box = document.querySelector('#login-error');
-    if (!box) { K.toast('Discord sign-in failed', message, 'error'); return; }
-    box.textContent = message;
-    box.classList.remove('hidden');
-    document.querySelector('#login-token')?.focus();
-  }
-
   K.ensureLogin = function ensureLogin(callback) {
-    if (K.isSignedIn()) { if (typeof callback === 'function') callback(); return true; }
+    if (K.isSignedIn() && K.hasUserToken()) {
+      if (typeof callback === 'function') callback();
+      return true;
+    }
+    if (K.isSignedIn() && !K.hasUserToken()) {
+      K.toast(
+        'A user token is needed',
+        'Discord OAuth proves who you are, but it cannot send Rich Presence. Add a user token to this account in Discord accounts.',
+        'warn'
+      );
+      K.navigate('accounts');
+      return false;
+    }
     K.loginSheet(typeof callback === 'function' ? callback : null, { subtitle: 'Connect Discord to publish this presence.' });
     return false;
   };
@@ -672,13 +628,28 @@
           </div>
         </div>
         <div class="onboard-bottom">
-          <button class="btn btn-primary btn-lg btn-block" data-action="welcome-next">${K.icon('message-circle', 'sm')}Continue with Discord</button>
+          <button class="btn btn-primary btn-lg btn-block" data-action="welcome-next">${K.icon('chevron-right', 'sm')}Get started</button>
           <div class="text-center mt-12"><button class="btn btn-ghost btn-sm" data-action="welcome-skip">Explore without connecting</button></div>
           <div class="welcome-footer">${K.icon('lock', 'sm')} Local-first · your server · no third-party cloud</div>
         </div>
       </div>`;
     },
-    mount() { K.welcomeStep = K.welcomeStep || 0; },
+    mount() {
+      K.welcomeStep = K.welcomeStep || 0;
+      if (K.welcomeStep === 1) {
+        K.onLoginSuccess = async () => {
+          if (K.currentScreen !== K.screens.welcome) return;
+          K.setLocal('ui.onboarded', true);
+          await K.queuePatch({ ui: { onboarded: true } }, 0);
+          K.welcomeStep = 0;
+          K.navigate('home');
+          setTimeout(() => {
+            K.toast('You are connected', `Welcome, ${K.displayName()}.`, 'ok');
+            K.render();
+          }, 80);
+        };
+      }
+    },
   };
 
   function renderWelcomeLogin() {
@@ -691,24 +662,9 @@
       <div style="margin-top:38px">
         <div class="eyebrow">One link between your accounts</div>
         <h1 style="font-size:2.0625rem;line-height:1.04;letter-spacing:-.045em;margin:0 0 10px">Connect <em>Discord.</em></h1>
-        <p class="onboard-copy" style="max-width:36ch">Kizzey uses your account token the same way the Android app does. It is kept server-side and only used for presence, chat and account tools you start.</p>
-        <div class="login-card">
-          <div class="field">
-            <label for="welcome-token"><span>Account token</span><span class="optional">stored server-side</span></label>
-            <div class="input-wrap">
-              <input id="welcome-token" class="input" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Discord token">
-              <span class="input-suffix"><button class="icon-btn small" data-action="toggle-welcome-token" aria-label="Show token">${K.icon('eye', 'sm')}</button></span>
-            </div>
-          </div>
-          <div id="welcome-error" class="field-error hidden"></div>
-          <button class="btn btn-primary btn-block" data-action="welcome-connect" id="welcome-connect">${K.icon('login', 'sm')}Connect Discord</button>
-          <div class="login-steps">
-            <span><b class="step-num">1</b><span>Sign in at <a href="https://discord.com/login" target="_blank" rel="noopener">discord.com/login</a> in a browser.</span></span>
-            <span><b class="step-num">2</b><span>Open DevTools → <b>Application → Local Storage → token</b>. Copy the value.</span></span>
-            <span><b class="step-num">3</b><span>Paste it here. It never goes back to the browser.</span></span>
-          </div>
-        </div>
-        <button class="btn btn-ghost btn-block" data-action="welcome-skip">Explore Kizzey without connecting</button>
+        <p class="onboard-copy" style="max-width:36ch">Sign in with Discord in one tap. Presence, chat and account tools still use a user token, kept on this server and never sent back to the browser.</p>
+        ${K.loginPanel('welcome')}
+        <button class="btn btn-ghost btn-block mt-12" data-action="welcome-skip">Explore Kizzey without connecting</button>
         <div class="welcome-footer">${K.icon('info', 'sm')} You can connect later from Settings.</div>
       </div>
     </div>`;
@@ -723,39 +679,6 @@
     K.navigate('home');
     setTimeout(() => K.render(), 50);
   };
-  K.actions['toggle-welcome-token'] = () => {
-    const input = document.querySelector('#welcome-token');
-    if (input) input.type = input.type === 'password' ? 'text' : 'password';
-  };
-  K.actions['welcome-connect'] = async function () {
-    const input = document.querySelector('#welcome-token');
-    const error = document.querySelector('#welcome-error');
-    const button = document.querySelector('#welcome-connect');
-    if (!input) return;
-    const token = input.value.trim();
-    if (!token) { showWelcomeError('Paste your token to continue.'); return; }
-    if (button) { button.disabled = true; button.textContent = 'Checking with Discord…'; }
-    try {
-      const data = await K.api('/api/auth/token', { method: 'POST', body: { token } });
-      K.receiveState(data.state || await K.refresh());
-      K.setLocal('ui.onboarded', true);
-      await K.queuePatch({ ui: { onboarded: true } }, 0);
-      K.welcomeStep = 0;
-      K.navigate('home');
-      setTimeout(() => {
-        K.toast('You are connected', `Welcome, ${K.displayName()}.`, 'ok');
-        K.render();
-      }, 80);
-    } catch (err) {
-      if (button) { button.disabled = false; button.innerHTML = `${K.icon('login', 'sm')}Connect Discord`; }
-      showWelcomeError(err.message);
-    }
-  };
-  function showWelcomeError(message) {
-    const box = document.querySelector('#welcome-error');
-    if (box) { box.textContent = message; box.classList.remove('hidden'); }
-    K.toast('Could not connect', message, 'error');
-  }
 
   // ---------------------------------------------------------------------
   // home

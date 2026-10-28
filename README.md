@@ -6,6 +6,11 @@ using a Python standard-library server as the browser equivalent of the Android 
 
 The Discord token lives on the server. The browser never receives it, not even a hint.
 
+Two sign-in paths are available: a normal **Sign in with Discord** OAuth2 flow for your identity,
+and an advanced user token for Rich Presence and anything that reads or writes messages. Discord
+does not grant OAuth applications gateway or channel access, so both paths exist on purpose and
+neither pretends to be the other.
+
 ## Run it
 
 Requirements:
@@ -29,6 +34,30 @@ location and browser screen capture are available there. On a plain-HTTP LAN add
 features may be blocked by the browser; put a TLS reverse proxy in front of Kizzey if you need
 them from another device.
 
+### Pull and run
+
+`script_pull.py` clones or updates the checkout and then starts the server, so a fresh machine
+needs one command:
+
+```bash
+python3 script_pull.py --host 0.0.0.0 --port 8420
+```
+
+It clones into `./kizzey-web` when the script is not already inside a checkout, runs
+`git pull --ff-only` when it is, and forwards every other flag to `server.py`. Runtime data in
+`data/` is git-ignored, so updates never delete accounts, settings or history.
+
+| Launcher option | Purpose |
+| --- | --- |
+| `--dir PATH` | Checkout to clone or update. Defaults to this script's folder. |
+| `--repo URL` / `--branch NAME` | Remote and branch to track. |
+| `--no-pull` | Start the current checkout without touching git. |
+| `--update-only` | Pull and exit. |
+
+A private remote needs an authenticated git helper first (`gh auth login`, an SSH key, or a
+credential helper). When the working tree has local edits, the fast-forward pull stops and says so
+instead of discarding them.
+
 ### Options
 
 | Option | Purpose |
@@ -37,26 +66,62 @@ them from another device.
 | `--port 8420` | HTTP port. Default `8420`. |
 | `--no-gateway` | Restore the saved account without opening the Discord gateway at startup. |
 | `KIZZEY_HOST` / `KIZZEY_PORT` | Environment equivalents for host and port. |
+| `--discord-client-id` / `--discord-client-secret` | Discord application credentials for OAuth sign-in. |
+| `KIZZEY_DISCORD_CLIENT_ID` / `KIZZEY_DISCORD_CLIENT_SECRET` | Environment equivalents; they override values saved in the UI. |
+| `KIZZEY_PUBLIC_URL` | Public origin used to build the OAuth redirect URI, e.g. `https://kizzey.example.com`. |
 
 ## Signing in
 
-Open the welcome screen or the drawer and choose **Connect Discord**. Kizzey uses a Discord
-user token because Rich Presence is sent through the user gateway, not a bot account. The sheet
-explains where the token is in Discord's Local Storage; pasting it is the web equivalent of the
-Android app's WebView sign-in.
+### Sign in with Discord (OAuth2)
 
-The token is validated against Discord, stored in `data/secret.json`, and used server-side.
-Public state, logs, API responses and state exports never include it. Use a token only on a
-server you control, keep the server off untrusted networks, and remember that Discord user
-tokens carry account risk.
+**Settings → Discord login** turns on a normal Discord sign-in screen. Create an application at
+<https://discord.com/developers/applications>, add the redirect URI shown on that screen, and paste
+the application's Client ID and Client Secret into Kizzey. The welcome screen and the sign-in sheet
+then offer **Continue with Discord**.
+
+The flow is a standard authorization-code exchange with PKCE and a single-use `state` value,
+completed entirely on the server:
+
+1. The browser is sent to `discord.com/oauth2/authorize` with the `identify` scope.
+2. Discord redirects to `/api/auth/oauth/callback`.
+3. The server exchanges the code, reads `/users/@me`, stores the identity, and returns to the app.
+
+Access and refresh tokens are written to `data/secret.json`, refreshed automatically when they
+expire, and never appear in public state, API responses, logs or exports. The client secret stays
+server-side too. Credentials saved in the UI are used only when the environment variables are not
+set.
+
+Discord does not let OAuth applications open a gateway session, read channel history or send Rich
+Presence. An OAuth account therefore shows as an **OAuth identity** with no gateway, and presence,
+chat tools and message mirroring explain that they need a user token for that account. Adding a
+token later keeps the OAuth identity linked to the same row.
+
+For a hosted instance, set `KIZZEY_PUBLIC_URL` (or use the exact host and port people open) so the
+redirect URI registered at Discord matches the one Kizzey sends.
+
+### Connect with a user token
+
+Rich Presence is sent through the user gateway, not a bot account, so the presence and message
+features need a Discord user token. The sign-in sheet keeps that path behind **Use a user token
+instead**: open Discord in a desktop browser, copy the `token` value from Local Storage, and paste
+it once. This is the web equivalent of the Android app's WebView session.
+
+The token is validated against Discord, stored in `data/secret.json`, and used server-side. Public
+state, logs, API responses and state exports never include it. Use a token only on a server you
+control, keep the server off untrusted networks, and remember that Discord user tokens carry
+account risk.
 
 ### Multiple Discord accounts
 
 Open **Settings → Discord accounts**, or choose the same item in the drawer, to save and switch
 identities. Up to eight accounts are kept in a private `accounts` array in `data/secret.json`;
 the legacy `token` field remains as a compatibility copy of the active token. The browser only
-receives account IDs, usernames, display names, avatars, timestamps and boolean token status —
-never a token, token fragment or hint.
+receives account IDs, usernames, display names, avatars, timestamps, the credential kind
+(`token`/`oauth`), and boolean token and gateway status — never a token, OAuth token, token
+fragment or hint.
+
+An account can hold an OAuth identity, a user token, or both. OAuth-only rows can be selected and
+labelled, but they do not open a gateway or back a mirror rule until a token is added.
 
 One gateway and one live presence run at a time. Switching validates the target token, stops the
 old presence and socket, then opens the target session. Replacing the token of the live account
@@ -148,6 +213,8 @@ python3 -m py_compile server.py
 for file in static/*.js; do node --check "$file"; done
 python3 tests/test_kizzey_import.py
 python3 tests/test_accounts_mirror.py
+python3 tests/test_oauth_login.py
+python3 tests/test_launcher.py
 node tests/test_import_ui.js
 node tests/test_gallery_apply.js
 node tests/test_accounts_ui.js
@@ -171,6 +238,7 @@ against a stubbed Material runtime.
 - Persistent history, server logs and usage counters
 - Saved presets, a gallery with local submissions, and automation schedules
 - Up to eight saved Discord accounts with server-side token isolation and active fallback
+- Normal **Sign in with Discord** OAuth2 flow with PKCE, state, server-side refresh and no token capture
 - A real, rate-limited message mirror with normal and managed-webhook identity formats
 - Optional album-art backdrop and artwork-sampled accent colour in Display settings
 - Custom CSS variables, text scaling, themes, AMOLED mode and Material You-style accents
@@ -242,6 +310,7 @@ The frontend uses JSON endpoints and an SSE stream. The main groups are:
 
 - `GET /api/state`, `/api/events`, `/api/accounts`, `/api/mirror`; `POST /api/patch`
 - `POST /api/auth/token`, `/api/auth/logout`, `/api/account/refresh`, `/api/gateway/reconnect`
+- `GET /api/auth/oauth/config`, `/api/auth/oauth/start`, `/api/auth/oauth/callback`; `POST /api/auth/oauth/config`
 - `POST /api/accounts/{add,switch,remove,remove-all}`
 - `POST /api/mirror/settings`, `/api/mirror/rules`, `/api/mirror/rules/{toggle,delete}`, `/api/mirror/run`
 - `POST /api/rpc/{start,stop,refresh,preview}`

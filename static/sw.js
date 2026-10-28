@@ -1,9 +1,9 @@
 /* Kizzey Web — installable shell, network-first for live files */
-const CACHE = 'kizzey-shell-v4';
+const CACHE = 'kizzey-shell-v5';
 const SHELL = [
   '/', '/styles.css', '/core.js', '/screens-rpc.js', '/screens-tools.js',
   '/screens-tools2.js', '/screens-social.js', '/screens-social2.js',
-  '/screens-settings.js', '/screens-accounts.js', '/app.js', '/icon.png',
+  '/screens-settings.js', '/screens-accounts.js', '/login.js', '/app.js', '/icon.png',
   '/icon-512.png', '/icon-fg-512.png', '/manifest.webmanifest'
 ];
 
