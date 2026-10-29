@@ -5882,14 +5882,18 @@ class _WSClient:
     @classmethod
     def connect(cls, url: str, timeout: float = 10) -> "_WSClient":
         parsed = urllib.parse.urlparse(str(url or ""))
-        if parsed.scheme not in ("ws", "http"):
+        if parsed.scheme not in ("ws", "wss", "http", "https"):
             raise OSError(f"Unsupported DevTools URL scheme: {parsed.scheme or 'none'}")
+        secure = parsed.scheme in ("wss", "https")
         host = parsed.hostname or "127.0.0.1"
-        port = int(parsed.port or 80)
+        port = int(parsed.port or (443 if secure else 80))
         path = parsed.path or "/"
         if parsed.query:
             path += "?" + parsed.query
         sock = socket.create_connection((host, port), timeout=timeout)
+        if secure:
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=host)
         sock.settimeout(timeout)
         client = cls(sock)
         try:
@@ -6200,6 +6204,227 @@ def _pick_page(targets: list[dict]) -> dict | None:
     return None
 
 
+# -- external DevTools endpoint ---------------------------------------------
+#
+# A headless container usually has no Chromium binary, and installing one just
+# to read a session token is a poor trade. Kizzey can instead drive a browser
+# that is already running somewhere else: Chrome/Edge on the operator's desktop
+# (started with --remote-debugging-port), another machine on the LAN, or a
+# browserless container. Only the DevTools HTTP endpoint and its WebSocket are
+# used, so the Kizzey container itself stays browser-free.
+#
+# KIZZEY_BROWSER_CDP may be http(s)://host:port or ws(s)://host:port?token=...
+# A URL in KIZZEY_BROWSER is accepted too, since that variable already names the
+# browser to use.
+
+
+def _remote_cdp() -> tuple[str, str]:
+    """Return ``(http_origin, query)`` for an external DevTools endpoint."""
+    raw = str(os.environ.get("KIZZEY_BROWSER_CDP") or "").strip()
+    if not raw:
+        candidate = str(os.environ.get("KIZZEY_BROWSER") or "").strip()
+        if candidate.lower().startswith(("http://", "https://", "ws://", "wss://")):
+            raw = candidate
+    if not raw:
+        return "", ""
+    if "://" not in raw:
+        raw = "http://" + raw
+    parsed = urllib.parse.urlsplit(raw)
+    scheme = parsed.scheme.lower()
+    if scheme in ("ws", "wss"):
+        scheme = "https" if scheme == "wss" else "http"
+    if scheme not in ("http", "https"):
+        raise DiscordError(500, "KIZZEY_BROWSER_CDP must be an http(s) or ws(s) URL.")
+    if not parsed.netloc:
+        raise DiscordError(
+            500,
+            "KIZZEY_BROWSER_CDP needs a host, for example http://192.168.1.10:9222.",
+        )
+    return f"{scheme}://{parsed.netloc}", parsed.query
+
+
+def _cdp_http(origin: str, query: str, path: str, timeout: float = 2, method: str = "GET"):
+    url = origin.rstrip("/") + path
+    if query:
+        url += ("&" if "?" in url else "?") + query
+    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method=method)
+    token = str(os.environ.get("KIZZEY_BROWSER_CDP_TOKEN") or "").strip()
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    if not raw:
+        return None
+    return json.loads(raw)
+
+
+def _cdp_browser_ws(origin: str, query: str, timeout: float = 3) -> str:
+    """The browser-level DevTools socket, rewritten to the configured host."""
+    version = _cdp_http(origin, query, "/json/version", timeout=timeout)
+    ws = str(version.get("webSocketDebuggerUrl") or "") if isinstance(version, dict) else ""
+    if not ws:
+        return ""
+    parsed = urllib.parse.urlsplit(ws)
+    base = urllib.parse.urlsplit(origin)
+    host = (parsed.hostname or "").lower()
+    local_names = ("", "localhost", "127.0.0.1", "0.0.0.0", "::1")
+    if host in local_names and base.hostname:
+        # Browserless and containerised Chrome report ws://localhost:<port>/...
+        # even when the endpoint was reached over another address.
+        return urllib.parse.urlunsplit(
+            (
+                "wss" if base.scheme == "https" else "ws",
+                base.netloc,
+                parsed.path or "/",
+                "",
+                parsed.query or query,
+            )
+        )
+    if parsed.scheme == "ws" and base.scheme == "https":
+        return urllib.parse.urlunsplit(("wss", parsed.netloc, parsed.path or "/", "", parsed.query or query))
+    return ws
+
+
+def _cdp_ready_at(origin: str, query: str) -> bool:
+    try:
+        return isinstance(_cdp_http(origin, query, "/json/version", timeout=2.5), dict)
+    except Exception:
+        return False
+
+
+def _cdp_targets_at(origin: str, query: str) -> list[dict]:
+    try:
+        data = _cdp_http(origin, query, "/json/list", timeout=2.5)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "") != "page":
+            continue
+        if not str(item.get("webSocketDebuggerUrl") or ""):
+            continue
+        out.append(item)
+    return out
+
+
+def _wait_for_remote(origin: str, query: str, deadline: float) -> bool:
+    while time.time() < deadline:
+        if BROWSER_LOGIN_ABORT.is_set():
+            return False
+        if _cdp_ready_at(origin, query):
+            return True
+        time.sleep(0.4)
+    return False
+
+
+def _create_target(browser_ws: str, url: str) -> str:
+    if not browser_ws:
+        raise DiscordError(502, "The browser did not report a DevTools WebSocket address.")
+    conn = _CDPConn(browser_ws, timeout=10)
+    try:
+        result = conn.call("Target.createTarget", {"url": url})
+    finally:
+        conn.close()
+    return str((result or {}).get("targetId") or "")
+
+
+def _wait_for_target(origin: str, query: str, target_id: str, deadline: float) -> dict | None:
+    while time.time() < deadline:
+        for target in _cdp_targets_at(origin, query):
+            if str(target.get("id") or "") == target_id:
+                return target
+        time.sleep(0.3)
+    return None
+
+
+def _close_target(browser_ws: str, target_id: str) -> None:
+    if not browser_ws or not target_id:
+        return
+    conn = None
+    try:
+        conn = _CDPConn(browser_ws, timeout=5)
+        conn.call("Target.closeTarget", {"targetId": target_id})
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _remote_browser_login(origin: str, query: str, timeout: float) -> dict:
+    deadline = time.time() + max(30.0, float(timeout))
+    if not _wait_for_remote(origin, query, min(deadline, time.time() + 12.0)):
+        raise DiscordError(
+            502,
+            f"Could not reach a browser at {origin}. Check KIZZEY_BROWSER_CDP and that the "
+            "browser was started with --remote-debugging-port.",
+        )
+    browser_ws = _cdp_browser_ws(origin, query)
+    target_id = ""
+    # If the remote browser already has a Discord tab, use it: an everyday
+    # profile is often signed in already and the token can be read at once.
+    page = _pick_page(_cdp_targets_at(origin, query))
+    if page is None:
+        target_id = _create_target(browser_ws, BROWSER_LOGIN_URL)
+        if not target_id:
+            raise DiscordError(502, "The browser did not open a sign-in tab.")
+        page = _wait_for_target(origin, query, target_id, min(deadline, time.time() + 10.0))
+        if page is None:
+            raise DiscordError(
+                502,
+                "The sign-in tab never appeared. Make sure the remote browser allows "
+                "Target.createTarget (a normal Chrome or a browserless container does).",
+            )
+    try:
+        while time.time() < deadline:
+            if BROWSER_LOGIN_ABORT.is_set():
+                return {"status": "cancelled"}
+            targets = _cdp_targets_at(origin, query)
+            chosen = None
+            if target_id:
+                chosen = next((item for item in targets if str(item.get("id") or "") == target_id), None)
+            if chosen is None:
+                chosen = _pick_page(targets)
+            if chosen is not None:
+                token = _read_page_token(str(chosen.get("webSocketDebuggerUrl") or ""))
+                if token:
+                    return {"status": "ok", "token": token}
+            time.sleep(1.0)
+        raise DiscordError(
+            504,
+            "Timed out waiting for the Discord sign-in. Finish signing in to the tab that "
+            "Kizzey opened in the remote browser, then try again.",
+        )
+    finally:
+        # Only the tab Kizzey created is closed; pre-existing tabs are left alone.
+        _close_target(browser_ws, target_id)
+
+
+def browser_endpoint_info() -> dict:
+    """Where browser sign-in would run, for the login panel and troubleshooting."""
+    try:
+        origin, query = _remote_cdp()
+    except DiscordError as exc:
+        return {"mode": "invalid", "error": exc.message}
+    if origin:
+        return {
+            "mode": "remote",
+            "address": origin,
+            "reachable": _cdp_ready_at(origin, query),
+        }
+    exe = _find_browser()
+    if exe:
+        return {"mode": "local", "browser": os.path.basename(exe), "path": exe}
+    return {"mode": "none"}
+
+
 def _wait_for_cdp(port: int, deadline: float, proc=None) -> bool:
     while time.time() < deadline:
         if BROWSER_LOGIN_ABORT.is_set():
@@ -6226,6 +6451,16 @@ def _launch_browser(exe: str, port: int, profile: str, url: str):
         "--new-window",
         url,
     ]
+    # A display-less host needs Chrome to run headless, but an invisible sign-in
+    # page is useless without a remote viewer, so that is opt-in. The sandbox is
+    # disabled automatically in containers, where Chrome refuses to start as
+    # root; the profile is throwaway and only talks to discord.com.
+    container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+    if str(os.environ.get("KIZZEY_BROWSER_HEADLESS") or "") == "1":
+        args.insert(1, "--headless=new")
+        args.insert(2, "--disable-gpu")
+    if container or str(os.environ.get("KIZZEY_BROWSER_NO_SANDBOX") or "") == "1":
+        args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
     kwargs = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
@@ -6303,17 +6538,24 @@ def _read_page_token(ws_url: str) -> str:
 
 
 def browser_login(timeout: float = BROWSER_LOGIN_TIMEOUT) -> dict:
-    """Open discord.com/login in a throwaway browser and read back the session.
+    """Open discord.com/login in a browser and read back the session.
 
-    Returns ``{"status": "ok", "token": ...}`` once Discord has stored a token
-    in that browser profile, or ``{"status": "cancelled"}`` if the operator hit
-    cancel. The browser is closed and its profile deleted either way.
+    The browser is either a Chromium-family binary on this machine or the
+    external DevTools endpoint in ``KIZZEY_BROWSER_CDP``. Returns
+    ``{"status": "ok", "token": ...}`` once Discord has stored a token, or
+    ``{"status": "cancelled"}`` if the operator hit cancel. A local browser is
+    closed and its throwaway profile deleted; a remote tab is closed too.
     """
+    origin, query = _remote_cdp()
+    if origin:
+        return _remote_browser_login(origin, query, timeout)
     exe = _find_browser()
     if not exe:
         raise DiscordError(
             500,
-            "No Chrome, Edge, or Brave was found on this machine. Install one, or use the password sign-in instead.",
+            "No Chrome, Edge, or Brave was found on this machine. Set "
+            "KIZZEY_BROWSER_CDP to a browser on another machine, or use the password "
+            "or token sign-in instead.",
         )
     port = _free_port()
     try:
@@ -6827,6 +7069,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.handle_preset_export()
             except ValueError as exc:
                 return self.send_error_json(str(exc), 400)
+        if path == "/api/auth/browser/info":
+            return self.send_json({"ok": True, "browser": browser_endpoint_info()})
         if path == "/api/health":
             return self.send_json(
                 {
@@ -7849,7 +8093,15 @@ def main() -> int:
     parser.add_argument("--host", default=os.environ.get("KIZZEY_HOST", "0.0.0.0"), help="Bind address (default 0.0.0.0)")
     parser.add_argument("--port", type=int, default=int(os.environ.get("KIZZEY_PORT", DEFAULT_PORT)), help="Port (default 8420)")
     parser.add_argument("--no-gateway", action="store_true", help="Do not auto-connect to Discord on startup")
+    parser.add_argument(
+        "--browser-cdp",
+        default=os.environ.get("KIZZEY_BROWSER_CDP", ""),
+        metavar="URL",
+        help="Use a Chrome/Chromium DevTools endpoint on another machine, e.g. http://192.168.1.10:9222",
+    )
     args = parser.parse_args()
+    if str(args.browser_cdp or "").strip():
+        os.environ["KIZZEY_BROWSER_CDP"] = str(args.browser_cdp).strip()
 
     STORE = Store()
     STORE.log("INFO", "Server", f"Kizzey Web {VERSION} starting on {args.host}:{args.port}.")

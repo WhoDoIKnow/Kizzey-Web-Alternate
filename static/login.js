@@ -9,6 +9,53 @@
   const mfaTickets = {};
   const busy = {};
 
+  // Browser sign-in runs locally or against KIZZEY_BROWSER_CDP; the panel asks
+  // the server which one so the hint matches what the button will actually do.
+  let browserInfo = null;
+  let browserInfoRequest = null;
+
+  function browserCopy(info) {
+    if (info.mode === 'remote') {
+      return {
+        title: `Uses the browser at ${info.address}`,
+        body: 'Kizzey opens discord.com in a tab there, waits for the sign-in, then closes that tab.',
+      };
+    }
+    if (info.mode === 'local') {
+      return {
+        title: `Opens discord.com in ${info.browser || 'a browser window'}`,
+        body: 'It uses a temporary profile and closes it afterwards, so your everyday browser is untouched.',
+      };
+    }
+    if (info.mode === 'invalid') {
+      return {
+        title: 'The browser endpoint is misconfigured',
+        body: info.error || 'Check KIZZEY_BROWSER_CDP.',
+      };
+    }
+    return {
+      title: 'No browser on this server',
+      body: 'Use the password or token sign-in below, or point KIZZEY_BROWSER_CDP at a Chrome on another machine.',
+    };
+  }
+
+  function paintBrowserHint(info) {
+    const copy = browserCopy(info || { mode: 'none' });
+    document.querySelectorAll('[data-browser-title]').forEach(node => { node.textContent = copy.title; });
+    document.querySelectorAll('[data-browser-copy]').forEach(node => { node.textContent = copy.body; });
+  }
+
+  function refreshBrowserHint() {
+    if (!document.querySelector('[data-browser-copy]')) return;
+    if (!browserInfoRequest) {
+      browserInfoRequest = K.api('/api/auth/browser/info')
+        .then(data => { browserInfo = (data && data.browser) || { mode: 'none' }; })
+        .catch(() => { browserInfo = null; })
+        .finally(() => { browserInfoRequest = null; });
+    }
+    browserInfoRequest.then(() => paintBrowserHint(browserInfo));
+  }
+
   /**
    * Markup for both entry points (onboarding and the sign-in sheet).
    * `prefix` keeps the element ids unique when two panels could be on screen.
@@ -19,12 +66,12 @@
    */
   K.loginPanel = function loginPanel(prefix = 'login', opts = {}) {
     const tokenOpen = !!opts.tokenOpen;
-    return `<div class="login-card" data-login-panel="${prefix}" style="margin-top:0">
+    const html = `<div class="login-card" data-login-panel="${prefix}" style="margin-top:0">
       <form data-login-step="credentials" data-submit-action="login-submit" novalidate>
         <button class="btn btn-primary btn-block btn-lg" type="button" data-action="login-browser" data-prefix="${prefix}" id="${prefix}-browser">${K.icon('login', 'sm')}Sign in with Discord</button>
         <div class="login-hint" style="margin-top:12px">
           ${K.icon('shield-check', 'sm')}
-          <div><b>Opens discord.com in a browser window</b><span>Sign in there like you normally would. Kizzey picks up the session when you are done and closes the window.</span></div>
+          <div><b data-browser-title>Opens discord.com in a browser window</b><span data-browser-copy>Sign in there like you normally would. Kizzey picks up the session when you are done.</span></div>
         </div>
         <div id="${prefix}-browser-error" class="field-error hidden"></div>
 
@@ -52,7 +99,7 @@
         <div class="hidden" data-browser-block="${prefix}">
           <div class="login-hint" style="margin-top:14px">
             ${K.icon('external-link', 'sm')}
-            <div><b>Waiting for the sign-in window</b><span>Finish signing in to Discord in the window that just opened.</span></div>
+            <div><b>Waiting for the Discord sign-in</b><span>Finish signing in to Discord in the tab that opened. Kizzey reads the session and closes it afterwards.</span></div>
           </div>
           <button class="btn btn-ghost btn-block btn-sm" type="button" data-action="login-browser-cancel" data-prefix="${prefix}" id="${prefix}-browser-cancel">Cancel</button>
         </div>
@@ -97,6 +144,9 @@
         <span>Kizzey runs on your own machine only. Your password goes straight to Discord from this computer; only the session token is kept, and it never leaves your disk.</span>
       </div>
     </div>`;
+    browserInfo = null;
+    setTimeout(refreshBrowserHint, 0);
+    return html;
   };
 
   function panelFor(el) {
@@ -202,6 +252,10 @@
       finish(data);
     } catch (error) {
       showError(`${prefix}-browser`, error.message);
+      if (/no chrome|no browser|KIZZEY_BROWSER_CDP|devtools/i.test(error.message || '')) {
+        revealPasswordBlock(prefix, true);
+        refreshBrowserHint();
+      }
     } finally {
       setBrowserBusy(prefix, false);
     }

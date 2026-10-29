@@ -1,0 +1,11 @@
+.git
+.gitignore
+.github
+__pycache__
+**/__pycache__
+data
+uploads
+tmp
+tests
+*.zip
+*.pyc

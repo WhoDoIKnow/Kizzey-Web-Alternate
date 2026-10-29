@@ -83,7 +83,10 @@ instead of discarding them.
 | `--host 0.0.0.0` | Listen on every interface. Default. |
 | `--port 8420` | HTTP port. Default `8420`. |
 | `--no-gateway` | Restore the saved accounts without opening any gateway socket at startup. |
+| `--browser-cdp URL` | Drive a Chrome/Chromium DevTools endpoint on another machine instead of a local browser. |
 | `KIZZEY_HOST` / `KIZZEY_PORT` | Environment equivalents for host and port. |
+| `KIZZEY_BROWSER_CDP` | Environment equivalent for `--browser-cdp`, for example `http://127.0.0.1:9222` or `ws://browser:3000?token=…`. |
+| `KIZZEY_BROWSER` | Path to a browser binary, or a DevTools URL (then it behaves like `KIZZEY_BROWSER_CDP`). |
 
 ## Signing in
 
@@ -102,7 +105,53 @@ your everyday browser: it carries no cookies from it, writes nothing to it, and 
 does not affect it.
 
 The token never leaves this machine and is never sent to the page. If the window cannot open (no
-Chromium-family browser installed), or you would rather not use it, both fallbacks below still work.
+Chromium-family browser installed), or you would rather not use it, the fallbacks below still work.
+
+### Headless server or container
+
+Kizzey's own container needs no browser. Browser sign-in only needs a Chromium-family browser
+*somewhere reachable over the network*, driven through its DevTools endpoint. Point
+`KIZZEY_BROWSER_CDP` at it (or pass `--browser-cdp`):
+
+```bash
+# A Chrome on your desktop, started with a debugging port. You sign in on that
+# screen, so no virtual display or VNC is needed.
+google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/kizzey-signin
+
+python3 server.py --browser-cdp http://192.168.1.20:9222
+```
+
+The included `Dockerfile` is Python-only, with no Chromium in the image:
+
+```bash
+docker build -t kizzey-web .
+docker run --rm -p 8420:8420 -v kizzey-data:/app/data \
+  -e KIZZEY_BROWSER_CDP=http://192.168.1.20:9222 \
+  kizzey-web
+```
+
+Kizzey asks the endpoint for its tabs, opens `discord.com/login` in a new tab, waits while you sign
+in on that machine, reads the session token over the same debugging channel, and closes that tab.
+Chrome binds the debugging port to `127.0.0.1` by default. Reach it with an SSH tunnel
+(`ssh -L 9222:127.0.0.1:9222 user@desktop`) and use `http://127.0.0.1:9222`, run Kizzey with host
+networking on that machine, or use a Chromium container on the same Docker network.
+
+For a hosted browser service, the `ws://` or `wss://` form keeps its query string:
+
+```bash
+KIZZEY_BROWSER_CDP='wss://browser.example.com?token=SECRET' python3 server.py
+```
+
+A headless Chromium (for example a browserless container) can open the tab but gives you no screen to
+sign in on; use it only if you can view that browser (VNC, a live-view URL) or if the profile is
+already signed in and the token can be read straight away. Otherwise the password and token
+fallbacks below work with no browser at all.
+
+The DevTools endpoint is remote control of a real browser: keep it on localhost, a private Docker
+network or an SSH tunnel, and never publish it to the internet. Set `KIZZEY_BROWSER_CDP_TOKEN` if
+your endpoint expects `Authorization: Bearer …`. A local browser on a display-less host stays
+invisible and unusable, so headless mode there is opt-in with `KIZZEY_BROWSER_HEADLESS=1`; containers
+automatically get `--no-sandbox` because a throwaway profile cannot start as root otherwise.
 
 ### Email or username and password
 
@@ -260,6 +309,7 @@ for file in static/*.js; do node --check "$file"; done
 python3 tests/test_kizzey_import.py
 python3 tests/test_accounts_mirror.py
 python3 tests/test_password_login.py
+python3 tests/test_browser_remote.py
 python3 tests/test_launcher.py
 node tests/test_import_ui.js
 node tests/test_gallery_apply.js
@@ -284,7 +334,7 @@ against a stubbed Material runtime.
 - Persistent history, server logs and usage counters
 - Saved presets, a gallery with local submissions, and automation schedules
 - Up to eight saved Discord accounts, each able to hold its own live Rich Presence at once
-- Discord email/username and password sign-in with a two-factor step, plus a user-token fallback
+- Discord web sign-in in a local browser or a remote Chrome DevTools endpoint, plus email/password with two-factor and a user-token fallback
 - A real, rate-limited message mirror with normal and managed-webhook identity formats
 - Optional album-art backdrop and artwork-sampled accent colour in Display settings
 - Custom CSS variables, text scaling, themes, AMOLED mode and Material You-style accents
