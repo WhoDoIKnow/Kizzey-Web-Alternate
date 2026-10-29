@@ -93,7 +93,7 @@
         <div class="account-hero">
           ${K.avatar({ name: account?.displayName || K.get('chatProfile.name', 'You'), url: account?.avatarUrl || K.get('chatProfile.avatar', ''), cls: '', style: 'width:54px;height:54px;font-size:1.125rem' })}
           <div style="flex:1;min-width:0"><div class="account-name" style="font-size:1.1875rem">${h(account?.displayName || K.get('chatProfile.name', 'You'))}</div><div class="account-handle">${account ? '@' + h(account.username || '') : 'Kizzey Web on this server'}</div><div class="account-meta" style="margin-top:5px"><span class="badge ${status.color === 'good' ? 'good' : 'plain'}">${h(status.text)}</span><span class="pill">${h(settings.theme || 'dark')}</span>${accounts.length ? `<span class="pill">${accounts.length} account${accounts.length === 1 ? '' : 's'}</span>` : ''}</div></div>
-          ${account ? `<button class="icon-btn" data-route="accounts" aria-label="Manage accounts">${K.icon('users', 'sm')}</button><button class="icon-btn" data-action="logout" aria-label="Sign out">${K.icon('logout', 'sm')}</button>` : `<button class="btn btn-primary btn-sm" data-action="retry-login">Connect</button>`}
+          ${account ? `<button class="icon-btn" data-route="accounts" aria-label="Manage accounts">${K.icon('users', 'sm')}</button><button class="icon-btn" data-action="logout" aria-label="Sign out">${K.icon('logout', 'sm')}</button>` : `<button class="btn btn-primary btn-sm" data-action="retry-login">Sign in with Discord</button>`}
         </div>
         ${discordGroup}
         ${K.settingGroup('General', pieces)}
@@ -152,7 +152,7 @@
   };
 
   K.actions['settings-reconnect-gateway'] = async () => {
-    if (!K.isSignedIn()) { K.toast('Connect Discord first', '', 'error'); return; }
+    if (!K.isSignedIn()) { K.toast('Sign in with Discord first', '', 'error'); return; }
     try {
       const data = await K.api('/api/gateway/reconnect', { method: 'POST', body: {} });
       if (data.state) K.receiveState(data.state);
@@ -162,7 +162,7 @@
   };
 
   K.actions['settings-refresh-account'] = async () => {
-    if (!K.isSignedIn()) { K.toast('Connect Discord first', '', 'error'); return; }
+    if (!K.isSignedIn()) { K.toast('Sign in with Discord first', '', 'error'); return; }
     try {
       const data = await K.api('/api/account/refresh', { method: 'POST', body: {} });
       if (data.state) K.receiveState(data.state);

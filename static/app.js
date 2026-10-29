@@ -611,7 +611,7 @@
           </div>
         </div>
         <div class="onboard-bottom">
-          <button class="btn btn-primary btn-lg btn-block" data-action="welcome-next">${K.icon('chevron-right', 'sm')}Get started</button>
+          <button class="btn btn-primary btn-lg btn-block" data-action="welcome-next">${K.icon('discord', 'sm')}Sign in with Discord</button>
           <div class="text-center mt-12"><button class="btn btn-ghost btn-sm" data-action="welcome-skip">Explore without connecting</button></div>
           <div class="welcome-footer">${K.icon('lock', 'sm')} Local-first · your server · no third-party cloud</div>
         </div>
@@ -644,7 +644,7 @@
       </div>
       <div style="margin-top:38px">
         <div class="eyebrow">One connection, every account</div>
-        <h1 style="font-size:2.0625rem;line-height:1.04;letter-spacing:-.045em;margin:0 0 10px">Connect <em>Discord.</em></h1>
+        <h1 style="font-size:2.0625rem;line-height:1.04;letter-spacing:-.045em;margin:0 0 10px">Sign in with <em>Discord.</em></h1>
         <p class="onboard-copy" style="max-width:36ch">Log in the way you would on discord.com. The session token stays on this machine, the browser never sees it again, and you can add more accounts later — each one keeps its own presence running.</p>
         ${K.loginPanel('welcome')}
         <button class="btn btn-ghost btn-block mt-12" data-action="welcome-skip">Explore Kizzey without connecting</button>
@@ -935,7 +935,7 @@
       <button class="btn btn-ghost" data-route="custom">${K.icon('edit', 'sm')}Full editor</button>
       <button class="btn btn-ghost" data-route="quick">${K.icon('sliders', 'sm')}Quick settings</button>
     </div>
-    ${!K.isSignedIn() ? `<div class="field-hint mt-12" style="text-align:center"><button class="btn btn-ghost btn-sm" data-action="retry-login">Connect Discord first</button></div>` : ''}`;
+    ${!K.isSignedIn() ? `<div class="field-hint mt-12" style="text-align:center"><button class="btn btn-ghost btn-sm" data-action="retry-login">Sign in with Discord first</button></div>` : ''}`;
     K.sheet({ title: 'Quick Controls', subtitle: 'Your presence, without leaving home.', body });
     document.querySelectorAll('[data-segment="quick-status"] button').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -1109,7 +1109,7 @@
         </div>`
       : `<button class="drawer-profile" data-action="retry-login" style="width:100%;text-align:left;border:1px solid var(--hairline)">
           <span class="avatar fallback">K</span>
-          <span style="flex:1;min-width:0"><span class="dp-name" style="display:block">Connect Discord</span><span class="dp-sub" style="display:flex"><span class="dot off" style="width:5px;height:5px"></span>Presence needs a token</span></span>
+          <span style="flex:1;min-width:0"><span class="dp-name" style="display:block">Sign in with Discord</span><span class="dp-sub" style="display:flex"><span class="dot off" style="width:5px;height:5px"></span>Presence needs a token</span></span>
           ${K.icon('chevron-right', 'sm')}
         </button>`;
     const items = menu.map(group => `<div class="drawer-section">
