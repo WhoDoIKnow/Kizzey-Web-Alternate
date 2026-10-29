@@ -7,3 +7,4 @@ data/kizzey.log
 data/uploads/
 data/tmp/
 .DS_Store
+*.md
