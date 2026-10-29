@@ -34,10 +34,20 @@ BASE = f"http://127.0.0.1:{PORT}"
 checks = []
 
 
+def safe_text(value):
+    """Keep failure previews printable on consoles that are not UTF-8."""
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    text = str(value)
+    try:
+        return text.encode(encoding, "replace").decode(encoding, "replace")
+    except Exception:
+        return text.encode("ascii", "replace").decode("ascii")
+
+
 def check(condition, label, extra=""):
     checks.append(bool(condition))
     if not condition:
-        print(f"FAIL: {label}" + (f" — {extra}" if extra else ""))
+        print(safe_text(f"FAIL: {label}" + (f" — {extra}" if extra else "")))
     else:
         print(f"ok: {label}")
 
@@ -69,6 +79,20 @@ def request(method, path, payload=None):
             return exc.code, {"raw": body}
 
 
+def request_raw(method, path, payload=None):
+    raw = None
+    headers = {}
+    if payload is not None:
+        raw = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(BASE + path, data=raw, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
+
+
 def wait_server():
     for _ in range(80):
         try:
@@ -97,9 +121,11 @@ def main():
     WORK = Path(tempfile.mkdtemp(prefix="kizzey-import-test-"))
     atexit.register(shutil.rmtree, WORK, ignore_errors=True)
     shutil.copy2(ROOT / "server.py", WORK / "server.py")
+    child_env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     proc = subprocess.Popen(
         [sys.executable, "server.py", "--host", "127.0.0.1", "--port", str(PORT), "--no-gateway"],
         cwd=str(WORK), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        encoding="utf-8", errors="replace", env=child_env,
     )
     try:
         if not wait_server():
@@ -328,9 +354,9 @@ def main():
         check(text_row and text_row["custom"].get("largeUrl") == "https://example.com/preset.png", "text preset image preserved")
         check(text_row and text_row.get("timestamp") == {"mode": "none"}, "text presets carry no stale timestamps")
         check("TOP-SECRET-TOKEN-VALUE" not in json.dumps(data), "token never appears in import response")
-        raw_state = (WORK / "data" / "state.json").read_text()
+        raw_state = (WORK / "data" / "state.json").read_text(encoding="utf-8")
         check("TOP-SECRET-TOKEN-VALUE" not in raw_state and "RealPerson" not in raw_state, "account/token fields are not written to state")
-        check("TOP-SECRET-TOKEN-VALUE" not in (WORK / "data" / "kizzey.log").read_text(), "token never appears in server log")
+        check("TOP-SECRET-TOKEN-VALUE" not in (WORK / "data" / "kizzey.log").read_text(encoding="utf-8"), "token never appears in server log")
 
         # Stand-alone Kizzey RpcConfig.
         single = {
@@ -544,6 +570,196 @@ def main():
         status, data6 = request("POST", "/api/import", {"settings": {"accent": "#abcdef"}, "savedConfigs": []})
         check(status == 200 and data6.get("import", {}).get("kind") == "web", "raw web state import remains supported")
         check(data6.get("state", {}).get("settings", {}).get("accent") == "#abcdef", "raw web state applies")
+
+        # Saved presets: create, rename, update, download, delete.
+        save_custom = {
+            "name": "Preset Card",
+            "details": "details line",
+            "state": "state line",
+            "type": "2",
+            "status": "idle",
+            "partyCurrentSize": "3",
+            "partyMaxSize": "5",
+            "button1": "Join",
+            "button1link": "https://example.com/join",
+            "largeUrl": "https://example.com/art.png",
+            "smallText": "tiny",
+            "timestampsStart": "1700000000000",
+            "timestampsStop": "1700000060000",
+            "applicationId": "123456789012345678",
+            "url": "https://example.com/me",
+        }
+        status, save1 = request("POST", "/api/presets/save", {"name": "My Preset", "custom": save_custom})
+        check(status == 200 and save1.get("ok"), "preset save creates a preset", str(save1)[:300])
+        preset1 = save1.get("preset") or {}
+        preset1_id = str(preset1.get("id") or "")
+        check(save1.get("created") is True and save1.get("dropped") == 0, "new preset reports a create", save1.get("created"))
+        check(preset1_id.startswith("kz-") and len(preset1_id) == 15, "saved preset gets a kz id", preset1_id)
+        check(preset1.get("name") == "My Preset" and preset1.get("sourceTitle") == "My Preset", "preset keeps its name and merge title", preset1.get("name"))
+        check(preset1.get("author") == "You" and preset1.get("tag") == "Saved" and bool(preset1.get("emoji")), "preset gets the local card style", (preset1.get("author"), preset1.get("tag"), preset1.get("emoji")))
+        check(bool(preset1.get("gradient")), "preset gets a shelf gradient", preset1.get("gradient"))
+        check(preset1.get("custom", {}).get("type") == "2", "saved card is normalised to the import shape", preset1.get("custom"))
+        check(preset1.get("custom", {}).get("largeUrl") == "https://example.com/art.png" and preset1.get("custom", {}).get("largeImg") == "", "saved card keeps remote artwork in the url slot", preset1.get("custom"))
+        check(preset1.get("timestamp") == {"mode": "absolute", "start": "1700000000000", "stop": "1700000060000"}, "saved card tracks its timers", preset1.get("timestamp"))
+        check(saved_names(save1.get("state", {})) == ["My Preset"], "saved preset appears in state", saved_names(save1.get("state", {})))
+
+        # A preset needs a name and at least one card field.
+        status, err = request("POST", "/api/presets/save", {"custom": save_custom})
+        check(status == 400, "preset save requires a name", str(err)[:200])
+        status, err = request("POST", "/api/presets/save", {"name": "Blank Preset", "custom": {}})
+        check(status == 400, "preset save rejects an empty card", str(err)[:200])
+        status, err = request("POST", "/api/presets/save", {"id": "kz-000000000000", "name": "Ghost"})
+        check(status == 400, "updating a missing preset is rejected", str(err)[:200])
+
+        # Rename only: the stored card and its identity stay intact.
+        status, rename = request("POST", "/api/presets/save", {"id": preset1_id, "name": "Renamed Preset"})
+        check(status == 200 and rename.get("created") is False and rename.get("renamed") is True, "rename reports an update", str(rename)[:300])
+        renamed = rename.get("preset") or {}
+        check(renamed.get("id") == preset1_id and renamed.get("name") == "Renamed Preset", "rename keeps the preset id", renamed.get("id"))
+        check(renamed.get("createdAt") == preset1.get("createdAt"), "rename keeps the creation time", renamed.get("createdAt"))
+        check(renamed.get("custom", {}).get("details") == "details line", "rename keeps the stored card", renamed.get("custom"))
+        check(renamed.get("author") == "You" and renamed.get("tag") == "Saved", "rename keeps the preset styling", (renamed.get("author"), renamed.get("tag")))
+
+        # Update from the live card: fields are replaced, identity is not.
+        updated_custom = {"name": "Preset Card v2", "details": "updated details", "state": "updated state", "type": "0"}
+        status, update = request("POST", "/api/presets/save", {"id": preset1_id, "name": "Renamed Preset", "custom": updated_custom})
+        check(status == 200 and update.get("created") is False and update.get("renamed") is False, "update reports an in-place edit", str(update)[:300])
+        updated = update.get("preset") or {}
+        check(updated.get("custom", {}).get("details") == "updated details" and updated.get("custom", {}).get("name") == "Preset Card v2", "update replaces the stored card", updated.get("custom"))
+        check(updated.get("id") == preset1_id and updated.get("createdAt") == preset1.get("createdAt"), "update keeps the preset id and creation time")
+        check(updated.get("timestamp") == {"mode": "none"}, "update clears timers the card no longer has", updated.get("timestamp"))
+        check(updated.get("custom", {}).get("largeUrl") == "", "update drops artwork the card no longer has", updated.get("custom"))
+
+        # Single preset download is a Kizzey RpcConfig named after the preset.
+        status, headers, body = request_raw("GET", f"/api/presets/export?id={preset1_id}")
+        check(status == 200 and headers.get("Content-Disposition") == 'attachment; filename="kizzey-preset-renamed-preset.json"', "preset download names the file after the preset", headers.get("Content-Disposition"))
+        status, headers, body = request_raw("GET", f"/api/presets/export?id={preset1_id}")
+        exported = json.loads(body.decode())
+        check(exported.get("details") == "updated details" and exported.get("name") == "Preset Card v2", "preset download carries the card text", exported)
+        check(exported.get("type") == 0 and exported.get("statusDisplayType") == -1, "preset download writes numeric activity fields", (exported.get("type"), exported.get("statusDisplayType")))
+        check(exported.get("applicationId") == "" and exported.get("partyCurrentSize") == "", "preset download blanks fields the card does not have", exported)
+
+        # The downloaded file must re-import through the public import route.
+        status, reimport = request("POST", "/api/import", {"backup": exported, "fileName": "kizzey-preset-renamed-preset.json"})
+        check(status == 200 and reimport.get("import", {}).get("kind") == "kizzey-config", "downloaded preset re-imports as a Kizzey config", str(reimport)[:300])
+        round_trip = find_saved(reimport.get("state", {}), "kizzey-preset-renamed-preset")
+        check(round_trip is not None, "downloaded preset imports under its file title", saved_names(reimport.get("state", {})))
+        check(round_trip and round_trip.get("custom", {}).get("details") == "updated details" and round_trip.get("custom", {}).get("name") == "Preset Card v2", "downloaded preset round-trips its card", round_trip.get("custom") if round_trip else None)
+
+        # The current card and the whole shelf download through the same route.
+        status, headers, body = request_raw("GET", "/api/presets/export?current=1")
+        live_config = json.loads(body.decode())
+        check(status == 200 and headers.get("Content-Disposition") == 'attachment; filename="kizzey-preset-current.json"', "current card download is named for the card", headers.get("Content-Disposition"))
+        check(isinstance(live_config, dict) and "statusDisplayType" in live_config, "current card download is a Kizzey config", str(live_config)[:200])
+        status, headers, body = request_raw("GET", "/api/presets/export?pack=1")
+        pack = json.loads(body.decode())
+        check(status == 200 and pack.get("format") == "kizzey-preset", "preset pack download uses the preset format", pack.get("format"))
+        check(len(pack.get("presets") or []) == 2, "preset pack lists every saved preset", len(pack.get("presets") or []))
+        check(headers.get("Content-Disposition", "").startswith('attachment; filename="kizzey-presets-'), "preset pack download is dated", headers.get("Content-Disposition"))
+        status, pack_import = request("POST", "/api/import", {"backup": pack, "fileName": "kizzey-presets.json"})
+        check(status == 200 and pack_import.get("import", {}).get("kind") == "kizzey-preset", "downloaded pack re-imports as a preset pack", str(pack_import)[:300])
+
+        # Shelf timers survive a downloaded pack: every entry carries its timer,
+        # so re-importing restores the same apply behaviour.
+        timed_pack = {
+            "format": "kizzey-preset",
+            "appVersion": "8.4.4",
+            "presets": [
+                {
+                    "title": "Absolute Timer",
+                    "name": "Absolute Timer",
+                    "timer": {"mode": "absolute", "start": "1700000000000", "stop": "1700003600000"},
+                },
+                {
+                    "title": "Duration Timer",
+                    "name": "Duration Timer",
+                    "timer": {"mode": "duration", "durationMs": 3600000},
+                },
+                {"title": "Since Apply", "name": "Since Apply", "timer": {"mode": "since_apply"}},
+            ],
+        }
+        status, timed = request("POST", "/api/import", {"backup": timed_pack, "fileName": "timed.json"})
+        check(status == 200 and timed.get("import", {}).get("presets") == 3, "timed preset pack imports", str(timed)[:300])
+        timed_state = timed.get("state", {})
+        absolute_row = find_saved(timed_state, "Absolute Timer") or {}
+        check(
+            absolute_row.get("timestamp") == {"mode": "absolute", "start": "1700000000000", "stop": "1700003600000"},
+            "absolute timer import keeps its dates",
+            absolute_row.get("timestamp"),
+        )
+        duration_row = find_saved(timed_state, "Duration Timer") or {}
+        check(duration_row.get("timestamp") == {"mode": "duration", "durationMs": 3600000}, "duration timer import keeps its length", duration_row.get("timestamp"))
+        duration_custom = duration_row.get("custom") or {}
+        check(
+            str(duration_custom.get("timestampsStop", "")).isdigit()
+            and int(duration_custom.get("timestampsStop", "0")) - int(duration_custom.get("timestampsStart", "0")) == 3600000,
+            "duration timer starts fresh from now",
+            duration_custom,
+        )
+        since_row = find_saved(timed_state, "Since Apply") or {}
+        check(since_row.get("timestamp") == {"mode": "since_apply"}, "since-apply timer import keeps its mode", since_row.get("timestamp"))
+        check(since_row.get("custom", {}).get("timestampsStop") == "" and bool(since_row.get("custom", {}).get("timestampsStart")), "since-apply timer imports an open clock", since_row.get("custom"))
+
+        status, headers, body = request_raw("GET", "/api/presets/export?pack=1")
+        timed_download = json.loads(body.decode())
+        timed_entries = {entry.get("title"): entry for entry in timed_download.get("presets") or [] if isinstance(entry, dict)}
+        check(
+            timed_entries.get("Absolute Timer", {}).get("timer") == {"mode": "absolute", "start": "1700000000000", "stop": "1700003600000"},
+            "pack download keeps the absolute timer",
+            timed_entries.get("Absolute Timer"),
+        )
+        check(timed_entries.get("Duration Timer", {}).get("timer") == {"mode": "duration", "durationMs": 3600000}, "pack download keeps the duration timer", timed_entries.get("Duration Timer"))
+        check(timed_entries.get("Since Apply", {}).get("timer") == {"mode": "since_apply"}, "pack download keeps the since-apply timer", timed_entries.get("Since Apply"))
+        check("timer" not in (timed_entries.get("Renamed Preset") or {}), "pack download leaves untimed presets alone", timed_entries.get("Renamed Preset"))
+
+        status, timed_again = request("POST", "/api/import", {"backup": timed_download, "fileName": "kizzey-presets-timed.json"})
+        again_state = timed_again.get("state", {})
+        check(
+            status == 200 and (find_saved(again_state, "Absolute Timer") or {}).get("timestamp") == {"mode": "absolute", "start": "1700000000000", "stop": "1700003600000"},
+            "re-imported pack restores the absolute timer",
+            (find_saved(again_state, "Absolute Timer") or {}).get("timestamp"),
+        )
+        check(
+            (find_saved(again_state, "Duration Timer") or {}).get("timestamp") == {"mode": "duration", "durationMs": 3600000},
+            "re-imported pack restores the duration timer",
+            (find_saved(again_state, "Duration Timer") or {}).get("timestamp"),
+        )
+        check((find_saved(again_state, "Since Apply") or {}).get("timestamp") == {"mode": "since_apply"}, "re-imported pack restores the since-apply timer", (find_saved(again_state, "Since Apply") or {}).get("timestamp"))
+
+        status, _, err = request_raw("GET", "/api/presets/export")
+        check(status == 400, "preset download needs a selection", str(err[:120]))
+        status, _, err = request_raw("GET", "/api/presets/export?id=kz-000000000000")
+        check(status == 400, "downloading a missing preset is rejected", str(err[:120]))
+
+        # Re-importing the pack rebuilds the shelf, so resolve the id it produced.
+        # The timed pack above re-saved the same titles, so read the latest state.
+        pack_row = find_saved(again_state, "Renamed Preset") or {}
+        doomed_id = str(pack_row.get("id") or "")
+        check(bool(doomed_id), "downloaded pack restores the renamed preset", saved_names(again_state))
+
+        # Delete removes the preset and reports it.
+        status, deleted = request("POST", "/api/presets/delete", {"id": doomed_id})
+        check(status == 200 and deleted.get("removed", {}).get("id") == doomed_id, "preset delete removes the preset", str(deleted)[:300])
+        check("Renamed Preset" not in saved_names(deleted.get("state", {})), "deleted preset leaves the state", saved_names(deleted.get("state", {})))
+        status, err = request("POST", "/api/presets/delete", {"id": doomed_id})
+        check(status == 400, "deleting a missing preset is rejected", str(err)[:200])
+        status, err = request("POST", "/api/presets/delete", {})
+        check(status == 400, "preset delete requires an id", str(err)[:200])
+
+        remaining = [row for row in (deleted.get("state", {}).get("savedConfigs") or []) if isinstance(row, dict)]
+        for row in remaining:
+            status, _ = request("POST", "/api/presets/delete", {"id": row.get("id")})
+            check(status == 200, "remaining presets delete cleanly", row.get("name"))
+        status, empty = request("GET", "/api/state")
+        check(empty.get("state", {}).get("savedConfigs") == [], "deleting every preset leaves an empty shelf", empty.get("state", {}).get("savedConfigs"))
+        status, _, err = request_raw("GET", "/api/presets/export?pack=1")
+        check(status == 400, "empty pack download is rejected", str(err[:120]))
+
+        status, log_data = request("GET", "/api/logs")
+        messages = [entry.get("message", "") for entry in log_data.get("logs", [])]
+        check(any("Preset saved: My Preset" in message for message in messages), "preset saves are logged", messages[-5:])
+        check(any("Preset updated: Renamed Preset" in message for message in messages), "preset updates are logged", messages[-5:])
+        check(any("Preset deleted: Renamed Preset" in message for message in messages), "preset deletes are logged", messages[-5:])
 
         # Invalid JSON body.
         req = urllib.request.Request(BASE + "/api/import", data=b"{not json", headers={"Content-Type": "application/json"}, method="POST")

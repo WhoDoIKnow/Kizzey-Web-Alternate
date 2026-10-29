@@ -611,7 +611,7 @@ def main():
         check(hook_rule and hook_rule.get("webhookSet") is True, "the public rule reports a ready webhook")
         check(len(fake_discord.webhook_creates) == 1 and fake_discord.webhook_creates[0]["token"] == "tok-beta-222", "the destination account creates the webhook")
         check(fake_discord.webhook_creates[0]["webhook"]["channel_id"] == "222222222222222222", "the webhook belongs to the destination channel")
-        secret = json.loads((DATA / "secret.json").read_text())
+        secret = json.loads((DATA / "secret.json").read_text(encoding="utf-8"))
         private_hook = (secret.get("mirrorWebhooks") or {}).get(hook_id) or {}
         check(bool(private_hook.get("token")), "the webhook token is stored privately")
         check(private_hook.get("token") not in json.dumps(hook_created), "the webhook token is not returned to the browser")
@@ -658,7 +658,7 @@ def main():
         check(private_hook.get("token") not in failed_blob and secret_url not in failed_blob, "webhook errors scrub the private URL")
         failed_public = json.dumps(state_of(request("GET", "/api/state")[1]))
         check(private_hook.get("token") not in failed_public and secret_url not in failed_public, "webhook state scrubs the private URL")
-        log_text = (DATA / "kizzey.log").read_text() if (DATA / "kizzey.log").exists() else ""
+        log_text = (DATA / "kizzey.log").read_text(encoding="utf-8") if (DATA / "kizzey.log").exists() else ""
         check(private_hook.get("token") not in log_text and secret_url not in log_text, "webhook logs scrub the private URL")
         fake_discord.fail_webhook = None
 
@@ -667,18 +667,18 @@ def main():
         check(status == 200 and normal_rule and normal_rule.get("mode") == "normal", "a relay can switch back to normal mode", str(normal_edit)[:300])
         check(normal_rule and normal_rule.get("webhookSet") is False, "normal mode reports no managed webhook")
         check(fake_discord.webhook_deletes == [private_hook.get("id")], "switching to normal mode deletes the webhook")
-        secret = json.loads((DATA / "secret.json").read_text())
+        secret = json.loads((DATA / "secret.json").read_text(encoding="utf-8"))
         check(hook_id not in (secret.get("mirrorWebhooks") or {}), "switching to normal mode forgets the webhook token")
 
         status, hook_again = request("POST", "/api/mirror/rules", {"id": hook_id, "mode": "webhook"})
         again_rule = mirror_rule_by_id(state_of(hook_again), hook_id)
-        again_hook = (json.loads((DATA / "secret.json").read_text()).get("mirrorWebhooks") or {}).get(hook_id) or {}
+        again_hook = (json.loads((DATA / "secret.json").read_text(encoding="utf-8")).get("mirrorWebhooks") or {}).get(hook_id) or {}
         check(status == 200 and again_rule and again_rule.get("webhookSet") is True, "switching back to webhook mode recreates the webhook")
         check(again_hook.get("id") and again_hook.get("id") != private_hook.get("id"), "recreated webhooks use a fresh identity")
 
         status, hook_deleted = request("POST", "/api/mirror/rules/delete", {"id": hook_id})
         check(status == 200 and mirror_rule_by_id(state_of(hook_deleted), hook_id) is None, "a webhook relay can be deleted")
-        secret = json.loads((DATA / "secret.json").read_text())
+        secret = json.loads((DATA / "secret.json").read_text(encoding="utf-8"))
         check(hook_id not in (secret.get("mirrorWebhooks") or {}), "deleting a relay removes its webhook token")
         check(again_hook.get("id") in fake_discord.webhook_deletes, "deleting a relay removes its Discord webhook")
 
@@ -688,12 +688,12 @@ def main():
         check("tok-alpha-111" not in blob and "tok-beta-222" not in blob, "web backup excludes every token")
         check("account" not in (exported.get("state") or {}), "web backup excludes the active account projection")
 
-        secret = json.loads((DATA / "secret.json").read_text())
+        secret = json.loads((DATA / "secret.json").read_text(encoding="utf-8"))
         check(len(secret.get("accounts") or []) == 2, "both tokens are stored privately")
         check(secret.get("token") == "tok-beta-222", "the compatibility token follows the active account")
-        state_file = (DATA / "state.json").read_text()
+        state_file = (DATA / "state.json").read_text(encoding="utf-8")
         check("tok-alpha-111" not in state_file and "tok-beta-222" not in state_file, "public state file contains no tokens")
-        log_file = (DATA / "kizzey.log").read_text() if (DATA / "kizzey.log").exists() else ""
+        log_file = (DATA / "kizzey.log").read_text(encoding="utf-8") if (DATA / "kizzey.log").exists() else ""
         check(BAD_TOKEN not in log_file, "rejected token is scrubbed from the server log")
 
         public_state = state_of(request("GET", "/api/state")[1])
@@ -740,7 +740,7 @@ def main():
         check(removed_all_state.get("accounts") == [], "remove-all empties the account list")
         check(removed_all_state.get("activeAccountId") == "" and removed_all_state.get("account") is None, "remove-all ends the active session")
         check((removed_all_state.get("mirror") or {}).get("rules", [{}])[0].get("enabled") is False, "remove-all pauses account-backed relays")
-        secret = json.loads((DATA / "secret.json").read_text())
+        secret = json.loads((DATA / "secret.json").read_text(encoding="utf-8"))
         check(secret.get("accounts") == [] and secret.get("token") == "", "remove-all clears private tokens")
 
         imported_mirror = {

@@ -242,7 +242,7 @@ def main():
         check(status == 200 and saved_oauth.get("configured") is True, "credentials are saved", str(saved)[:300])
         check(saved_oauth.get("hasSecret") is True, "saved config reports a stored secret")
         check(not leaks(saved, [SECRETS["client"]]), "saving never echoes the client secret")
-        secret_file = json.loads(server.SECRET_FILE.read_text())
+        secret_file = json.loads(server.SECRET_FILE.read_text(encoding="utf-8"))
         check(secret_file.get("oauth", {}).get("clientSecret") == SECRETS["client"], "client secret lands in secret.json only")
 
         status, missing = request("POST", "/api/auth/oauth/config", {"clientId": "123456789012345678", "clientSecret": ""})
@@ -278,7 +278,7 @@ def main():
         check(after_state.get("account", {}).get("username") == "delta", "the active identity is projected")
         check(after_state.get("tokenSet") is False, "public state reports no user token")
         check(fake_gateway.starts == [], "OAuth sign-in never opens a gateway")
-        oauth_secret = json.loads(server.SECRET_FILE.read_text()).get("accounts", [{}])[0].get("oauth") or {}
+        oauth_secret = json.loads(server.SECRET_FILE.read_text(encoding="utf-8")).get("accounts", [{}])[0].get("oauth") or {}
         check(oauth_secret.get("accessToken") == "oauth-access-aaa", "the access token is stored server-side")
         check(oauth_secret.get("refreshToken") == "oauth-refresh-bbb", "the refresh token is stored server-side")
         private = [SECRETS["client"], SECRETS["access"], SECRETS["refresh"], "oauth-refresh-ddd"]
@@ -312,7 +312,7 @@ def main():
 
         status, refreshed = request("POST", "/api/account/refresh", {})
         check(status == 200 and (refreshed.get("user") or {}).get("username") == "delta", "account refresh works for OAuth", str(refreshed)[:200])
-        oauth_secret = json.loads(server.SECRET_FILE.read_text()).get("accounts", [{}])[0].get("oauth") or {}
+        oauth_secret = json.loads(server.SECRET_FILE.read_text(encoding="utf-8")).get("accounts", [{}])[0].get("oauth") or {}
         check(oauth_secret.get("accessToken") == "oauth-access-ccc", "refresh rotates the access token")
         check(oauth_secret.get("refreshToken") == "oauth-refresh-ddd", "refresh rotates the refresh token")
         check(not leaks(state_of(refreshed), ["oauth-access-ccc", "oauth-refresh-ddd"]), "refresh response exposes no tokens")
@@ -326,7 +326,7 @@ def main():
         removed_state = state_of(removed)
         check(status == 200 and removed_state.get("accounts") == [], "remove-all clears OAuth identities too")
         check(removed_state.get("account") is None and removed_state.get("activeAccountId") == "", "remove-all ends the identity session")
-        private_dump = json.dumps(json.loads(server.SECRET_FILE.read_text()))
+        private_dump = json.dumps(json.loads(server.SECRET_FILE.read_text(encoding="utf-8")))
         check("oauth-access-ccc" not in private_dump and "oauth-refresh-ddd" not in private_dump, "removal wipes stored OAuth tokens")
 
         print(f"\n{sum(checks)}/{len(checks)} OAuth login checks passed")

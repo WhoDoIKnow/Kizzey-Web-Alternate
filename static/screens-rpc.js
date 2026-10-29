@@ -220,70 +220,191 @@
     });
   };
 
+  // ---------------------------------------------------------------------
+  // presets
+  // ---------------------------------------------------------------------
+  function savedPresets() {
+    const list = K.get('savedConfigs', []);
+    return (Array.isArray(list) ? list : []).filter(preset => preset && typeof preset === 'object' && preset.id);
+  }
+
+  function savedPreset(id) {
+    return savedPresets().find(preset => preset.id === id) || null;
+  }
+
+  function presetLine(preset) {
+    const card = preset?.custom || {};
+    return card.details || card.state || card.name || 'Custom card';
+  }
+
+  function presetTile(preset) {
+    const gradient = preset?.gradient || 'var(--surface-2)';
+    return `<div class="setting-icon" style="background:${K.esc(gradient)};font-size:1.0625rem;line-height:1">${K.esc(preset?.emoji || '⭐')}</div>`;
+  }
+
+  function downloadPreset(query) {
+    const link = document.createElement('a');
+    link.href = '/api/presets/export?' + query;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  function afterPresetChange(data) {
+    if (data && data.state) K.receiveState(data.state);
+    openPresetManager();
+  }
+
+  function openPresetManager() {
+    const saved = savedPresets();
+    const builtIn = Array.isArray(K.presetLibrary) ? K.presetLibrary : [];
+    K.sheet({
+      title: 'Presets',
+      subtitle: `${saved.length} saved · ${builtIn.length} built-in`,
+      body: `
+        <div class="setting-group-title">Your presets</div>
+        <div class="setting-group">
+          ${saved.length ? saved.map(preset => `<div class="setting-row">
+            ${presetTile(preset)}
+            <div class="setting-body">
+              <div class="setting-title">${K.esc(preset.name || 'Preset')}</div>
+              <div class="setting-desc">${K.esc(presetLine(preset))}</div>
+            </div>
+            <button class="icon-btn small" data-action="apply-preset" data-preset-id="${K.esc(preset.id)}" aria-label="Load preset">${K.icon('play', 'sm')}</button>
+            <button class="icon-btn small" data-action="edit-preset" data-preset-id="${K.esc(preset.id)}" aria-label="Edit preset">${K.icon('edit', 'sm')}</button>
+            <button class="icon-btn small" data-action="download-preset" data-preset-id="${K.esc(preset.id)}" aria-label="Download preset">${K.icon('download', 'sm')}</button>
+            <button class="icon-btn small" data-action="delete-preset" data-preset-id="${K.esc(preset.id)}" aria-label="Delete preset">${K.icon('trash', 'sm')}</button>
+          </div>`).join('') : `<div class="setting-row"><div class="setting-body"><div class="setting-title">Nothing saved yet</div><div class="setting-desc">Save the card you built and it lands here.</div></div></div>`}
+        </div>
+        <button class="btn btn-primary btn-block" data-action="save-preset">${K.icon('bookmark', 'sm')}Save current card</button>
+        <div class="two-col mt-8">
+          <button class="btn btn-ghost" data-action="download-preset" data-pack="1" ${saved.length ? '' : 'disabled'}>${K.icon('download', 'sm')}All presets</button>
+          <button class="btn btn-ghost" data-action="download-preset" data-current="1">${K.icon('download', 'sm')}Current card</button>
+        </div>
+        <div class="field-hint">A single card downloads as a Kizzey RPC config that imports straight back in. “All presets” writes a preset pack, which keeps names, details, state line and artwork.</div>
+        <div class="setting-group-title">Built-in presets</div>
+        <div class="setting-group">
+          ${builtIn.map((preset, index) => `<div class="setting-row">
+            ${presetTile(preset)}
+            <div class="setting-body">
+              <div class="setting-title">${K.esc(preset.name || 'Preset')}</div>
+              <div class="setting-desc">${K.esc(presetLine(preset))}</div>
+            </div>
+            <button class="icon-btn small" data-action="apply-preset" data-preset-index="${index}" aria-label="Load preset">${K.icon('play', 'sm')}</button>
+          </div>`).join('')}
+        </div>`,
+    });
+  }
+
+  K.actions['open-preset-manager'] = () => openPresetManager();
+
   K.actions['save-preset'] = () => {
     const custom = K.get('custom', {});
     K.sheet({
       title: 'Save as preset',
-      subtitle: 'Keep this card in your gallery.',
+      subtitle: 'Keep this card on your shelf or take it with you.',
       body: `${K.field({ id: 'preset-name', label: 'Preset name', value: custom.name || 'My presence', placeholder: 'Late night listening' })}
-        <div class="field-hint">The card fields and images are saved. You can edit them again any time.</div>
-        <div class="modal-actions"><button class="btn btn-ghost" data-close-sheet>Cancel</button><button class="btn btn-primary" data-action="save-preset-confirm">${K.icon('bookmark', 'sm')}Save preset</button></div>`,
+        <div class="field-hint">Card fields and images are stored. Downloading also writes a Kizzey RPC config you can import anywhere else.</div>
+        <div class="modal-actions"><button class="btn btn-ghost" data-close-sheet>Cancel</button><button class="btn btn-primary" data-action="save-preset-confirm">${K.icon('bookmark', 'sm')}Save preset</button></div>
+        <button class="btn btn-ghost btn-block mt-8" data-action="save-preset-confirm" data-download="1">${K.icon('download', 'sm')}Save and download .json</button>`,
     });
   };
 
-  K.actions['save-preset-confirm'] = async () => {
+  K.actions['save-preset-confirm'] = async function (el) {
     const input = document.getElementById('preset-name');
     const name = input?.value.trim();
     if (!name) { K.toast('Give the preset a name', '', 'error'); input?.focus(); return; }
-    const preset = {
-      id: K.uid(),
-      name,
-      custom: K.clone(K.get('custom', {})),
-      createdAt: Date.now(),
-      author: K.get('chatProfile.name', 'You'),
-      tag: 'Custom',
-      emoji: '✨',
-      gradient: 'linear-gradient(135deg,#3d2a51,#7f5f9d)',
-    };
-    const configs = K.clone(K.get('savedConfigs', []) || []);
-    configs.unshift(preset);
-    K.setLocal('savedConfigs', configs);
-    await K.api('/api/patch', { method: 'POST', body: { updates: { savedConfigs: configs } } })
-      .then(data => { if (data.state) K.receiveState(data.state); })
-      .catch(error => K.toast('Could not save preset', error.message, 'error'));
+    const data = await K.api('/api/presets/save', { method: 'POST', body: { name, custom: K.get('custom', {}) } });
+    if (data.state) K.receiveState(data.state);
     K.closeSheet();
+    if (el?.dataset.download === '1' && data.preset?.id) downloadPreset('id=' + encodeURIComponent(data.preset.id));
     K.toast('Preset saved', name, 'ok');
+    if (data.dropped) K.toast('Shelf was full', `${data.dropped} older preset${data.dropped === 1 ? '' : 's'} dropped.`, '');
     K.render();
   };
 
   K.actions['apply-preset'] = async function (el) {
     const id = el.dataset.presetId;
     const index = Number(el.dataset.presetIndex);
-    let preset;
-    if (id) preset = (K.get('savedConfigs', []) || []).find(p => p.id === id);
-    else preset = K.presetLibrary[index];
-    if (!preset) return;
+    const preset = id ? savedPreset(id) : (K.presetLibrary || [])[index];
+    if (!preset) { K.toast('Preset unavailable', 'Reload the screen and try again.', 'error'); return; }
     const next = K.customFromPreset(preset, preset.name);
     K.setLocal('custom', next);
     await K.queuePatch({ custom: next }, 0);
+    K.closeSheet();
     K.navigate('custom');
     K.toast('Preset loaded', preset.name, 'ok');
   };
 
+  K.actions['edit-preset'] = function (el) {
+    const preset = savedPreset(el.dataset.presetId);
+    if (!preset) { K.toast('Preset unavailable', 'Reload the screen and try again.', 'error'); return; }
+    const card = preset.custom || {};
+    K.sheet({
+      title: 'Edit preset',
+      subtitle: K.esc(preset.name || ''),
+      body: `${K.field({ id: 'preset-name', label: 'Preset name', value: preset.name || '', placeholder: 'Late night listening' })}
+        <div class="field-hint">Rename keeps the saved card. Update replaces it with the Custom RPC form you have open right now.</div>
+        <div class="modal-actions"><button class="btn btn-ghost" data-action="preset-rename" data-preset-id="${K.esc(preset.id)}">Rename only</button><button class="btn btn-primary" data-action="preset-update" data-preset-id="${K.esc(preset.id)}">${K.icon('refresh', 'sm')}Update from card</button></div>
+        <div class="two-col mt-8">
+          <button class="btn btn-ghost" data-action="download-preset" data-preset-id="${K.esc(preset.id)}">${K.icon('download', 'sm')}Download .json</button>
+          <button class="btn btn-ghost" data-close-sheet>Done</button>
+        </div>
+        <div class="setting-group-title">Saved card</div>
+        <div class="setting-group">
+          <div class="setting-row"><div class="setting-body"><div class="setting-title">${K.esc(card.name || 'No activity name')}</div><div class="setting-desc">${K.esc(card.details || card.state || 'No details saved')}</div></div></div>
+        </div>`,
+    });
+  };
+
+  K.actions['preset-rename'] = async function (el) {
+    const input = document.getElementById('preset-name');
+    const name = input?.value.trim();
+    if (!name) { K.toast('Give the preset a name', '', 'error'); input?.focus(); return; }
+    const data = await K.api('/api/presets/save', { method: 'POST', body: { id: el.dataset.presetId, name } });
+    afterPresetChange(data);
+    K.toast(data.renamed ? 'Preset renamed' : 'Name unchanged', name, 'ok');
+  };
+
+  K.actions['preset-update'] = async function (el) {
+    const input = document.getElementById('preset-name');
+    const name = input?.value.trim();
+    if (!name) { K.toast('Give the preset a name', '', 'error'); input?.focus(); return; }
+    const data = await K.api('/api/presets/save', { method: 'POST', body: { id: el.dataset.presetId, name, custom: K.get('custom', {}) } });
+    afterPresetChange(data);
+    K.toast('Preset updated', name, 'ok');
+  };
+
+  K.actions['download-preset'] = function (el) {
+    if (el.dataset.pack === '1') {
+      if (!savedPresets().length) { K.toast('Nothing to download', 'Save a preset first.', 'error'); return; }
+      downloadPreset('pack=1');
+      K.toast('Preset pack ready', 'Check your downloads folder.', 'ok');
+      return;
+    }
+    if (el.dataset.current === '1') {
+      downloadPreset('current=1');
+      K.toast('Card downloaded', 'kizzey-preset-current.json', 'ok');
+      return;
+    }
+    const preset = savedPreset(el.dataset.presetId);
+    if (!preset) { K.toast('Preset unavailable', 'Reload the screen and try again.', 'error'); return; }
+    downloadPreset('id=' + encodeURIComponent(preset.id));
+    K.toast('Preset downloaded', preset.name || 'Preset', 'ok');
+  };
+
   K.actions['delete-preset'] = function (el) {
-    const id = el.dataset.presetId;
-    const preset = (K.get('savedConfigs', []) || []).find(p => p.id === id);
-    if (!preset) return;
+    const preset = savedPreset(el.dataset.presetId);
+    if (!preset) { K.toast('Preset unavailable', 'Reload the screen and try again.', 'error'); return; }
     K.confirm({
       title: 'Delete this preset?',
       subtitle: preset.name,
       confirm: 'Delete', danger: true,
       onConfirm: async () => {
-        const configs = (K.get('savedConfigs', []) || []).filter(p => p.id !== id);
-        K.setLocal('savedConfigs', configs);
-        await K.queuePatch({ savedConfigs: configs }, 0);
-        K.toast('Preset deleted', '', 'ok');
-        K.render();
+        const data = await K.api('/api/presets/delete', { method: 'POST', body: { id: preset.id } });
+        afterPresetChange(data);
+        K.toast('Preset deleted', preset.name, 'ok');
       },
     });
   };
@@ -492,7 +613,7 @@
     render() {
       const c = K.get('custom', {});
       return `<div class="page">
-        ${rpcHeader('custom', 'Custom RPC', 'Build a card that feels like you.', `<button class="icon-btn" data-action="save-preset" aria-label="Save preset">${K.icon('bookmark')}</button>`)}
+        ${rpcHeader('custom', 'Custom RPC', 'Build a card that feels like you.', `<button class="icon-btn" data-action="open-preset-manager" aria-label="Presets">${K.icon('layers')}</button><button class="icon-btn" data-action="save-preset" aria-label="Save preset">${K.icon('bookmark')}</button>`)}
         ${statusCard('custom', 'Custom RPC', 'All changes save as you type.')}
         <div class="preview-wrap" id="rpc-preview">${customPreview(c)}</div>
         ${K.sectionLabel('Start from a preset', `<span style="font-size:0.65625rem;color:var(--faint);text-transform:none;letter-spacing:0">${K.presetLibrary.length} cards</span>`)}

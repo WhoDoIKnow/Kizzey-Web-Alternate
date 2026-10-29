@@ -206,6 +206,30 @@ applied verbatim. A single native file imports at most 300 cards and 64 artwork 
 saved-card library is capped at 500. The result sheet and Logs report anything skipped, including
 Android-local image paths, malformed entries, merged duplicate titles and discarded older cards.
 
+## Presets
+
+**Presets** on the Custom RPC screen keeps cards on a shelf and moves them between installs. The
+manager lists your saved cards plus the built-in ones, and each saved row can be loaded, edited,
+downloaded or deleted.
+
+- **Save current card** stores the form you have open under a name, optionally downloading it in the
+  same step. Names are required; an empty card is rejected.
+- **Edit** renames the card or replaces it with whatever the Custom RPC form holds right now. Both
+  keep the preset's id and creation time.
+- **Download .json** writes a single card. **All presets** writes a dated pack. **Current card**
+  writes the form without saving it.
+
+A single card downloads as a stand-alone Kizzey `RpcConfig`, the same shape the Android app's
+**Save config** produces, so it imports back into Kizzey or into this server unchanged. Party sizes
+and timestamps are written as numbers when the card sets them and left blank otherwise, the activity
+type is clamped to Kizzey's list, and an application ID is kept only when it is a valid 18–19 digit
+snowflake. A pack downloads as a `kizzey-preset` bundle carrying every saved card with its name,
+details, state line, timers and artwork, and re-imports through **Backup & restore**.
+
+Presets live in `data/state.json` alongside the rest of the saved-card library, capped at 500. The
+endpoints write under the store lock and return the new state, so the browser never has to guess
+what the shelf looks like.
+
 ## Checks
 
 The runtime has no dependencies, but the repository includes regression checks for the native
@@ -317,6 +341,7 @@ The frontend uses JSON endpoints and an SSE stream. The main groups are:
 - `POST /api/accounts/{add,switch,remove,remove-all}`
 - `POST /api/mirror/settings`, `/api/mirror/rules`, `/api/mirror/rules/{toggle,delete}`, `/api/mirror/run`
 - `POST /api/rpc/{start,stop,refresh,preview}`
+- `POST /api/presets/{save,delete}`; `GET /api/presets/export` (`?id=`, `?current=1`, `?pack=1`)
 - `GET /api/weather`, `/api/geocode`, `/api/route`, `/api/friends`, `/api/hoststats`, `/api/update`
 - `POST /api/upload`, `/api/image`, `/api/ocr`, `/api/chat/*`, `/api/voice/*`, `/api/moments/*`
 - `POST /api/wallet/daily`, `/api/shop/buy`, `/api/premium/{unlock,reset}`

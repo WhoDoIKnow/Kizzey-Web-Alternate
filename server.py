@@ -1961,6 +1961,13 @@ def _kz_preset_from_text(entry, ctx: dict, number: int) -> dict | None:
     image = _kz_clean(entry.get("image"), 2048)
     if not any((title, name, details, state, image)):
         return None
+    # A timer block is optional and only this server writes it, so a downloaded
+    # pack keeps the shelf's apply behaviour. Kizzey's own packs never carry one.
+    timer = entry.get("timer") if isinstance(entry.get("timer"), dict) else {}
+    mode = _kz_clean(timer.get("mode"), 24)
+    start = _kz_timestamp(timer.get("start"))
+    stop = _kz_timestamp(timer.get("stop"))
+    duration = _kz_int(timer.get("durationMs"), 0, None, 0)
     custom = _kz_custom_from_config(
         {
             "name": name,
@@ -1968,10 +1975,22 @@ def _kz_preset_from_text(entry, ctx: dict, number: int) -> dict | None:
             "state": state,
             "largeImg": image,
             "status": "online",
+            "timestampsStart": start if mode == "absolute" else "",
+            "timestampsStop": stop if mode == "absolute" else "",
         },
         ctx,
     )
-    return _kz_preset(title or name or details or state, custom, number, source_title=title)
+    preset = _kz_preset(title or name or details or state, custom, number, source_title=title)
+    if mode == "duration" and duration > 0:
+        now = now_ms()
+        custom["timestampsStart"] = str(now)
+        custom["timestampsStop"] = str(now + duration)
+        preset["timestamp"] = {"mode": "duration", "durationMs": duration}
+    elif mode == "since_apply":
+        custom["timestampsStart"] = str(now_ms())
+        custom["timestampsStop"] = ""
+        preset["timestamp"] = {"mode": "since_apply"}
+    return preset
 
 
 def _kz_preset_from_template(entry, ctx: dict, number: int) -> dict | None:
@@ -2582,6 +2601,115 @@ def merge_saved_configs(existing, incoming: list) -> tuple[list, int]:
     merged = list(incoming) + kept
     dropped = max(0, len(merged) - KIZZEY_SAVED_LIMIT)
     return merged[:KIZZEY_SAVED_LIMIT], dropped
+
+
+def _kz_config_image(custom: dict, slot: str) -> str:
+    """Return the single image value for a slot that survives a re-import."""
+    url = _kz_clean(custom.get(slot + "Url"), 2048)
+    if url and (
+        re.match(r"^https?://", url, re.I)
+        or re.fullmatch(r"/uploads/[A-Za-z0-9][A-Za-z0-9._-]*", url)
+    ):
+        return url
+    asset = _kz_clean(custom.get(slot + "Img"), 2048)
+    if asset.startswith(("mp:", "external/", "attachments/")):
+        return asset
+    return ""
+
+
+def _kz_config_count(value):
+    """Party sizes export as numbers; blank stays blank so cards gain no content."""
+    number = _kz_int(value, low=0)
+    return number if number else ""
+
+
+def _kz_config_timestamp(value):
+    """Epoch timestamps export as numbers, ISO strings stay strings, else blank."""
+    text = _kz_timestamp(value)
+    if not text:
+        return ""
+    return int(text) if text.isdigit() else text
+
+
+def _kz_config_from_custom(custom) -> dict:
+    """Inverse of _kz_custom_from_config: emit a Kizzey RpcConfig for a web card."""
+    cfg = custom if isinstance(custom, dict) else {}
+    activity_type = _kz_int(cfg.get("type"), low=0)
+    if activity_type not in KIZZEY_ACTIVITY_TYPES:
+        activity_type = 0
+    app_id = _kz_clean(cfg.get("applicationId"), 32)
+    if app_id and not re.fullmatch(r"\d{18,19}", app_id):
+        app_id = ""
+    return {
+        "name": _kz_clean(cfg.get("name"), 128),
+        "details": _kz_clean(cfg.get("details"), 128),
+        "state": _kz_clean(cfg.get("state"), 128),
+        "partyCurrentSize": _kz_config_count(cfg.get("partyCurrentSize")),
+        "partyMaxSize": _kz_config_count(cfg.get("partyMaxSize")),
+        "timestampsStart": _kz_config_timestamp(cfg.get("timestampsStart")),
+        "timestampsStop": _kz_config_timestamp(cfg.get("timestampsStop")),
+        "platform": _kz_clean(cfg.get("platform"), 32) or "android",
+        "status": _kz_status(cfg.get("status"), "online"),
+        "button1": _kz_clean(cfg.get("button1"), 32),
+        "button1link": _kz_url(cfg.get("button1link")),
+        "button2": _kz_clean(cfg.get("button2"), 32),
+        "button2link": _kz_url(cfg.get("button2link")),
+        "largeImg": _kz_config_image(cfg, "large"),
+        "largeText": _kz_clean(cfg.get("largeText"), 128),
+        "smallImg": _kz_config_image(cfg, "small"),
+        "smallText": _kz_clean(cfg.get("smallText"), 128),
+        "type": activity_type,
+        "url": _kz_url(cfg.get("url")),
+        "applicationId": app_id,
+        "statusDisplayType": -1,
+    }
+
+
+def _kz_file_slug(value, fallback: str = "preset") -> str:
+    text = re.sub(r"[^a-z0-9]+", "-", _kz_clean(value, 80).casefold()).strip("-")
+    return text[:48] or fallback
+
+
+def _saved_preset_index(saved, preset_id: str) -> int:
+    if not preset_id:
+        return -1
+    for index, preset in enumerate(saved if isinstance(saved, list) else []):
+        if isinstance(preset, dict) and str(preset.get("id") or "") == preset_id:
+            return index
+    return -1
+
+
+def _kz_saved_preset(payload, custom, existing=None, number: int = 0) -> dict:
+    """Normalise a client preset into the shape the Kizzey importer produces."""
+    base = existing if isinstance(existing, dict) else {}
+    name = _kz_clean(payload.get("name"), 80) or _kz_clean(base.get("name"), 80)
+    if not name:
+        raise ValueError("Give the preset a name.")
+    normalised = _kz_custom_from_config(custom, _kz_new_context({}))
+    if not _kz_custom_has_content(normalised):
+        raise ValueError("Fill in the Custom RPC card before saving a preset.")
+    start = _kz_clean(normalised.get("timestampsStart"), 48)
+    stop = _kz_clean(normalised.get("timestampsStop"), 48)
+    created = base.get("createdAt")
+    now = now_ms()
+    return {
+        "id": _kz_clean(base.get("id"), 64) or "kz-" + uuid.uuid4().hex[:12],
+        "name": name,
+        "custom": normalised,
+        "timestamp": (
+            {"mode": "absolute", "start": start, "stop": stop}
+            if start or stop
+            else {"mode": "none"}
+        ),
+        "sourceTitle": name,
+        "createdAt": created if isinstance(created, (int, float)) else now,
+        "updatedAt": now,
+        "author": _kz_clean(base.get("author"), 40) or "You",
+        "tag": _kz_clean(base.get("tag"), 24) or "Saved",
+        "emoji": _kz_clean(base.get("emoji"), 8) or "⭐",
+        "gradient": _kz_clean(base.get("gradient"), 160)
+        or KIZZEY_PRESET_GRADIENTS[number % len(KIZZEY_PRESET_GRADIENTS)],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -6080,6 +6208,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_friends()
         if path == "/api/export":
             return self.handle_export()
+        if path == "/api/presets/export":
+            try:
+                return self.handle_preset_export()
+            except ValueError as exc:
+                return self.send_error_json(str(exc), 400)
         if path == "/api/health":
             return self.send_json(
                 {
@@ -6383,6 +6516,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/voice/state":
                 data = self.read_json()
                 return self.send_json({"ok": True, "voice": voice_update(str(data.get("clientId") or ""), data)})
+            if path == "/api/presets/save":
+                return self.handle_preset_save()
+            if path == "/api/presets/delete":
+                return self.handle_preset_delete()
             if path == "/api/import":
                 return self.handle_import()
             if path == "/api/log":
@@ -6670,6 +6807,138 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True, "friends": friends, "signedIn": True})
         except DiscordError as exc:
             return self.send_error_json(exc.message, exc.status or 502)
+
+    # -- presets ----------------------------------------------------------
+    def send_attachment(self, payload, file_name: str):
+        raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{file_name}"')
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def handle_preset_save(self):
+        assert STORE is not None
+        data = self.read_json()
+        preset_id = _kz_clean(data.get("id"), 64)
+        with STORE.lock:
+            saved = list(STORE.state.get("savedConfigs") or [])
+            index = _saved_preset_index(saved, preset_id)
+            existing = saved[index] if index >= 0 else None
+            if preset_id and existing is None:
+                raise ValueError("That preset is no longer saved.")
+            custom = data.get("custom")
+            if not isinstance(custom, dict):
+                if existing is not None and isinstance(existing.get("custom"), dict):
+                    custom = existing["custom"]
+                else:
+                    custom = STORE.state.get("custom")
+            preset = _kz_saved_preset(data, custom, existing, len(saved))
+            if existing is not None:
+                saved[index] = preset
+                dropped = 0
+            else:
+                merged = [preset] + saved
+                dropped = max(0, len(merged) - KIZZEY_SAVED_LIMIT)
+                saved = merged
+            saved = saved[:KIZZEY_SAVED_LIMIT]
+            STORE.state["savedConfigs"] = saved
+            STORE.save()
+        if existing is None:
+            STORE.log("INFO", "Presets", f"Preset saved: {preset['name']}")
+        else:
+            STORE.log("INFO", "Presets", f"Preset updated: {preset['name']}")
+        STORE.broadcast_state()
+        return self.send_json(
+            {
+                "ok": True,
+                "preset": preset,
+                "created": existing is None,
+                "renamed": bool(existing) and existing.get("name") != preset["name"],
+                "dropped": dropped,
+                "state": public_state(),
+            }
+        )
+
+    def handle_preset_delete(self):
+        assert STORE is not None
+        data = self.read_json()
+        preset_id = _kz_clean(data.get("id"), 64)
+        if not preset_id:
+            raise ValueError("Choose a preset to delete.")
+        with STORE.lock:
+            saved = list(STORE.state.get("savedConfigs") or [])
+            index = _saved_preset_index(saved, preset_id)
+            if index < 0:
+                raise ValueError("That preset is no longer saved.")
+            removed = saved.pop(index)
+            STORE.state["savedConfigs"] = saved
+            STORE.save()
+        STORE.log("INFO", "Presets", f"Preset deleted: {_kz_clean(removed.get('name'), 80) or preset_id}")
+        STORE.broadcast_state()
+        return self.send_json({"ok": True, "removed": removed, "state": public_state()})
+
+    def handle_preset_export(self):
+        assert STORE is not None
+        query = self.query()
+        pack = _kz_clean(query.get("pack"), 8).lower() in ("1", "true", "yes", "on")
+        preset_id = _kz_clean(query.get("id"), 64)
+        current = _kz_clean(query.get("current"), 8).lower() in ("1", "true", "yes", "on")
+        with STORE.lock:
+            saved = list(STORE.state.get("savedConfigs") or [])
+            if pack:
+                entries = []
+                for preset in saved:
+                    if not isinstance(preset, dict):
+                        continue
+                    custom = preset.get("custom") if isinstance(preset.get("custom"), dict) else {}
+                    timer = preset.get("timestamp") if isinstance(preset.get("timestamp"), dict) else {}
+                    mode = _kz_clean(timer.get("mode"), 24) or "none"
+                    entry = {
+                        "title": _kz_clean(preset.get("name"), 80),
+                        "name": _kz_clean(custom.get("name"), 128),
+                        "details": _kz_clean(custom.get("details"), 128),
+                        "state": _kz_clean(custom.get("state"), 128),
+                        "image": _kz_config_image(custom, "large"),
+                    }
+                    if mode == "absolute":
+                        entry["timer"] = {
+                            "mode": mode,
+                            "start": _kz_clean(timer.get("start"), 48),
+                            "stop": _kz_clean(timer.get("stop"), 48),
+                        }
+                    elif mode == "duration":
+                        entry["timer"] = {"mode": mode, "durationMs": _kz_int(timer.get("durationMs"), 0, None, 0)}
+                    elif mode == "since_apply":
+                        entry["timer"] = {"mode": mode}
+                    entries.append(entry)
+                if not entries:
+                    raise ValueError("There are no saved presets to download yet.")
+                payload = {
+                    "format": KIZZEY_PRESET_FORMAT,
+                    "appVersion": VERSION,
+                    "presets": entries,
+                }
+                file_name = f"kizzey-presets-{dt.date.today().isoformat()}.json"
+            elif preset_id:
+                index = _saved_preset_index(saved, preset_id)
+                if index < 0:
+                    raise ValueError("That preset is no longer saved.")
+                preset = saved[index]
+                payload = _kz_config_from_custom(preset.get("custom"))
+                file_name = f"kizzey-preset-{_kz_file_slug(preset.get('name'))}.json"
+            elif current:
+                payload = _kz_config_from_custom(STORE.state.get("custom"))
+                file_name = "kizzey-preset-current.json"
+            else:
+                raise ValueError("Choose a preset to download.")
+        return self.send_attachment(payload, file_name)
 
     # -- backup / import --------------------------------------------------
     def handle_export(self):
