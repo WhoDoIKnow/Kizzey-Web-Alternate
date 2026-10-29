@@ -60,19 +60,83 @@ def free_port() -> int:
 
 
 class FakeGateway:
+    """Pool stand-in: one simulated socket per account id.
+
+    Mirrors `server.GatewayPool`: `start`/`send_presence` take an optional
+    account id, `stop`/`ensure`/`restart` take one, and `reconcile` opens and
+    closes sockets so they match `server.wanted_gateways()`.
+    """
+
     def __init__(self):
-        self.starts = []
-        self.stops = 0
-        self.presences = []
+        self.starts = []  # (account_id, token) in start order
+        self.stops = []  # account ids in stop order
+        self.presences = []  # (account_id, presence)
+        self.sockets = {}  # account_id -> token
 
-    def start(self, token):
-        self.starts.append(token)
+    @staticmethod
+    def _resolve(account_id=""):
+        return str(account_id or "") or (server.STORE.active_account_id() if server.STORE else "")
 
-    def stop(self):
-        self.stops += 1
+    def get(self, account_id=""):
+        return self._resolve(account_id)
 
-    def send_presence(self, presence):
-        self.presences.append(presence)
+    def running(self, account_id=""):
+        return self._resolve(account_id) in self.sockets
+
+    def active_ids(self):
+        return sorted(self.sockets)
+
+    @staticmethod
+    def token_for(account_id):
+        if not account_id or server.STORE is None:
+            return ""
+        account = server.STORE.account_by_id(account_id, include_token=True)
+        return server.clean_discord_token((account or {}).get("token"))
+
+    def ensure(self, account_id=""):
+        account_id = self._resolve(account_id)
+        token = self.token_for(account_id)
+        if account_id and token and account_id not in self.sockets:
+            self.start(token, account_id)
+        return account_id
+
+    def start(self, token, account_id=""):
+        account_id = self._resolve(account_id)
+        self.starts.append((account_id, token))
+        self.sockets[account_id] = token
+
+    def stop(self, account_id=""):
+        account_id = self._resolve(account_id)
+        self.stops.append(account_id)
+        self.sockets.pop(account_id, None)
+
+    def stop_all(self):
+        for account_id in list(self.sockets):
+            self.stop(account_id)
+
+    def restart(self, account_id=""):
+        account_id = self._resolve(account_id)
+        if not account_id:
+            return
+        if account_id in self.sockets:
+            self.stop(account_id)
+        self.reconcile()
+
+    def send_presence(self, presence, account_id=""):
+        self.presences.append((self._resolve(account_id), presence))
+
+    def reconcile(self):
+        wanted = server.wanted_gateways()
+        for account_id in list(self.sockets):
+            if account_id not in wanted:
+                self.stop(account_id)
+        for account_id, token in wanted.items():
+            if account_id not in self.sockets:
+                self.start(token, account_id)
+
+    # -- assertions helpers ----------------------------------------------
+    def tokens_for(self, account_id):
+        return [token for owner, token in self.starts if owner == account_id]
 
 
 def fake_user(user_id, username, global_name):
@@ -319,7 +383,7 @@ def main():
         beta_row = account_named(beta_state, "beta")
         check(status == 200 and beta.get("created") is True and beta_row, "second account is added", str(beta)[:300])
         check(beta_state.get("activeAccountId") == alpha_row.get("id"), "adding without switch keeps the active account")
-        check(fake_gateway.starts == ["tok-alpha-111"], "only the active account opens a gateway", fake_gateway.starts)
+        check(fake_gateway.active_ids() == [], "saving an account opens no gateway socket", fake_gateway.starts)
 
         status, duplicate = request(
             "POST",
@@ -345,7 +409,7 @@ def main():
         switched_state = state_of(switched)
         check(status == 200 and switched_state.get("activeAccountId") == beta_row.get("id"), "account switching activates the target")
         check(switched_state.get("account", {}).get("username") == "beta", "switching changes the projected identity")
-        check(fake_gateway.starts[-1] == "tok-beta-222", "switching starts the target account gateway")
+        check(fake_gateway.active_ids() == [], "switching focus opens no gateway socket")
         check(not tokens_present(switched, ["tok-beta-222"]), "switch response has no token")
 
         status, listed = request("GET", "/api/accounts")
@@ -558,12 +622,24 @@ def main():
         status, settings = request("POST", "/api/mirror/settings", {"enabled": True, "interval": 20})
         check(status == 200 and state_of(settings).get("mirror", {}).get("enabled") is True, "auto mirror can be enabled")
         check(state_of(settings).get("mirror", {}).get("interval") == 20, "mirror interval is saved")
+        check(
+            fake_gateway.active_ids() == sorted([alpha_row.get("id"), beta_row.get("id")]),
+            "enabling a relay opens a socket for both of its accounts",
+            fake_gateway.active_ids(),
+        )
+        check(
+            fake_gateway.sockets.get(alpha_row.get("id")) == "tok-alpha-111"
+            and fake_gateway.sockets.get(beta_row.get("id")) == "tok-beta-222",
+            "each relay socket uses its own account token",
+            fake_gateway.sockets,
+        )
 
         status, toggled = request(
             "POST", "/api/mirror/rules/toggle", {"id": rule["id"], "enabled": False}
         )
         toggled_rule = mirror_rule(state_of(toggled))
         check(status == 200 and toggled_rule.get("enabled") is False, "a mirror rule can be paused")
+        check(fake_gateway.active_ids() == [], "pausing the last relay closes both sockets", fake_gateway.active_ids())
         paused_result = server.MIRROR.run_rule(rule["id"], manual=False)
         check(paused_result.get("disabled") is True, "the polling engine skips paused rules")
 
@@ -571,6 +647,11 @@ def main():
             "POST", "/api/mirror/rules/toggle", {"id": rule["id"], "enabled": True}
         )
         check(status == 200 and mirror_rule(state_of(toggled)).get("enabled") is True, "a mirror rule can be resumed")
+        check(
+            fake_gateway.active_ids() == sorted([alpha_row.get("id"), beta_row.get("id")]),
+            "resuming the relay reopens both sockets",
+            fake_gateway.active_ids(),
+        )
         check(not tokens_present(toggled, ["tok-alpha-111", "tok-beta-222"]), "rule toggle response has no tokens")
 
         # Webhook mode recreates the source identity at the destination. The
@@ -708,7 +789,7 @@ def main():
         check(len(removed_state.get("accounts") or []) == 1, "removing an account leaves the other saved")
         check(removed_state.get("activeAccountId") == alpha_row.get("id"), "active removal falls back to the next saved token")
         check(removed_state.get("account", {}).get("username") == "alpha", "fallback identity is active")
-        check(fake_gateway.starts[-1] == "tok-alpha-111", "fallback opens the next account gateway")
+        check(fake_gateway.active_ids() == [], "removing an account leaves no stray socket")
         check(removed_rule and removed_rule.get("enabled") is False, "rules using the removed account are paused")
         check(removed_rule and "removed" in removed_rule.get("lastError", "").lower(), "paused rule reports the removed account")
 
@@ -721,7 +802,11 @@ def main():
         check(status == 200 and refreshed.get("created") is False, "a live account can replace its token", str(refreshed)[:300])
         check(len(refreshed_state.get("accounts") or []) == 1, "replacing a live token does not duplicate the account")
         check(refreshed_state.get("activeAccountId") == alpha_row.get("id"), "replacing a live token keeps the same active account")
-        check(fake_gateway.starts[-1] == "tok-alpha-new444", "replacing a live token restarts its gateway")
+        check(
+            fake_gateway.active_ids() == [],
+            "replacing a live token opens no gateway socket",
+            fake_gateway.starts,
+        )
 
         status, gamma = request(
             "POST", "/api/accounts/add", {"token": "tok-gamma-333", "makeActive": False}

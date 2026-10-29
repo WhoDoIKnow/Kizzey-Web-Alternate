@@ -44,7 +44,6 @@
     plugins: 'Plugins',
     logs: 'Logs',
     'rpc-settings': 'RPC Settings',
-    'discord-login': 'Discord login',
     display: 'Display',
     language: 'Language',
     about: 'About',
@@ -118,26 +117,6 @@
       </div>`;
       return;
     }
-    const params = new URLSearchParams(location.search);
-    const oauthResult = params.get('oauth');
-    if (oauthResult) {
-      const message = params.get('message') || '';
-      history.replaceState(null, '', location.pathname + location.hash);
-      if (oauthResult === 'success') {
-        K.setLocal('ui.onboarded', true);
-        K.queuePatch({ ui: { onboarded: true } }, 0).catch(() => {});
-        K.navigate('accounts');
-        setTimeout(
-          () => K.toast('Signed in with Discord', `Welcome, ${K.displayName()}. Add a user token for Rich Presence.`, 'ok'),
-          140
-        );
-      } else {
-        setTimeout(
-          () => K.toast('Discord sign-in failed', message || 'Discord did not confirm the sign-in.', 'error'),
-          140
-        );
-      }
-    }
     const parsed = parseHash();
     K.current = parsed;
     K.render();
@@ -168,10 +147,21 @@
     es.addEventListener('gateway', event => {
       try {
         const data = JSON.parse(event.data);
-        const previous = K.state?.gateway?.state;
-        if (data.gateway && K.state) K.state.gateway = data.gateway;
-        if (data.gateway?.state === 'reconnecting' && previous !== 'reconnecting' && K.get('settings.reconnect', true)) {
-          K.toast('Reconnecting to Discord', 'The gateway dropped; the server is retrying.', 'warn');
+        if (!data.gateway || !K.state) return;
+        const id = String(data.accountId || '');
+        const focused = id && id === String(K.state.activeAccountId || '');
+        // Background accounts keep their own socket; never let their state
+        // overwrite the focused account's badge on screen.
+        if (id) {
+          K.state.gateways = K.state.gateways || {};
+          K.state.gateways[id] = data.gateway;
+        }
+        if (!id || focused) {
+          const previous = K.state.gateway?.state;
+          K.state.gateway = data.gateway;
+          if (data.gateway.state === 'reconnecting' && previous !== 'reconnecting' && K.get('settings.reconnect', true)) {
+            K.toast('Reconnecting to Discord', 'The gateway dropped; the server is retrying.', 'warn');
+          }
         }
         if (K.current.route === 'home') refreshHomeRuntime();
       } catch {}
@@ -360,13 +350,6 @@
       subtitle: opts.subtitle || 'Your presence, sent from this server.',
       body: `${K.loginPanel('sheet', opts)}
         <div class="text-center mt-12"><button class="btn btn-ghost" data-action="login-help">Where do I find my token?</button></div>`,
-      onMount(root) {
-        const panel = root.querySelector('[data-login-panel]');
-        const block = panel?.querySelector('[data-token-block]');
-        if (block && !block.classList.contains('hidden')) {
-          panel.querySelector('input')?.focus({ preventScroll: true });
-        }
-      },
     });
   };
 
@@ -377,8 +360,8 @@
     }
     if (K.isSignedIn() && !K.hasUserToken()) {
       K.toast(
-        'A user token is needed',
-        'Discord OAuth proves who you are, but it cannot send Rich Presence. Add a user token to this account in Discord accounts.',
+        'Sign in again',
+        'This account has no session token saved, so Rich Presence cannot start. Log in with your Discord password, or add a token.',
         'warn'
       );
       K.navigate('accounts');
@@ -660,9 +643,9 @@
         <button class="skip-link" data-action="welcome-skip">Skip</button>
       </div>
       <div style="margin-top:38px">
-        <div class="eyebrow">One link between your accounts</div>
+        <div class="eyebrow">One connection, every account</div>
         <h1 style="font-size:2.0625rem;line-height:1.04;letter-spacing:-.045em;margin:0 0 10px">Connect <em>Discord.</em></h1>
-        <p class="onboard-copy" style="max-width:36ch">Sign in with Discord in one tap. Presence, chat and account tools still use a user token, kept on this server and never sent back to the browser.</p>
+        <p class="onboard-copy" style="max-width:36ch">Log in the way you would on discord.com. The session token stays on this machine, the browser never sees it again, and you can add more accounts later — each one keeps its own presence running.</p>
         ${K.loginPanel('welcome')}
         <button class="btn btn-ghost btn-block mt-12" data-action="welcome-skip">Explore Kizzey without connecting</button>
         <div class="welcome-footer">${K.icon('info', 'sm')} You can connect later from Settings.</div>

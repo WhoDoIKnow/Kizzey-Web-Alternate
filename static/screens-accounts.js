@@ -71,13 +71,14 @@
       const active = activeAccount();
       const limit = Number(K.get('accountLimit', 8)) || 8;
       const status = K.discordStatus();
+      const runningCount = rows.filter(row => row.tokenSet && K.accountRunning(row.id)).length;
       const hero = active
         ? `<div class="account-hero">
             ${K.avatar({ name: accountName(active), url: active.avatarUrl || '', cls: '', style: 'width:54px;height:54px;font-size:1.125rem' })}
             <div style="flex:1;min-width:0">
               <div class="account-name" style="font-size:1.1875rem">${h(accountName(active))}</div>
               <div class="account-handle">${active.username ? '@' + h(active.username) : 'Discord account'}</div>
-              <div class="account-meta" style="margin-top:5px"><span class="badge ${status.color === 'good' ? 'good' : 'plain'}">${h(status.text)}</span><span class="pill">active</span><span class="pill">${active.tokenSet ? 'user token' : 'OAuth'}</span><span class="pill">${rows.length}/${limit}</span></div>
+              <div class="account-meta" style="margin-top:5px"><span class="badge ${status.color === 'good' ? 'good' : 'plain'}">${h(status.text)}</span><span class="pill">focus</span><span class="pill">${active.tokenSet ? 'user token' : 'token needed'}</span><span class="pill">${K.accountRunning(active.id) ? 'running' : 'idle'}</span><span class="pill">${rows.length}/${limit}</span></div>
             </div>
             <button class="icon-btn" data-action="account-refresh" aria-label="Refresh active account">${K.icon('refresh', 'sm')}</button>
           </div>`
@@ -85,8 +86,8 @@
             <span class="avatar fallback" style="width:54px;height:54px">K</span>
             <div style="flex:1;min-width:0">
               <div class="account-name" style="font-size:1.1875rem">No account active</div>
-              <div class="account-handle">Sign in with Discord, or add a user token.</div>
-              <div class="account-meta" style="margin-top:5px"><span class="badge plain">signed out</span><span class="pill">${rows.length}/${limit}</span></div>
+              <div class="account-handle">Log in with your Discord email and password, or paste a token.</div>
+              <div class="account-meta" style="margin-top:5px"><span class="badge plain">signed out</span><span class="pill">${runningCount} running</span><span class="pill">${rows.length}/${limit}</span></div>
             </div>
             <button class="btn btn-primary btn-sm" data-action="account-add">${K.icon('plus', 'sm')}Add</button>
           </div>`;
@@ -95,15 +96,12 @@
         ? `<div class="account-list">${rows.map(row => {
             const isActive = row.id === K.get('activeAccountId', '');
             const tokenMissing = !row.tokenSet || row.needsAuth;
-            const oauthOnly = !row.tokenSet && !!row.oauthLinked;
-            const canUse = !!row.tokenSet || !!row.oauthLinked;
+            const running = !!(row.tokenSet && K.accountRunning(row.id));
             const kindBadge = row.tokenSet
               ? statusBadge('User token', 'good')
-              : oauthOnly
-                ? statusBadge('OAuth identity')
-                : statusBadge('Token needed', 'plain');
-            const switchAction = canUse && !isActive
-              ? `<button class="btn btn-ghost btn-sm" data-action="account-switch" data-id="${h(row.id)}">${K.icon('swap', 'sm')}${row.tokenSet ? 'Switch' : 'Use'}</button>`
+              : statusBadge('Token needed', 'plain');
+            const switchAction = row.tokenSet && !isActive
+              ? `<button class="btn btn-ghost btn-sm" data-action="account-switch" data-id="${h(row.id)}">${K.icon('swap', 'sm')}Switch</button>`
               : '';
             const tokenAction = tokenMissing
               ? `<button class="btn btn-ghost btn-sm" data-action="account-readd" data-id="${h(row.id)}">${K.icon('key', 'sm')}Add token</button>`
@@ -114,14 +112,14 @@
                 <div class="account-list-name">${h(accountName(row))} ${isActive ? '<span class="dot good" style="width:6px;height:6px"></span>' : ''}</div>
                 <div class="account-list-sub">${row.username ? '@' + h(row.username) : 'Discord account'}${row.userId ? ` · <span class="mono">${h(row.userId)}</span>` : ''}</div>
                 <div class="account-list-tags">
-                  ${isActive ? statusBadge('Active', 'good') : statusBadge(row.lastUsedAt ? 'Used ' + K.relTime(row.lastUsedAt) : 'Saved')}
+                  ${isActive ? statusBadge('Focus', 'good') : statusBadge(row.lastUsedAt ? 'Used ' + K.relTime(row.lastUsedAt) : 'Saved')}
                   ${kindBadge}
-                  ${oauthOnly ? statusBadge('No gateway', 'plain') : ''}
+                  ${running ? statusBadge('Running', 'good') : ''}
                 </div>
                 ${row.needsAuth && row.authError ? `<div class="mirror-error">${h(row.authError)}</div>` : ''}
               </div>
               <div class="account-list-actions">
-                ${isActive ? '<span class="badge good">IN USE</span>' : switchAction}
+                ${isActive ? '<span class="badge good">FOCUS</span>' : switchAction}
                 ${tokenAction}
                 <button class="icon-btn small" data-action="account-remove" data-id="${h(row.id)}" aria-label="Remove ${h(accountName(row))}">${K.icon('trash', 'sm')}</button>
               </div>
@@ -130,32 +128,32 @@
         : K.empty(
             'users',
             'No Discord accounts saved',
-            'Sign in with Discord to confirm an identity, or add a user token for Rich Presence and the message mirror. Both stay on this server.',
+            'Log in with your Discord email and password to add an identity, or paste a user token. Each account gets its own gateway, so several can hold Rich Presence at once.',
             K.btn('Add account', { cls: 'btn-primary', action: 'account-add', icon: 'plus' })
           );
 
       const footer = rows.length
         ? `<div class="danger-zone">
             <div class="dz-title">Remove every account</div>
-            <p>This deletes every saved token, OAuth session and identity from <span class="mono-copy">data/secret.json</span>, stops the gateway, clears the live presence and pauses mirror rules that need an account. Settings and presets stay.</p>
+            <p>This deletes every saved token and identity from <span class="mono-copy">data/secret.json</span>, closes every gateway, clears the live presence and pauses mirror rules that need an account. Settings and presets stay.</p>
             <button class="btn btn-danger btn-sm" data-action="account-remove-all">${K.icon('shield-off', 'sm')}Remove all accounts</button>
           </div>`
         : '';
 
       return page(
         'Discord accounts',
-        'One gateway, several saved identities. Tokens never enter the browser.',
+        'Every saved account runs its own gateway. The focused one drives the screens; the rest keep their presence alive.',
         `${hero}
         ${K.settingGroup('Saved accounts', list)}
         <div class="quick-grid-2" style="margin-top:14px">
           <button class="btn btn-primary" data-action="account-add" ${rows.length >= limit ? 'disabled' : ''}>${K.icon('user-plus', 'sm')}Add account</button>
           <button class="btn btn-ghost" data-route="mirror">${K.icon('repeat', 'sm')}Message mirror</button>
         </div>
-        ${K.settingGroup('How switching works', `
+        ${K.settingGroup('How multiple accounts work', `
           <div class="account-info-row">${K.icon('key', 'sm')}<div><b>Per-account tokens</b><span>Each saved account has its own private entry in data/secret.json. State, logs and API responses carry only identity metadata.</span></div></div>
-          <div class="account-info-row">${K.icon('shield-check', 'sm')}<div><b>Sign in with Discord or use a token</b><span>OAuth confirms your identity in one tap. Rich Presence and message mirroring need a user token, because Discord does not grant those to OAuth apps.</span></div></div>
-          <div class="account-info-row">${K.icon('swap', 'sm')}<div><b>One live session</b><span>Switching stops the running presence, closes the old gateway and opens a new session for the selected account. Mirror rules keep their own account references.</span></div></div>
-          <div class="account-info-row">${K.icon('shield-check', 'sm')}<div><b>Fallback stays predictable</b><span>Removing the active account switches to the next saved token with credentials. If none remains, Kizzey signs out cleanly.</span></div></div>
+          <div class="account-info-row">${K.icon('shield-check', 'sm')}<div><b>Log in like on discord.com</b><span>Email and password go straight to Discord from this machine. If Discord asks for a captcha or two-factor, finish from the token field or your authenticator app.</span></div></div>
+          <div class="account-info-row">${K.icon('swap', 'sm')}<div><b>Presence keeps running</b><span>Toggling an account on starts its own gateway. Switching focus to another account changes which screens you see — it does not stop the presence you already started.</span></div></div>
+          <div class="account-info-row">${K.icon('activity', 'sm')}<div><b>Gateways close when idle</b><span>An account keeps a socket only while it has a presence, or while a mirror rule uses it. With nothing switched on, its gateway closes and nothing is sent.</span></div></div>
         `)}
         ${footer}`,
         `<button class="icon-btn" data-action="account-add" aria-label="Add account" ${rows.length >= limit ? 'disabled' : ''}>${K.icon('plus')}</button>`
@@ -165,51 +163,48 @@
 
   function accountSheet(accountId = '') {
     const existing = accountId ? accountById(accountId) : null;
-    const hasActive = !!activeAccount();
-    const makeActive = existing ? (existing.id === K.get('activeAccountId', '') || !hasActive) : !hasActive;
-    const oauthOnly = existing && !existing.tokenSet && !!existing.oauthLinked;
-    const title = existing ? (oauthOnly ? 'Add a user token' : 'Update Discord token') : 'Add a Discord account';
-    const subtitle = existing
-      ? oauthOnly
-        ? `Add Rich Presence and mirroring to ${h(accountName(existing))}.`
-        : `Replace the saved token for ${h(accountName(existing))}.`
-      : hasActive
-        ? 'The current account stays active unless you choose otherwise.'
-        : 'The first saved account becomes the live session.';
+    if (!existing) {
+      K.onLoginSuccess = null;
+      K.sheet({
+        title: 'Add a Discord account',
+        subtitle: 'Log in the way you would on discord.com. Each saved account keeps its own gateway.',
+        body: `${K.loginPanel('account')}
+          <div class="text-center mt-12"><button class="btn btn-ghost" data-action="login-help">Where do I find my token?</button></div>`,
+      });
+      return;
+    }
+    const isActive = existing.id === K.get('activeAccountId', '');
+    const subtitle = `Replace the saved token for ${h(accountName(existing))}. Anything it has switched on reconnects with the new token.`;
     const body = `<div class="login-card" style="margin-top:0">
-      ${existing ? `<div class="card soft" style="margin-bottom:14px"><div class="card-row">${accountAvatar(existing, '')}<div style="min-width:0"><div class="card-title" style="font-size:0.875rem">${h(accountName(existing))}</div><div class="card-sub">${existing.tokenSet ? (existing.username ? '@' + h(existing.username) : 'Saved Discord identity') : 'OAuth identity · no gateway yet'}</div></div></div></div>` : ''}
-      ${!existing && K.oauthConfigured() ? `<button class="btn btn-primary btn-block" data-action="account-oauth">${K.icon('discord', 'sm')}Sign in with Discord</button>
-      <div class="login-or"><span>or add a user token</span></div>` : ''}
+      <div class="card soft" style="margin-bottom:14px"><div class="card-row">${accountAvatar(existing, '')}<div style="min-width:0"><div class="card-title" style="font-size:0.875rem">${h(accountName(existing))}</div><div class="card-sub">${existing.tokenSet ? (existing.username ? '@' + h(existing.username) : 'Saved Discord identity') : 'No token saved yet'}</div></div></div></div>
       ${K.field({
         id: 'account-add-token',
         label: 'Discord account token',
         type: 'password',
         value: '',
         placeholder: 'Paste a user token',
-        hint: oauthOnly
-          ? 'The OAuth identity stays linked; this token only unlocks Rich Presence and mirroring for it.'
-          : 'Validated with Discord, then written only to data/secret.json. It is never returned to the browser.',
+        hint: 'Validated with Discord, then written only to data/secret.json. It is never returned to the browser.',
         suffix: `<button class="icon-btn small" data-action="account-toggle-token" aria-label="Show token">${K.icon('eye', 'sm')}</button>`,
         attrs: 'spellcheck="false" autocomplete="off"',
       })}
       <div id="account-add-error" class="field-error hidden"></div>
-      <div class="setting-row" style="margin-top:4px;border-bottom:0">
+      ${isActive ? '' : `<div class="setting-row" style="margin-top:4px;border-bottom:0">
         <div class="setting-icon">${K.icon('swap')}</div>
-        <div class="setting-body"><div class="setting-title">Make this the active account</div><div class="setting-desc">Switching restarts the Discord gateway and stops any running presence.</div></div>
-        <label class="switch"><input id="account-make-active" type="checkbox" ${makeActive ? 'checked' : ''}><span class="track"></span><span class="thumb"></span></label>
-      </div>
+        <div class="setting-body"><div class="setting-title">Focus this account</div><div class="setting-desc">Focus only changes which account the screens show. Gateways already running keep running.</div></div>
+        <label class="switch"><input id="account-make-active" type="checkbox"><span class="track"></span><span class="thumb"></span></label>
+      </div>`}
       <div class="login-steps">
         <span><b class="step-num">1</b><span>Sign in at <a href="https://discord.com/login" target="_blank" rel="noopener">discord.com/login</a> in a desktop browser.</span></span>
         <span><b class="step-num">2</b><span>Open DevTools → <b>Application → Local Storage → discord.com</b> and copy the <b>token</b> value.</span></span>
-        <span><b class="step-num">3</b><span>Paste it here. Add each account separately; one token never unlocks another account row.</span></span>
+        <span><b class="step-num">3</b><span>Paste it here. Each account has its own row and its own token.</span></span>
       </div>
     </div>
     <div class="modal-actions">
       <button class="btn btn-ghost" data-close-sheet>Cancel</button>
-      <button class="btn btn-primary" id="account-add-btn" data-action="account-submit" data-id="${h(existing?.id || '')}">${K.icon('check', 'sm')}${existing ? 'Replace token' : 'Save account'}</button>
+      <button class="btn btn-primary" id="account-add-btn" data-action="account-submit" data-id="${h(existing.id)}">${K.icon('check', 'sm')}Save token</button>
     </div>`;
     K.sheet({
-      title,
+      title: 'Update Discord token',
       subtitle,
       body,
       onMount(root) {
@@ -238,22 +233,6 @@
 
   K.actions['account-add'] = () => accountSheet('');
   K.actions['account-readd'] = el => accountSheet(el.dataset.id || '');
-
-  K.actions['account-oauth'] = async function (el) {
-    if (!K.oauthConfigured()) {
-      K.toast('Discord login is not configured', 'Add a Discord application Client ID and secret in Settings → Discord login.', 'error');
-      return;
-    }
-    if (el) el.disabled = true;
-    try {
-      const data = await K.api('/api/auth/oauth/start');
-      if (!data.url) throw new Error('The server did not return a Discord sign-in link.');
-      window.location.assign(data.url);
-    } catch (error) {
-      if (el) el.disabled = false;
-      K.toast('Could not start Discord sign-in', error.message, 'error');
-    }
-  };
 
   K.actions['account-toggle-token'] = () => {
     const input = document.querySelector('#account-add-token');
@@ -290,7 +269,7 @@
     } catch (error) {
       if (button) {
         button.disabled = false;
-        button.innerHTML = `${K.icon('check', 'sm')}${button.dataset.id ? 'Replace token' : 'Save account'}`;
+        button.innerHTML = `${K.icon('check', 'sm')}Save token`;
       }
       showAccountError(error.message);
     }

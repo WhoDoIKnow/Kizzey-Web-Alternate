@@ -84,14 +84,14 @@ MIRROR_MODES = ("normal", "webhook")
 MIRROR_WEBHOOK_LOCK = threading.RLock()
 SERVER_STARTED = time.monotonic()
 
-# Discord OAuth2 sign-in. OAuth proves who the operator is; it cannot open a
-# gateway socket or read channels, so a user token remains necessary for RPC
-# and mirroring.
-OAUTH_SCOPES = ("identify",)
-OAUTH_STATE_TTL = 600
-OAUTH_PENDING: dict[str, dict] = {}
-OAUTH_PENDING_LOCK = threading.Lock()
-SERVER_PUBLIC_HOST = ""
+# Discord sign-in posts the operator's own credentials straight to Discord from
+# the machine running this server. Nothing is stored but the resulting token.
+DISCORD_LOGIN_API = "https://discord.com/api/v9/auth/login"
+DISCORD_MFA_API = "https://discord.com/api/v9/auth/mfa/totp"
+DISCORD_LOGIN_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 MIME_OVERRIDES = {
     ".js": "text/javascript; charset=utf-8",
@@ -371,6 +371,31 @@ def default_chat() -> dict:
     }
 
 
+def default_gateway_record() -> dict:
+    """One gateway slot per account. `state["gateway"]` mirrors the focused one."""
+    return {
+        "connected": False,
+        "state": "offline",
+        "latency": None,
+        "error": "",
+        "reconnects": 0,
+        "since": None,
+        "tokenSet": False,
+    }
+
+
+def empty_presence() -> dict:
+    """One Rich Presence slot per account."""
+    return {
+        "active": None,
+        "startedAt": None,
+        "updatedAt": None,
+        "activities": [],
+        "info": {},
+        "cycleIndex": 0,
+    }
+
+
 def default_state() -> dict:
     t = now_ms()
     return {
@@ -380,20 +405,10 @@ def default_state() -> dict:
         "startedIso": now_iso(),
         "host": HOST_DEVICE,
         "account": None,
-        "gateway": {
-            "connected": False,
-            "state": "offline",
-            "latency": None,
-            "error": "",
-            "reconnects": 0,
-            "since": None,
-        },
-        "presence": {
-            "active": None,
-            "startedAt": None,
-            "updatedAt": None,
-            "activities": [],
-        },
+        "gateway": default_gateway_record(),
+        "gateways": {},
+        "presence": empty_presence(),
+        "presences": {},
         "settings": {
             "theme": "dark",
             "accent": "#d0bcff",
@@ -693,9 +708,7 @@ def _account_public(account: dict) -> dict:
     user = account.get("user") if isinstance(account.get("user"), dict) else {}
     display = str(user.get("displayName") or user.get("globalName") or user.get("username") or "Discord account")
     token = clean_discord_token(account.get("token"))
-    oauth = account.get("oauth") if isinstance(account.get("oauth"), dict) else {}
-    oauth_linked = bool(oauth.get("accessToken") or oauth.get("refreshToken"))
-    auth_kind = "token" if token else ("oauth" if oauth_linked else "none")
+    auth_kind = "token" if token else "none"
     return {
         "id": str(account.get("id") or ""),
         "userId": str(user.get("id") or ""),
@@ -705,7 +718,6 @@ def _account_public(account: dict) -> dict:
         "avatarUrl": str(user.get("avatarUrl") or ""),
         "tokenSet": bool(token),
         "authKind": auth_kind,
-        "oauthLinked": oauth_linked,
         "canGateway": bool(token) and not bool(account.get("needsAuth")),
         "needsAuth": bool(account.get("needsAuth")),
         "authError": _scrub(str(account.get("authError") or ""))[:220],
@@ -883,30 +895,6 @@ def prepare_imported_mirror(value) -> tuple[dict, list[str]]:
     return mirror, notes
 
 
-def _coerce_oauth_record(raw) -> dict | None:
-    if not isinstance(raw, dict):
-        return None
-    access = str(raw.get("accessToken") or "").strip()
-    refresh = str(raw.get("refreshToken") or "").strip()
-    if not access and not refresh:
-        return None
-    if len(access) > 512 or len(refresh) > 512:
-        return None
-    expires = raw.get("expiresAt")
-    if not isinstance(expires, (int, float)):
-        expires = 0
-    scope = str(raw.get("scope") or "identify").strip()[:120]
-    token_type = str(raw.get("tokenType") or "Bearer").strip()[:32]
-    return {
-        "accessToken": access,
-        "refreshToken": refresh,
-        "scope": scope,
-        "tokenType": token_type or "Bearer",
-        "expiresAt": int(expires),
-        "linkedAt": raw.get("linkedAt") if isinstance(raw.get("linkedAt"), (int, float)) else now_ms(),
-    }
-
-
 def _coerce_account_record(raw: dict, fallback_token: str = "", fallback_at=None) -> dict | None:
     if not isinstance(raw, dict):
         return None
@@ -924,7 +912,6 @@ def _coerce_account_record(raw: dict, fallback_token: str = "", fallback_at=None
         if value and not merged_user.get(key):
             merged_user[key] = value
     token = clean_discord_token(raw.get("token") or fallback_token)
-    oauth = _coerce_oauth_record(raw.get("oauth"))
     uid = str(merged_user.get("id") or raw.get("userId") or "")
     username = str(merged_user.get("username") or "")
     display = str(
@@ -954,7 +941,7 @@ def _coerce_account_record(raw: dict, fallback_token: str = "", fallback_at=None
         "avatarUrl": avatar_url,
         "email": "",
     })
-    if not token and not oauth and not uid and not username:
+    if not token and not uid and not username:
         return None
     account_id = str(raw.get("id") or "")
     if not account_id.startswith("acct_") or len(account_id) < 8:
@@ -964,11 +951,10 @@ def _coerce_account_record(raw: dict, fallback_token: str = "", fallback_at=None
         "id": account_id,
         "token": token,
         "tokenSetAt": raw.get("tokenSetAt") if token else None,
-        "authKind": "token" if token else ("oauth" if oauth else "none"),
-        "oauth": oauth,
+        "authKind": "token" if token else "none",
         "addedAt": raw.get("addedAt") or fallback_at or now,
         "lastUsedAt": raw.get("lastUsedAt"),
-        "needsAuth": bool(raw.get("needsAuth")) or (not token and not oauth),
+        "needsAuth": bool(raw.get("needsAuth")) or not token,
         "authError": str(raw.get("authError") or "")[:220],
         "user": merged_user,
     }
@@ -1005,10 +991,10 @@ class Store:
             if room.get("id") not in self.state["chat"].setdefault("messages", {}):
                 self.state["chat"]["messages"][room.get("id")] = []
         # The server always owns these runtime fields.
-        self.state.setdefault("presence", {"active": None, "startedAt": None, "activities": []})
-        self.state.setdefault("gateway", {"connected": False, "state": "offline"})
-        self.state["gateway"]["connected"] = False
-        self.state["gateway"]["state"] = "offline"
+        self.state["presence"] = empty_presence()
+        self.state["presences"] = {}
+        self.state["gateway"] = default_gateway_record()
+        self.state["gateways"] = {}
         self.state["mirror"] = normalize_mirror_state(self.state.get("mirror"))
         raw_webhooks = self.secret.get("mirrorWebhooks")
         webhooks = {}
@@ -1077,13 +1063,6 @@ class Store:
                         existing["needsAuth"] = False
                         existing["authError"] = ""
                         by_token[token] = existing
-                    if account.get("oauth"):
-                        existing["oauth"] = account["oauth"]
-                        existing["needsAuth"] = False
-                        existing["authError"] = ""
-                    existing["authKind"] = "token" if clean_discord_token(existing.get("token")) else (
-                        "oauth" if existing.get("oauth") else "none"
-                    )
                     if account.get("lastUsedAt"):
                         existing["lastUsedAt"] = account.get("lastUsedAt")
                     existing["user"].update({k: v for k, v in account["user"].items() if v})
@@ -1135,19 +1114,17 @@ class Store:
             active = next((account for account in accounts if account["id"] == active_id), None)
             if not active and legacy_token:
                 active = by_token.get(legacy_token)
-            if not active or not (clean_discord_token(active.get("token")) or active.get("oauth")):
+            if not active or not clean_discord_token(active.get("token")):
                 active = next(
                     (account for account in accounts if clean_discord_token(account.get("token"))),
                     None,
                 )
-            if not active:
-                active = next((account for account in accounts if account.get("oauth")), None)
             if active:
                 self.secret["activeId"] = active["id"]
                 self.secret["token"] = clean_discord_token(active.get("token"))
                 self.secret["tokenSetAt"] = active.get("tokenSetAt") if self.secret["token"] else None
                 self.state["account"] = copy.deepcopy(active["user"])
-                if active.get("token") or active.get("oauth"):
+                if clean_discord_token(active.get("token")):
                     self.secret["authError"] = ""
             else:
                 self.secret["activeId"] = ""
@@ -1167,9 +1144,7 @@ class Store:
         with self.lock:
             active_id = str(self.secret.get("activeId") or "")
             for account in self.secret.get("accounts", []) or []:
-                if account.get("id") == active_id and (
-                    clean_discord_token(account.get("token")) or account.get("oauth")
-                ):
+                if account.get("id") == active_id and clean_discord_token(account.get("token")):
                     return active_id
             return ""
 
@@ -1181,7 +1156,6 @@ class Store:
                     result = copy.deepcopy(account)
                     if not include_token:
                         result.pop("token", None)
-                        result.pop("oauth", None)
                     return result
             return None
 
@@ -1193,7 +1167,6 @@ class Store:
                     result = copy.deepcopy(account)
                     if not include_token:
                         result.pop("token", None)
-                        result.pop("oauth", None)
                     return result
             return None
 
@@ -1245,92 +1218,13 @@ class Store:
             self.save()
             return copy.deepcopy(existing), created
 
-    def upsert_oauth_account(self, user: dict, oauth: dict) -> tuple[dict, bool]:
-        """Save (or refresh) an identity proven through Discord OAuth2."""
-        user = dict(user or {})
-        record = _coerce_oauth_record(oauth)
-        if not record:
-            raise ValueError("Discord did not return a usable OAuth session.")
-        user_id = str(user.get("id") or "")
-        if not user_id:
-            raise ValueError("Discord did not return a usable account.")
-        with self.lock:
-            accounts = self.secret.setdefault("accounts", [])
-            existing = next(
-                (
-                    account
-                    for account in accounts
-                    if str((account.get("user") or {}).get("id") or "") == user_id
-                ),
-                None,
-            )
-            if existing is None:
-                if len(accounts) >= ACCOUNT_LIMIT:
-                    raise ValueError(f"You can save up to {ACCOUNT_LIMIT} Discord accounts.")
-                existing = _coerce_account_record({"user": user, "oauth": record})
-                if existing is None:
-                    raise ValueError("Discord did not return a usable account.")
-                accounts.append(existing)
-                created = True
-            else:
-                created = False
-                existing["oauth"] = record
-                existing["user"] = {**(existing.get("user") or {}), **user, "email": ""}
-                existing["needsAuth"] = False
-                existing["authError"] = ""
-            existing["authKind"] = "token" if clean_discord_token(existing.get("token")) else "oauth"
-            existing["oauthLinkedAt"] = record["linkedAt"]
-            self.save()
-            return copy.deepcopy(existing), created
-
-    def update_oauth(self, account_id: str, oauth: dict | None = None, user: dict | None = None) -> dict | None:
-        with self.lock:
-            account = next(
-                (row for row in self.secret.get("accounts", []) or [] if row.get("id") == account_id),
-                None,
-            )
-            if not account:
-                return None
-            if oauth is not None:
-                record = _coerce_oauth_record(oauth)
-                if record:
-                    account["oauth"] = record
-                    account["oauthLinkedAt"] = record["linkedAt"]
-            if user:
-                account["user"] = {**(account.get("user") or {}), **user, "email": ""}
-            account["authKind"] = "token" if clean_discord_token(account.get("token")) else (
-                "oauth" if account.get("oauth") else "none"
-            )
-            if account.get("token") or account.get("oauth"):
-                account["needsAuth"] = False
-                account["authError"] = ""
-            if str(self.secret.get("activeId") or "") == account_id:
-                self.state["account"] = copy.deepcopy(account.get("user") or {})
-            self.save()
-            return copy.deepcopy(account)
-
-    def mark_oauth_failed(self, account_id: str, message: str) -> None:
-        with self.lock:
-            account = next(
-                (row for row in self.secret.get("accounts", []) or [] if row.get("id") == account_id),
-                None,
-            )
-            if account is None:
-                return
-            safe = _scrub(message)[:220] or "Discord rejected this sign-in."
-            account["needsAuth"] = True
-            account["authError"] = safe
-            if str(self.secret.get("activeId") or "") == account_id:
-                self.secret["authError"] = safe
-            self.save()
-
     def activate_account(self, account_id: str, user: dict | None = None) -> dict:
         with self.lock:
             account = next(
                 (row for row in self.secret.get("accounts", []) or [] if row.get("id") == account_id),
                 None,
             )
-            if not account or not (clean_discord_token(account.get("token")) or account.get("oauth")):
+            if not account or not clean_discord_token(account.get("token")):
                 raise ValueError("That account has no saved token. Add it again.")
             token = clean_discord_token(account.get("token"))
             if user:
@@ -1430,6 +1324,24 @@ class Store:
             self.save()
             return count
 
+    # -- focused-account mirror ------------------------------------------
+    def sync_focused(self) -> None:
+        """Point the legacy single-account slots at the focused account.
+
+        `state["gateway"]` and `state["presence"]` still drive the UI, but the real
+        records live per account in `state["gateways"]` / `state["presences"]`.
+        """
+        with self.lock:
+            account_id = str(self.secret.get("activeId") or "")
+            gateways = self.state.setdefault("gateways", {})
+            presences = self.state.setdefault("presences", {})
+            record = copy.deepcopy(gateways.get(account_id) or default_gateway_record())
+            record["tokenSet"] = bool(self.active_token())
+            if not account_id:
+                record["connected"] = False
+            self.state["gateway"] = record
+            self.state["presence"] = copy.deepcopy(presences.get(account_id) or empty_presence())
+
     # -- events ----------------------------------------------------------
     def subscribe(self) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=32)
@@ -1515,6 +1427,7 @@ STORE: Store | None = None
 def public_state() -> dict:
     if STORE is None:
         return {}
+    STORE.sync_focused()
     with STORE.lock:
         # Tokens live only in secret.json and are never handed to the browser.
         data = json.loads(json.dumps(STORE.state, ensure_ascii=False))
@@ -1525,7 +1438,6 @@ def public_state() -> dict:
         data["accountLimit"] = ACCOUNT_LIMIT
         data["mirrorRuleLimit"] = MIRROR_RULE_LIMIT
         data["activeAccountId"] = STORE.active_account_id()
-        data["auth"] = {"oauth": public_oauth_config()}
         data["tokenSet"] = bool(STORE.active_token())
         data["serverTime"] = now_ms()
         data["version"] = VERSION
@@ -1555,7 +1467,9 @@ PROTECTED_PATCH_KEYS = {
     "accountCount",
     "activeAccountId",
     "gateway",
+    "gateways",
     "presence",
+    "presences",
     "history",
     "logs",
     "version",
@@ -3384,10 +3298,14 @@ class WSClient:
 
 
 class DiscordGateway:
-    def __init__(self) -> None:
+    """One Discord gateway socket, owned by exactly one saved account."""
+
+    def __init__(self, account_id: str = "") -> None:
+        self.account_id = str(account_id or "")
         self.lock = threading.RLock()
         self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
+        self.keep_running = True
         self.ws: WSClient | None = None
         self.token = ""
         self.ready = False
@@ -3404,16 +3322,60 @@ class DiscordGateway:
     def connected(self) -> bool:
         return bool(self.ready and self.ws is not None)
 
-    def set_gateway_state(self, state: str, **kwargs) -> None:
+    def _id(self) -> str:
+        if self.account_id:
+            return self.account_id
+        return STORE.active_account_id() if STORE else ""
+
+    def gateway_record(self) -> dict | None:
+        """The per-account gateway record, created on first use."""
         if not STORE:
+            return None
+        account_id = self._id()
+        if not account_id:
+            return None
+        with STORE.lock:
+            gateways = STORE.state.setdefault("gateways", {})
+            record = gateways.get(account_id)
+            if not isinstance(record, dict):
+                record = default_gateway_record()
+                gateways[account_id] = record
+            return record
+
+    def set_gateway_state(self, state: str, **kwargs) -> None:
+        record = self.gateway_record()
+        if record is None:
             return
         with STORE.lock:
-            g = STORE.state["gateway"]
-            g["state"] = state
-            g["connected"] = bool(self.connected)
+            record["state"] = state
+            record["connected"] = bool(self.connected)
+            record["tokenSet"] = bool(self.token)
             for key, value in kwargs.items():
-                g[key] = value
-        STORE.publish({"type": "gateway", "gateway": STORE.state["gateway"]})
+                record[key] = value
+            STORE.sync_focused()
+        self._publish_gateway()
+
+    def _publish_gateway(self) -> None:
+        """Push a live update; only the focused account may drive the UI slot."""
+        if not STORE:
+            return
+        account_id = self._id()
+        focused = STORE.active_account_id()
+        if account_id and account_id == focused:
+            with STORE.lock:
+                snapshot = copy.deepcopy(STORE.state["gateway"])
+            STORE.publish({"type": "gateway", "gateway": snapshot, "accountId": account_id})
+        else:
+            # Background sockets still update the account list, so send full state.
+            STORE.broadcast_state()
+
+    def _store_latency(self, latency: int) -> None:
+        record = self.gateway_record()
+        if record is None:
+            return
+        with STORE.lock:
+            record["latency"] = max(0, int(latency))
+            STORE.sync_focused()
 
     def start(self, token: str) -> None:
         with self.lock:
@@ -3421,11 +3383,14 @@ class DiscordGateway:
             if not token:
                 return
             self.token = token
+            self.keep_running = True
             self.stop_event = threading.Event()
             self.ready = False
             self.sequence = None
             self.started_at = now_ms()
-            self.thread = threading.Thread(target=self.run, name="discord-gateway", daemon=True)
+            self.thread = threading.Thread(
+                target=self.run, name=f"discord-gateway-{self._id() or 'main'}", daemon=True
+            )
             self.thread.start()
 
     def stop(self) -> None:
@@ -3434,6 +3399,7 @@ class DiscordGateway:
 
     def stop_locked(self) -> None:
         self.stop_event.set()
+        self.keep_running = False
         self.ready = False
         try:
             if self.ws:
@@ -3444,13 +3410,7 @@ class DiscordGateway:
         if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
             self.thread.join(timeout=2)
         self.thread = None
-        if STORE:
-            with STORE.lock:
-                STORE.state["gateway"].update(
-                    {"connected": False, "state": "offline", "latency": None}
-                )
-            STORE.publish({"type": "gateway", "gateway": STORE.state["gateway"]})
-        self.set_gateway_state("offline")
+        self.set_gateway_state("offline", latency=None)
 
     def send_presence(self, presence: dict | None) -> None:
         self.last_presence = presence
@@ -3487,30 +3447,31 @@ class DiscordGateway:
                 if STORE:
                     STORE.log("ERROR" if fatal else "WARN", "Gateway", f"Connection lost: {msg}")
                     if fatal:
-                        active_id = STORE.active_account_id()
-                        if active_id:
-                            STORE.mark_account_auth_failed(
-                                active_id, "Discord rejected the saved token. Add a fresh token."
-                            )
-                        with STORE.lock:
-                            STORE.secret["token"] = ""
-                            STORE.secret["tokenSetAt"] = None
-                            STORE.state["account"] = None
-                            STORE.state["gateway"].update(
-                                {
-                                    "connected": False,
-                                    "state": "error",
-                                    "error": "Discord rejected the saved token. Add a fresh token in Discord accounts.",
-                                    "latency": None,
-                                    "tokenSet": False,
-                                }
-                            )
-                            STORE.save()
+                        account_id = self._id()
+                        error_text = "Discord rejected the saved token. Add a fresh token in Discord accounts."
+                        if account_id:
+                            STORE.mark_account_auth_failed(account_id, error_text)
+                        record = self.gateway_record()
+                        if record is not None:
+                            with STORE.lock:
+                                record.update(
+                                    {
+                                        "connected": False,
+                                        "state": "error",
+                                        "error": error_text,
+                                        "latency": None,
+                                        "tokenSet": False,
+                                    }
+                                )
+                                STORE.sync_focused()
+                        self.token = ""
+                        self.keep_running = False
                         STORE.broadcast_state()
                         self.stop_event.set()
                         break
                 self.ready = False
                 if STORE and not STORE.state.get("settings", {}).get("keepAlive", True):
+                    self.keep_running = False
                     self.set_gateway_state("offline", error=msg + " Keep-alive is off.")
                     break
                 self.set_gateway_state("reconnecting", error=msg)
@@ -3527,6 +3488,7 @@ class DiscordGateway:
                     STORE.log("WARN", "Gateway", f"Connection lost: {msg}")
                 self.ready = False
                 if STORE and not STORE.state.get("settings", {}).get("keepAlive", True):
+                    self.keep_running = False
                     self.set_gateway_state("offline", error=msg + " Keep-alive is off.")
                     break
                 self.set_gateway_state("reconnecting", error=msg)
@@ -3543,7 +3505,14 @@ class DiscordGateway:
                     pass
                 self.ws = None
                 self.ready = False
-        self.set_gateway_state("offline" if self.stop_event.is_set() and STORE and STORE.secret.get("token") else "error")
+        self.set_gateway_state("offline" if self.stop_event.is_set() and self._account_token() else "error")
+
+    def _account_token(self) -> str:
+        account_id = self._id()
+        if not account_id or not STORE:
+            return ""
+        account = STORE.account_by_id(account_id, include_token=True)
+        return clean_discord_token((account or {}).get("token"))
 
     def _connect_once(self) -> None:
         self.stop_event.clear()
@@ -3611,10 +3580,8 @@ class DiscordGateway:
                 self.sequence = seq
             if op == 11:
                 self.last_ack = mono()
-                if STORE:
-                    with STORE.lock:
-                        latency = max(0, int((mono() - self.last_heartbeat) * 1000))
-                        STORE.state["gateway"]["latency"] = latency
+                if STORE and self.last_heartbeat:
+                    self._store_latency(max(0, int((mono() - self.last_heartbeat) * 1000)))
                 continue
             if op == 1:
                 self._heartbeat()
@@ -3637,15 +3604,17 @@ class DiscordGateway:
                     self.ready = True
                     self.session_id = data.get("session_id")
                     user = data.get("user") or {}
-                    if user and STORE:
+                    if user and STORE and self._id() == STORE.active_account_id():
+                        # Only the focused account owns the legacy identity slot.
                         with STORE.lock:
                             STORE.state["account"] = normalize_user(user)
+                    record = self.gateway_record() or {}
                     self.set_gateway_state(
                         "connected",
                         connected=True,
                         error="",
                         since=now_ms(),
-                        reconnects=STORE.state["gateway"].get("reconnects", 0) if STORE else 0,
+                        reconnects=record.get("reconnects", 0),
                     )
                     if STORE:
                         STORE.log("INFO", "Gateway", "Discord gateway is ready.")
@@ -3685,10 +3654,7 @@ class DiscordGateway:
             if op == 11:
                 self.last_ack = mono()
                 if STORE and self.last_heartbeat:
-                    with STORE.lock:
-                        STORE.state["gateway"]["latency"] = max(
-                            0, int((mono() - self.last_heartbeat) * 1000)
-                        )
+                    self._store_latency(max(0, int((mono() - self.last_heartbeat) * 1000)))
             elif op == 1:
                 self._heartbeat()
             elif op in (7, 9):
@@ -3748,7 +3714,149 @@ class DiscordGateway:
                 pass
 
 
-GATEWAY = DiscordGateway()
+def wanted_gateways() -> dict[str, str]:
+    """Accounts that must hold a gateway socket right now.
+
+    An account needs a live gateway only when it is pushing Rich Presence or is
+    referenced by an enabled mirror relay. Everything else stays disconnected so
+    idle accounts never sit in Discord's session list.
+    """
+    if STORE is None:
+        return {}
+    wanted: dict[str, str] = {}
+    with STORE.lock:
+        presences = STORE.state.get("presences") or {}
+        for account_id, record in presences.items():
+            if isinstance(record, dict) and record.get("active"):
+                wanted[str(account_id)] = ""
+        mirror = STORE.state.get("mirror") or {}
+        if mirror.get("enabled"):
+            for rule in mirror.get("rules") or []:
+                if not isinstance(rule, dict) or not rule.get("enabled"):
+                    continue
+                for key in ("sourceAccountId", "destAccountId"):
+                    account_id = str(rule.get(key) or "")
+                    if account_id:
+                        wanted.setdefault(account_id, "")
+    for account_id in list(wanted):
+        account = STORE.account_by_id(account_id, include_token=True)
+        token = clean_discord_token((account or {}).get("token"))
+        if token:
+            wanted[account_id] = token
+        else:
+            wanted.pop(account_id, None)
+    return wanted
+
+
+class GatewayPool:
+    """Owns one `DiscordGateway` socket per account that needs one."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.gateways: dict[str, DiscordGateway] = {}
+
+    # -- lookups ----------------------------------------------------------
+    def get(self, account_id: str = "") -> DiscordGateway:
+        account_id = str(account_id or "") or (STORE.active_account_id() if STORE else "")
+        with self.lock:
+            gateway = self.gateways.get(account_id)
+            if gateway is None or gateway.account_id != account_id:
+                gateway = DiscordGateway(account_id)
+                self.gateways[account_id] = gateway
+            return gateway
+
+    def running(self, account_id: str = "") -> bool:
+        account_id = str(account_id or "") or (STORE.active_account_id() if STORE else "")
+        with self.lock:
+            gateway = self.gateways.get(account_id)
+        return bool(gateway and gateway.connected)
+
+    def active_ids(self) -> list[str]:
+        with self.lock:
+            items = list(self.gateways.items())
+        return [account_id for account_id, gateway in items if gateway.connected]
+
+    @staticmethod
+    def token_for(account_id: str) -> str:
+        if not account_id or STORE is None:
+            return ""
+        account = STORE.account_by_id(account_id, include_token=True)
+        return clean_discord_token((account or {}).get("token"))
+
+    # -- lifecycle --------------------------------------------------------
+    def ensure(self, account_id: str = "") -> DiscordGateway:
+        """Return the account's socket, starting it if the account has a token."""
+        account_id = str(account_id or "") or (STORE.active_account_id() if STORE else "")
+        gateway = self.get(account_id)
+        if account_id and not gateway.thread:
+            token = self.token_for(account_id)
+            if token:
+                gateway.start(token)
+        return gateway
+
+    def start(self, token: str, account_id: str = "") -> None:
+        account_id = str(account_id or "") or (STORE.active_account_id() if STORE else "")
+        self.get(account_id).start(token)
+
+    def stop(self, account_id: str = "") -> None:
+        account_id = str(account_id or "") or (STORE.active_account_id() if STORE else "")
+        with self.lock:
+            gateway = self.gateways.pop(account_id, None)
+        if gateway:
+            gateway.stop()
+
+    def stop_all(self) -> None:
+        with self.lock:
+            gateways = list(self.gateways.values())
+            self.gateways.clear()
+        for gateway in gateways:
+            gateway.stop()
+
+    def restart(self, account_id: str = "") -> None:
+        """Drop an account's socket so the next reconcile reconnects with its token."""
+        account_id = str(account_id or "") or (STORE.active_account_id() if STORE else "")
+        if not account_id:
+            return
+        with self.lock:
+            gateway = self.gateways.get(account_id)
+        if gateway and (gateway.thread or gateway.token):
+            self.stop(account_id)
+        self.reconcile()
+
+    def send_presence(self, presence: dict | None, account_id: str = "") -> None:
+        account_id = str(account_id or "") or (STORE.active_account_id() if STORE else "")
+        gateway = self.get(account_id)
+        gateway.send_presence(presence)
+
+    def reconcile(self) -> None:
+        """Start and stop sockets so the pool matches `wanted_gateways()`.
+
+        Never call this while holding `STORE.lock`: stopping a socket joins its
+        thread, which itself needs that lock to publish state.
+        """
+        wanted = wanted_gateways()
+        with self.lock:
+            stale = [
+                account_id
+                for account_id, gateway in self.gateways.items()
+                if account_id not in wanted or (not gateway.keep_running and not gateway.thread)
+            ]
+            missing = [
+                (account_id, token)
+                for account_id, token in wanted.items()
+                if account_id not in self.gateways
+                or (self.gateways[account_id].keep_running and not self.gateways[account_id].thread)
+            ]
+        for account_id in stale:
+            with self.lock:
+                gateway = self.gateways.pop(account_id, None)
+            if gateway:
+                gateway.stop()
+        for account_id, token in missing:
+            self.get(account_id).start(token)
+
+
+GATEWAY = GatewayPool()
 
 
 # ---------------------------------------------------------------------------
@@ -4405,11 +4513,6 @@ def _mirror_rule_by_id(rule_id: str) -> dict | None:
 
 
 def _mirror_token_message(account: dict, role: str) -> str:
-    if account and account.get("oauth"):
-        return (
-            f"The {role} account signed in with Discord OAuth. OAuth cannot read or post messages, "
-            "so mirroring needs a user token for that account."
-        )
     return f"The {role} account needs a fresh Discord token."
 
 
@@ -4519,6 +4622,8 @@ def save_mirror_rule(data: dict) -> tuple[dict, str]:
             message = exc.message if isinstance(exc, DiscordError) else str(exc)
             warning = f"Rule saved, but the source could not be read yet: {_scrub(message)}"
     MIRROR.kick()
+    # An enabled rule holds gateways open for both of its accounts.
+    GATEWAY.reconcile()
     STORE.log(
         "INFO",
         "Mirror",
@@ -4549,6 +4654,8 @@ def set_mirror_settings(data: dict) -> dict:
         )
     if mirror["enabled"]:
         MIRROR.kick()
+    # Enabling or pausing mirroring changes which accounts need a socket.
+    GATEWAY.reconcile()
     STORE.broadcast_state()
     return public_mirror_state()
 
@@ -4563,6 +4670,8 @@ def delete_mirror_rule(rule_id: str) -> None:
         STORE.state["mirror"] = mirror
         STORE.save()
     delete_mirror_webhook(rule_id, remote=True)
+    # The accounts this rule referenced may no longer need a socket.
+    GATEWAY.reconcile()
     STORE.log("INFO", "Mirror", "A message relay was removed.")
     STORE.broadcast_state()
 
@@ -4604,6 +4713,7 @@ def toggle_mirror_rule(rule_id: str, enabled: bool) -> dict:
         except (DiscordError, ValueError) as exc:
             warning = _scrub(exc.message if isinstance(exc, DiscordError) else str(exc))
     MIRROR.kick()
+    GATEWAY.reconcile()
     STORE.log("INFO", "Mirror", f"Relay {'resumed' if enabled else 'paused'}.")
     STORE.broadcast_state()
     updated = public_mirror_rule(_mirror_rule_by_id(rule_id) or {})
@@ -5177,16 +5287,38 @@ def presence_public(kind: str, started_at: int | None, activities: list[dict], c
     }
 
 
-def send_current_presence(store: Store, *, force: bool = False, cycle_index: int | None = None) -> dict | None:
+def presence_record(account_id: str = "") -> dict | None:
+    """Return the Rich Presence slot for one account, creating it if needed."""
+    assert STORE is not None
+    account_id = str(account_id or "") or STORE.active_account_id()
+    if not account_id:
+        return None
+    presences = STORE.state.setdefault("presences", {})
+    record = presences.get(account_id)
+    if not isinstance(record, dict):
+        record = empty_presence()
+        presences[account_id] = record
+    return record
+
+
+def send_current_presence(
+    store: Store, *, force: bool = False, cycle_index: int | None = None, account_id: str = ""
+) -> dict | None:
+    account_id = str(account_id or "") or store.active_account_id()
+    if not account_id:
+        return None
     with store.lock:
-        active = store.state.get("presence", {}).get("active")
+        record = presence_record(account_id)
+        if record is None:
+            return None
+        active = record.get("active")
         if not active:
             return None
         kind = active.get("kind")
-        started = store.state["presence"].get("startedAt") or now_ms()
+        started = record.get("startedAt") or now_ms()
         if cycle_index is not None:
-            store.state["presence"]["cycleIndex"] = cycle_index
-        idx = cycle_index if cycle_index is not None else store.state["presence"].get("cycleIndex", 0)
+            record["cycleIndex"] = cycle_index
+        idx = cycle_index if cycle_index is not None else record.get("cycleIndex", 0)
         sources = []
         if kind == "multiple":
             sources = list(store.state.get("multiple", {}).get("sources") or [])
@@ -5216,12 +5348,22 @@ def send_current_presence(store: Store, *, force: bool = False, cycle_index: int
             "status": status,
             "afk": False,
         }
-        store.state["presence"]["activities"] = activities
-        store.state["presence"]["updatedAt"] = now_ms()
-        store.state["presence"]["info"] = presence_public(kind, started, activities, idx)
-        GATEWAY.send_presence(payload)
-        store.save()
-    store.publish({"type": "presence", "presence": store.state["presence"], "gateway": store.state["gateway"]})
+        record["activities"] = activities
+        record["updatedAt"] = now_ms()
+        record["info"] = presence_public(kind, started, activities, idx)
+        store.sync_focused()
+        focused = account_id == store.active_account_id()
+        snapshot = copy.deepcopy(store.state["presence"]) if focused else None
+        gateway_snapshot = copy.deepcopy(store.state["gateway"]) if focused else None
+    # Opening the socket for a background account is fine: each account owns its
+    # own connection, so several presences can run at the same time.
+    GATEWAY.ensure(account_id)
+    GATEWAY.send_presence(payload, account_id)
+    store.save()
+    if focused:
+        store.publish({"type": "presence", "presence": snapshot, "gateway": gateway_snapshot})
+    else:
+        store.broadcast_state()
     return payload
 
 
@@ -5234,9 +5376,10 @@ class Ticker:
     def __init__(self) -> None:
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self.run, name="kizzey-ticker", daemon=True)
-        self.last_sent = 0.0
-        self.last_template = ""
-        self.last_cycle = -1
+        # Per-account bookkeeping: every running presence rotates on its own clock.
+        self.last_sent: dict[str, float] = {}
+        self.last_template: dict[str, str] = {}
+        self.last_cycle: dict[str, int] = {}
 
     def start(self) -> None:
         self.thread.start()
@@ -5255,14 +5398,26 @@ class Ticker:
         assert STORE is not None
         self.run_automation()
         with STORE.lock:
-            presence = STORE.state.get("presence") or {}
+            account_ids = [str(key) for key in (STORE.state.get("presences") or {})]
+        for account_id in account_ids:
+            try:
+                self._tick_account(account_id)
+            except Exception:
+                STORE.log("WARN", "Ticker", traceback.format_exc(limit=2))
+
+    def _tick_account(self, account_id: str) -> None:
+        assert STORE is not None
+        with STORE.lock:
+            presence = (STORE.state.get("presences") or {}).get(account_id) or {}
             active = presence.get("active")
             if not active:
+                self.last_sent.pop(account_id, None)
+                self.last_template.pop(account_id, None)
+                self.last_cycle.pop(account_id, None)
                 return
             kind = active.get("kind")
             started = presence.get("startedAt") or now_ms()
             cfg = dict(STORE.state.get("custom") or {})
-            next_cycle = None
             interval = 0
             if kind == "cycling":
                 cyc = STORE.state.get("cycling") or {}
@@ -5275,29 +5430,31 @@ class Ticker:
             if interval:
                 elapsed = max(0, (now_ms() - started) / 1000.0)
                 idx = int(elapsed // interval)
-                if idx != self.last_cycle:
-                    self.last_cycle = idx
-                    send_current_presence(STORE, cycle_index=idx)
+                if idx != self.last_cycle.get(account_id, -1):
+                    self.last_cycle[account_id] = idx
+                    send_current_presence(STORE, cycle_index=idx, account_id=account_id)
                     return
             # Refresh dynamic clock/date tokens once a minute when running.
             now = time.time()
-            if kind == "custom" and now - self.last_sent >= 60:
+            if kind == "custom" and now - self.last_sent.get(account_id, 0.0) >= 60:
                 rendered = expand_template(cfg.get("name", ""), STORE.state) + "|" + expand_template(
                     cfg.get("details", ""), STORE.state
                 ) + "|" + expand_template(cfg.get("state", ""), STORE.state)
-                if rendered != self.last_template:
-                    self.last_template = rendered
-                    self.last_sent = now
-                    send_current_presence(STORE, force=True)
+                if rendered != self.last_template.get(account_id, ""):
+                    self.last_template[account_id] = rendered
+                    self.last_sent[account_id] = now
+                    send_current_presence(STORE, force=True, account_id=account_id)
 
     def run_automation(self) -> None:
         """Start a scheduled presence when its weekday/time matches.
 
         Automations are intentionally conservative: an already-running presence
         is never replaced, so a hand-started card always wins over a schedule.
+        Schedules only ever drive the focused account.
         """
         assert STORE is not None
-        if not STORE.active_token():
+        focused = STORE.active_account_id()
+        if not focused or not STORE.active_token():
             return
         data = STORE.state.get("automation") or {}
         if not data.get("enabled"):
@@ -5305,7 +5462,8 @@ class Ticker:
         now = dt.datetime.now()
         minute_key = now.strftime("%Y-%m-%dT%H:%M")
         with STORE.lock:
-            if (STORE.state.get("presence") or {}).get("active"):
+            focused_record = (STORE.state.get("presences") or {}).get(focused) or {}
+            if focused_record.get("active"):
                 return
             for rule in data.get("rules") or []:
                 if not isinstance(rule, dict) or not rule.get("enabled"):
@@ -5363,6 +5521,7 @@ def save_discord_account(token: str, make_active: bool = True) -> tuple[dict, bo
         # when the caller did not ask to switch; otherwise the old socket would
         # keep using credentials that no longer exist.
         activate_discord_account(account["id"], user=user, verify=False)
+        GATEWAY.restart(account["id"])
     else:
         STORE.broadcast_state()
     action = "Added" if created else "Updated"
@@ -5376,28 +5535,8 @@ def activate_discord_account(account_id: str, user: dict | None = None, verify: 
     if not account:
         raise DiscordError(404, "That Discord account is not saved.")
     token = clean_discord_token(account.get("token"))
-    if not token and not account.get("oauth"):
-        raise DiscordError(401, "That account needs a fresh Discord token.")
     if not token:
-        # OAuth-only accounts keep their identity but never touch the gateway.
-        if verify or not user:
-            try:
-                user = refresh_oauth_account(account_id)
-            except DiscordError:
-                STORE.broadcast_state()
-                raise
-        stop_presence(None, quiet=True)
-        GATEWAY.stop()
-        account = STORE.activate_account(account_id, user=user)
-        with STORE.lock:
-            STORE.state["gateway"].update(
-                {"connected": False, "state": "offline", "error": "", "latency": None, "tokenSet": False}
-            )
-            STORE.save()
-        display = (account.get("user") or {}).get("displayName") or "Discord account"
-        STORE.log("INFO", "Account", f"Switched to {display} (OAuth identity).")
-        STORE.broadcast_state()
-        return account
+        raise DiscordError(401, "That account needs a fresh Discord token.")
     if verify or not user:
         try:
             user = _validated_account_user(token, account_id)
@@ -5406,10 +5545,12 @@ def activate_discord_account(account_id: str, user: dict | None = None, verify: 
             # updated public account list so every open client drops the stale row.
             STORE.broadcast_state()
             raise
-    stop_presence(None, quiet=True)
-    GATEWAY.stop()
     account = STORE.activate_account(account_id, user=user)
-    GATEWAY.start(token)
+    # Switching focus only changes which account the UI mirrors. Every account
+    # owns its own socket, so nothing that is already running gets stopped.
+    with STORE.lock:
+        STORE.sync_focused()
+    GATEWAY.reconcile()
     display = (account.get("user") or {}).get("displayName") or "Discord account"
     STORE.log("INFO", "Account", f"Switched to {display}.")
     STORE.broadcast_state()
@@ -5429,22 +5570,18 @@ def remove_discord_account(account_id: str) -> dict:
         raise ValueError("That Discord account is not saved.")
     active_id = STORE.active_account_id()
     was_active = account_id == active_id
-    if was_active:
-        stop_presence(None, quiet=True)
-        GATEWAY.stop()
+    # The account's presence and socket die with it; other accounts keep running.
+    with STORE.lock:
+        (STORE.state.get("presences") or {}).pop(account_id, None)
+        (STORE.state.get("gateways") or {}).pop(account_id, None)
     result = STORE.remove_account(account_id) or {}
-    next_account = STORE.account_by_id(result.get("nextId", ""), include_token=True) if result.get("nextId") else None
-    if was_active and next_account:
-        token = clean_discord_token(next_account.get("token"))
-        if token:
-            GATEWAY.start(token)
-    if was_active and not next_account:
+    GATEWAY.stop(account_id)
+    if was_active:
         with STORE.lock:
-            STORE.state["gateway"].update(
-                {"connected": False, "state": "offline", "error": "", "latency": None}
-            )
-        STORE.save()
+            STORE.sync_focused()
+    GATEWAY.reconcile()
     display = (account.get("user") or {}).get("displayName") or "Discord account"
+    next_account = STORE.account_by_id(result.get("nextId", "")) if result.get("nextId") else None
     if was_active and next_account:
         next_name = (next_account.get("user") or {}).get("displayName") or "the next account"
         STORE.log("INFO", "Account", f"Removed {display}; switched to {next_name}.")
@@ -5462,162 +5599,49 @@ def sign_out() -> None:
     if active_id:
         remove_discord_account(active_id)
         return
-    GATEWAY.stop()
+    GATEWAY.stop_all()
     with STORE.lock:
         STORE.secret["token"] = ""
         STORE.secret["tokenSetAt"] = None
         STORE.secret["activeId"] = ""
         STORE.state["account"] = None
-        STORE.state["gateway"].update(
-            {"connected": False, "state": "offline", "error": "", "latency": None}
-        )
+        STORE.sync_focused()
     STORE.save()
     STORE.log("INFO", "Account", "Signed out of Discord.")
     STORE.broadcast_state()
 
 
 # ---------------------------------------------------------------------------
-# Discord OAuth2 ("Sign in with Discord")
+# Discord login (email/username + password)
+#
+# This mirrors what discord.com itself posts when you sign in: the credentials
+# go straight to Discord from this machine, and only the resulting user token is
+# kept. Discord may answer with a captcha demand or an MFA ticket; both are
+# surfaced as normal errors instead of being swallowed.
 # ---------------------------------------------------------------------------
 
-OAUTH_CALLBACK_PATH = "/api/auth/oauth/callback"
+LOGIN_SOURCE = "https://discord.com/login"
 
 
-def _oauth_env(name: str) -> str:
-    return str(os.environ.get(name) or "").strip()
-
-
-def oauth_credentials() -> tuple[str, str]:
-    """Return the Discord application credentials, env/CLI first, saved config second."""
-    cfg: dict = {}
-    if STORE is not None and isinstance(STORE.secret.get("oauth"), dict):
-        cfg = STORE.secret["oauth"]
-    client_id = _oauth_env("KIZZEY_DISCORD_CLIENT_ID") or _oauth_env("DISCORD_CLIENT_ID") or str(
-        cfg.get("clientId") or ""
-    ).strip()
-    client_secret = _oauth_env("KIZZEY_DISCORD_CLIENT_SECRET") or _oauth_env("DISCORD_CLIENT_SECRET") or str(
-        cfg.get("clientSecret") or ""
-    ).strip()
-    return client_id, client_secret
-
-
-def oauth_authorize_endpoint() -> str:
-    return _oauth_env("KIZZEY_OAUTH_AUTHORIZE") or "https://discord.com/oauth2/authorize"
-
-
-def oauth_token_endpoint() -> str:
-    return _oauth_env("KIZZEY_OAUTH_TOKEN_URL") or "https://discord.com/api/oauth2/token"
-
-
-def oauth_redirect_uri() -> str:
-    base = _oauth_env("KIZZEY_PUBLIC_URL")
-    if base:
-        return base.rstrip("/") + OAUTH_CALLBACK_PATH
-    host = SERVER_PUBLIC_HOST or f"127.0.0.1:{DEFAULT_PORT}"
-    return f"http://{host}{OAUTH_CALLBACK_PATH}"
-
-
-def public_oauth_config() -> dict:
-    client_id, client_secret = oauth_credentials()
+def _login_headers() -> dict:
     return {
-        "configured": bool(client_id and client_secret),
-        "clientId": client_id,
-        "hasSecret": bool(client_secret),
-        "redirectUri": oauth_redirect_uri(),
-        "scopes": list(OAUTH_SCOPES),
-        "callbackPath": OAUTH_CALLBACK_PATH,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+        "Origin": "https://discord.com",
+        "Referer": LOGIN_SOURCE,
+        "User-Agent": DISCORD_LOGIN_UA,
+        "X-Super-Properties": super_properties(),
+        "X-Discord-Locale": "en-US",
+        "X-Discord-Timezone": "Europe/London",
     }
 
 
-def save_oauth_config(client_id: str, client_secret: str) -> dict:
-    """Store the Discord application credentials. The secret never leaves the server."""
-    assert STORE is not None
-    client_id = str(client_id or "").strip()
-    client_secret = str(client_secret or "").strip()
-    if not client_id and not client_secret:
-        with STORE.lock:
-            STORE.secret["oauth"] = {"clientId": "", "clientSecret": ""}
-        STORE.save()
-        STORE.log("INFO", "Account", "Discord OAuth sign-in was turned off.")
-        return public_oauth_config()
-    if not re.fullmatch(r"\d{15,22}", client_id):
-        raise ValueError("A Discord application Client ID is a 15–22 digit number.")
-    if not client_secret:
-        with STORE.lock:
-            existing = STORE.secret.get("oauth") if isinstance(STORE.secret.get("oauth"), dict) else {}
-            client_secret = str(existing.get("clientSecret") or "").strip()
-        if not client_secret:
-            raise ValueError("Paste the Discord application Client Secret too.")
-    if len(client_secret) > 200 or not re.fullmatch(r"[A-Za-z0-9_.-]{10,200}", client_secret):
-        raise ValueError("That does not look like a Discord application Client Secret.")
-    with STORE.lock:
-        STORE.secret["oauth"] = {"clientId": client_id, "clientSecret": client_secret}
-    STORE.save()
-    STORE.log("INFO", "Account", "Saved Discord OAuth sign-in credentials.")
-    return public_oauth_config()
-
-
-def oauth_start() -> str:
-    """Build the Discord authorize URL with single-use state and PKCE."""
-    client_id, client_secret = oauth_credentials()
-    if not client_id or not client_secret:
-        raise ValueError(
-            "Add a Discord application Client ID and Client Secret in Settings → Discord login first."
-        )
-    verifier = secrets.token_urlsafe(64)
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    state = secrets.token_urlsafe(32)
-    redirect_uri = oauth_redirect_uri()
-    now = time.time()
-    with OAUTH_PENDING_LOCK:
-        for key in [key for key, value in OAUTH_PENDING.items() if now - value["createdAt"] > OAUTH_STATE_TTL]:
-            OAUTH_PENDING.pop(key, None)
-        if len(OAUTH_PENDING) > 32:
-            OAUTH_PENDING.clear()
-        OAUTH_PENDING[state] = {
-            "verifier": verifier,
-            "createdAt": now,
-            "redirectUri": redirect_uri,
-        }
-    params = urllib.parse.urlencode(
-        {
-            "client_id": client_id,
-            "response_type": "code",
-            "redirect_uri": redirect_uri,
-            "scope": " ".join(OAUTH_SCOPES),
-            "state": state,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "prompt": "consent",
-        }
-    )
-    return f"{oauth_authorize_endpoint()}?{params}"
-
-
-def oauth_take_state(state: str) -> dict | None:
-    with OAUTH_PENDING_LOCK:
-        pending = OAUTH_PENDING.pop(str(state or ""), None)
-    if not pending:
-        return None
-    if time.time() - float(pending.get("createdAt") or 0) > OAUTH_STATE_TTL:
-        return None
-    return pending
-
-
-def _oauth_post_form(url: str, fields: dict) -> dict:
-    data = urllib.parse.urlencode(fields).encode()
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "User-Agent": DISCORD_UA,
-        },
-        method="POST",
-    )
+def _login_post(url: str, body: dict, timeout: float = 25) -> dict:
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers=_login_headers(), method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         raw = exc.read()
@@ -5625,156 +5649,143 @@ def _oauth_post_form(url: str, fields: dict) -> dict:
         try:
             info = json.loads(raw)
         except Exception:
+            info = {"message": raw.decode("utf-8", "replace")[:300]}
+        if not isinstance(info, dict):
             info = {}
-        message = str(info.get("error_description") or info.get("error") or f"Discord returned HTTP {exc.code}")
-        raise DiscordError(exc.code, message, info) from None
+        raise DiscordError(exc.code, _login_error_message(exc.code, info), info) from None
     except urllib.error.URLError as exc:
         raise DiscordError(0, f"Could not reach Discord: {exc.reason}") from None
     except TimeoutError:
-        raise DiscordError(0, "Discord took too long to answer.") from None
+        raise DiscordError(0, "Discord took too long to answer. Check your connection and try again.") from None
+    if not raw:
+        return {}
     try:
         payload = json.loads(raw)
     except Exception:
-        raise DiscordError(502, "Discord returned an unreadable OAuth response.") from None
-    if not isinstance(payload, dict) or not payload.get("access_token"):
-        raise DiscordError(502, "Discord did not return an access token.")
-    return payload
+        raise DiscordError(502, "Discord returned an unreadable login response.") from None
+    return payload if isinstance(payload, dict) else {}
 
 
-def oauth_exchange_code(code: str, verifier: str, redirect_uri: str) -> dict:
-    client_id, client_secret = oauth_credentials()
-    if not client_id or not client_secret:
-        raise DiscordError(400, "Discord OAuth sign-in is not configured on this server.")
-    return _oauth_post_form(
-        oauth_token_endpoint(),
+def _login_error_message(status: int, info: dict) -> str:
+    retry_after = info.get("retry_after")
+    if status == 429 or retry_after:
+        try:
+            wait = int(float(retry_after)) if retry_after is not None else 0
+        except Exception:
+            wait = 0
+        wait = wait or 60
+        return f"Discord is rate limiting this sign-in. Wait {wait} seconds and try again."
+    if info.get("captcha_key") or info.get("captcha_sitekey"):
+        return (
+            "Discord wants a captcha for this sign-in, which this app cannot solve. "
+            "Sign in at discord.com in your browser, then paste the token instead."
+        )
+    if status == 401 or "invalid" in str(info.get("message") or "").lower():
+        return "Wrong email/username or password."
+    if info.get("mfa") or info.get("mfa_required"):
+        return "Discord needs your two-factor code."
+    message = str(info.get("message") or "").strip()
+    if message:
+        return message[:220]
+    if status == 400:
+        return "Discord rejected that sign-in. Check the email/username and password."
+    return f"Discord returned HTTP {status}."
+
+
+def discord_password_login(login: str, password: str) -> dict:
+    """Sign in with email/username + password.
+
+    Returns ``{"status": "ok", "token": ...}`` or
+    ``{"status": "mfa", "ticket": ..., "methods": [...]}``.
+    """
+    login = str(login or "").strip()
+    password = str(password or "")
+    if not login:
+        raise DiscordError(400, "Enter your Discord email or username.")
+    if not password:
+        raise DiscordError(400, "Enter your Discord password.")
+    payload = _login_post(
+        DISCORD_LOGIN_API,
         {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "grant_type": "authorization_code",
-            "code": str(code or ""),
-            "redirect_uri": redirect_uri,
-            "code_verifier": verifier,
+            "login": login,
+            "password": password,
+            "undelete": False,
+            "login_source": None,
+            "gift_code_sku_id": None,
+            "captcha_key": None,
         },
     )
+    token = clean_discord_token(payload.get("token"))
+    if token:
+        return {"status": "ok", "token": token}
+    ticket = str(payload.get("ticket") or "")
+    if ticket:
+        methods = payload.get("mfa") if isinstance(payload.get("mfa"), list) else []
+        return {"status": "mfa", "ticket": ticket, "methods": [str(m) for m in methods]}
+    raise DiscordError(502, "Discord did not return a session for that sign-in.")
 
 
-def oauth_refresh_session(refresh_token: str) -> dict:
-    client_id, client_secret = oauth_credentials()
-    if not client_id or not client_secret:
-        raise DiscordError(400, "Discord OAuth sign-in is not configured on this server.")
-    if not refresh_token:
-        raise DiscordError(401, "This Discord sign-in expired. Sign in with Discord again.")
-    return _oauth_post_form(
-        oauth_token_endpoint(),
-        {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "grant_type": "refresh_token",
-            "refresh_token": str(refresh_token),
-        },
-    )
-
-
-def oauth_fetch_identity(access_token: str) -> dict:
-    me = discord_api("/users/@me", f"Bearer {access_token}")
-    if not isinstance(me, dict) or not me.get("id"):
-        raise DiscordError(401, "Discord did not return an account for this sign-in.")
-    return normalize_user(me)
-
-
-def oauth_session_from_tokens(tokens: dict, previous: dict | None = None) -> dict:
-    previous = previous or {}
-    expires_in = tokens.get("expires_in")
-    try:
-        expires_in = int(expires_in)
-    except Exception:
-        expires_in = 0
-    refresh = str(tokens.get("refresh_token") or previous.get("refreshToken") or "")
-    session = {
-        "accessToken": str(tokens.get("access_token") or ""),
-        "refreshToken": refresh,
-        "scope": str(tokens.get("scope") or previous.get("scope") or " ".join(OAUTH_SCOPES)),
-        "tokenType": str(tokens.get("token_type") or "Bearer"),
-        "expiresAt": now_ms() + expires_in * 1000 if expires_in else now_ms() + 3600 * 1000,
-        "linkedAt": previous.get("linkedAt") or now_ms(),
-    }
-    return session
-
-
-def oauth_access_token(account_id: str, force: bool = False) -> str:
-    assert STORE is not None
-    account = STORE.account_by_id(account_id, include_token=True) or {}
-    session = account.get("oauth") if isinstance(account.get("oauth"), dict) else {}
-    access = str(session.get("accessToken") or "")
-    expires_at = float(session.get("expiresAt") or 0)
-    if access and not force and expires_at - 60_000 > now_ms():
-        return access
-    refresh = str(session.get("refreshToken") or "")
-    try:
-        tokens = oauth_refresh_session(refresh)
-    except DiscordError as exc:
-        if exc.status in (400, 401):
-            STORE.mark_oauth_failed(account_id, "Discord sign-in expired. Sign in with Discord again.")
-        raise
-    updated = oauth_session_from_tokens(tokens, session)
-    STORE.update_oauth(account_id, oauth=updated)
-    return updated["accessToken"]
-
-
-def refresh_oauth_account(account_id: str, force: bool = False) -> dict:
-    access = oauth_access_token(account_id, force=force)
-    user = oauth_fetch_identity(access)
-    STORE.update_oauth(account_id, user=user)
-    return user
-
-
-def oauth_complete_sign_in(code: str, state: str) -> dict:
-    """Finish the callback: exchange the code, verify identity, save the account."""
-    assert STORE is not None
-    pending = oauth_take_state(state)
-    if not pending:
-        raise ValueError("That Discord sign-in link expired. Start again.")
+def discord_mfa_login(ticket: str, code: str) -> str:
+    """Finish a login that Discord answered with an MFA ticket."""
+    ticket = str(ticket or "")
+    code = str(code or "").strip().replace(" ", "")
+    if not ticket:
+        raise DiscordError(400, "That two-factor step expired. Sign in again.")
     if not code:
-        raise ValueError("Discord did not return an authorization code.")
-    tokens = oauth_exchange_code(code, pending["verifier"], pending["redirectUri"])
-    user = oauth_fetch_identity(tokens["access_token"])
-    session = oauth_session_from_tokens(tokens)
-    account, created = STORE.upsert_oauth_account(user, session)
-    activate_discord_account(account["id"], user=user, verify=False)
-    STORE.log(
-        "INFO",
-        "Account",
-        f"{'Added' if created else 'Refreshed'} Discord sign-in for {user['displayName']}.",
+        raise DiscordError(400, "Enter the 6-digit code from your authenticator app.")
+    payload = _login_post(
+        DISCORD_MFA_API,
+        {"ticket": ticket, "mfa_type": "totp", "data": code},
     )
-    return {"account": account, "created": created, "user": user}
+    token = clean_discord_token(payload.get("token"))
+    if not token:
+        raise DiscordError(401, "Discord did not accept that two-factor code.")
+    return token
 
 
-def require_gateway_token() -> str:
-    """Return the active user token, or explain why Rich Presence is unavailable."""
+def login_with_password(login: str, password: str) -> dict:
+    """Sign in and save the account. Returns the MFA challenge or the user."""
+    result = discord_password_login(login, password)
+    if result["status"] == "mfa":
+        STORE.log("INFO", "Account", "Discord asked for a two-factor code.")
+        return {"status": "mfa", "ticket": result["ticket"], "methods": result["methods"]}
+    user = sign_in(result["token"])
+    STORE.log("INFO", "Account", f"Signed in with a password as {user['displayName']}.")
+    return {"status": "ok", "user": user, "account": STORE.active_account_id()}
+
+
+def login_with_mfa(ticket: str, code: str) -> dict:
+    token = discord_mfa_login(ticket, code)
+    user = sign_in(token)
+    STORE.log("INFO", "Account", f"Signed in with a password as {user['displayName']}.")
+    return {"status": "ok", "user": user, "account": STORE.active_account_id()}
+
+
+def require_gateway_token(account_id: str = "") -> str:
+    """Return the account's user token, or explain why Rich Presence is unavailable."""
     assert STORE is not None
-    token = STORE.active_token()
+    account_id = str(account_id or "") or STORE.active_account_id()
+    account = STORE.account_by_id(account_id, include_token=True) if account_id else None
+    token = clean_discord_token((account or {}).get("token"))
     if token:
         return token
-    account = STORE.active_account(include_token=True)
-    if account and account.get("oauth"):
-        raise DiscordError(
-            401,
-            "This account signed in with Discord OAuth. Discord does not allow OAuth apps to open "
-            "the gateway, so Rich Presence and mirroring need a user token for this account.",
-        )
     raise DiscordError(401, "Connect Discord before starting a presence.")
 
 
-def stop_presence(kind: str | None = None, quiet: bool = False) -> bool:
+def stop_presence(kind: str | None = None, quiet: bool = False, account_id: str = "") -> bool:
     assert STORE is not None
+    account_id = str(account_id or "") or STORE.active_account_id()
+    if not account_id:
+        return False
     with STORE.lock:
-        active = STORE.state.get("presence", {}).get("active")
-        started = STORE.state.get("presence", {}).get("startedAt")
+        record = (STORE.state.get("presences") or {}).get(account_id)
+        active = (record or {}).get("active")
         if not active:
             return False
         if kind and active.get("kind") != kind and kind != "all":
             return False
-        title = active.get("title") or (STORE.state.get("presence", {}).get("info", {}) or {}).get("title") or ""
+        started = (record or {}).get("startedAt")
+        title = active.get("title") or (((record or {}).get("info") or {}).get("title") or "")
         STORE.add_history(
             active.get("kind") or "custom",
             PRESENCE_KINDS.get(active.get("kind"), "Rich Presence"),
@@ -5782,25 +5793,31 @@ def stop_presence(kind: str | None = None, quiet: bool = False) -> bool:
             int(started or now_ms()),
             now_ms(),
         )
-        STORE.state["presence"] = {
-            "active": None,
-            "startedAt": None,
-            "activities": [],
-            "updatedAt": now_ms(),
-            "info": None,
-        }
+        record.clear()
+        record.update(empty_presence())
+        record["updatedAt"] = now_ms()
         STORE.state["custom"]["status"] = "online"
         if not quiet:
             STORE.log("INFO", "Presence", "Stopped all rich presence.")
-        GATEWAY.send_presence(None)
-        STORE.save()
-    STORE.publish({"type": "presence", "presence": STORE.state["presence"], "gateway": STORE.state["gateway"]})
+        STORE.sync_focused()
+        focused = account_id == STORE.active_account_id()
+        snapshot = copy.deepcopy(STORE.state["presence"]) if focused else None
+        gateway_snapshot = copy.deepcopy(STORE.state["gateway"]) if focused else None
+    GATEWAY.send_presence(None, account_id)
+    STORE.save()
+    # The account may have nothing left running, so its socket can close now.
+    GATEWAY.reconcile()
+    if focused:
+        STORE.publish({"type": "presence", "presence": snapshot, "gateway": gateway_snapshot})
+    else:
+        STORE.broadcast_state()
     return True
 
 
-def start_presence(kind: str, payload: dict | None = None) -> dict:
+def start_presence(kind: str, payload: dict | None = None, account_id: str = "") -> dict:
     assert STORE is not None
-    require_gateway_token()
+    account_id = str(account_id or "") or STORE.active_account_id()
+    require_gateway_token(account_id)
     if kind not in PRESENCE_KINDS:
         raise ValueError("Unknown RPC type.")
     if payload and isinstance(payload, dict):
@@ -5834,22 +5851,28 @@ def start_presence(kind: str, payload: dict | None = None) -> dict:
         first = build_activity(snapshot, kind)
     except Exception as exc:
         raise ValueError(str(exc)) from exc
-    # stop the previous routine, mirroring the Android RoutineController
-    stop_presence(None, quiet=True)
+    # stop the previous routine for this account, mirroring the Android
+    # RoutineController. Other accounts keep running untouched.
+    stop_presence(None, quiet=True, account_id=account_id)
     with STORE.lock:
         started = now_ms()
         info = presence_public(kind, started, [first])
-        STORE.state["presence"] = {
-            "active": {"kind": kind, "title": first.get("name"), "startedAt": started},
-            "startedAt": started,
-            "activities": [first],
-            "info": info,
-            "updatedAt": started,
-            "cycleIndex": 0,
-        }
+        record = presence_record(account_id)
+        record.clear()
+        record.update(
+            {
+                "active": {"kind": kind, "title": first.get("name"), "startedAt": started},
+                "startedAt": started,
+                "activities": [first],
+                "info": info,
+                "updatedAt": started,
+                "cycleIndex": 0,
+            }
+        )
         STORE.state.setdefault("usage", {})[kind] = int(STORE.state.get("usage", {}).get(kind, 0)) + 1
         recent = [kind] + [x for x in STORE.state.get("recent", []) if x != kind]
         STORE.state["recent"] = recent[:8]
+        STORE.sync_focused()
         STORE.log(
             "INFO",
             "Presence",
@@ -5857,21 +5880,28 @@ def start_presence(kind: str, payload: dict | None = None) -> dict:
             + (f" — {info['subtitle']}" if info.get("subtitle") else ""),
         )
         STORE.save()
-    send_current_presence(STORE, force=True)
+        snapshot = copy.deepcopy(record)
+    send_current_presence(STORE, force=True, account_id=account_id)
+    GATEWAY.reconcile()
     STORE.broadcast_state()
-    return STORE.state["presence"]
+    return snapshot
 
 
-def refresh_presence() -> dict | None:
+def refresh_presence(account_id: str = "") -> dict | None:
     assert STORE is not None
+    account_id = str(account_id or "") or STORE.active_account_id()
+    if not account_id:
+        return None
     with STORE.lock:
-        active = STORE.state.get("presence", {}).get("active")
+        active = (presence_record(account_id) or {}).get("active")
     if not active:
         return None
-    send_current_presence(STORE, force=True)
+    send_current_presence(STORE, force=True, account_id=account_id)
+    GATEWAY.reconcile()
     STORE.log("INFO", "Presence", "Presence refreshed.")
     STORE.broadcast_state()
-    return STORE.state.get("presence")
+    with STORE.lock:
+        return copy.deepcopy(presence_record(account_id) or {})
 
 
 # ---------------------------------------------------------------------------
@@ -6158,19 +6188,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routing ----------------------------------------------------------
     def do_GET(self):
-        global SERVER_PUBLIC_HOST
-        SERVER_PUBLIC_HOST = str(self.headers.get("Host") or "").strip()[:120]
         path = self.route_path()
-        if path == "/api/auth/oauth/callback":
-            return self.handle_oauth_callback()
-        if path == "/api/auth/oauth/config":
-            return self.send_json({"ok": True, "oauth": public_oauth_config()})
-        if path == "/api/auth/oauth/start":
-            try:
-                url = oauth_start()
-            except ValueError as exc:
-                return self.send_error_json(str(exc), 400)
-            return self.send_json({"ok": True, "url": url, "oauth": public_oauth_config()})
         if path == "/api/state":
             return self.send_json({"ok": True, "state": public_state()})
         if path == "/api/accounts":
@@ -6238,12 +6256,37 @@ class Handler(BaseHTTPRequestHandler):
         return self.handle_static(path)
 
     def do_POST(self):
-        global SERVER_PUBLIC_HOST
-        SERVER_PUBLIC_HOST = str(self.headers.get("Host") or "").strip()[:120]
         path = self.route_path()
         try:
             if path == "/api/patch":
                 return self.handle_patch()
+            if path == "/api/auth/login":
+                data = self.read_json()
+                login = str(data.get("login") or data.get("email") or data.get("username") or "")
+                password = str(data.get("password") or "")
+                try:
+                    result = login_with_password(login, password)
+                except DiscordError as exc:
+                    STORE.log("WARN", "Account", f"Password sign-in failed: {_scrub(exc.message)[:160]}")
+                    return self.send_error_json(exc.message, exc.status or 401, extra={"captcha": bool(exc.data.get("captcha_key"))})
+                if result.get("status") == "mfa":
+                    return self.send_json(
+                        {
+                            "ok": True,
+                            "status": "mfa",
+                            "ticket": result["ticket"],
+                            "methods": result["methods"],
+                        }
+                    )
+                return self.send_json({"ok": True, "status": "ok", "user": result["user"], "state": public_state()})
+            if path == "/api/auth/mfa":
+                data = self.read_json()
+                try:
+                    result = login_with_mfa(str(data.get("ticket") or ""), str(data.get("code") or ""))
+                except DiscordError as exc:
+                    STORE.log("WARN", "Account", f"Two-factor sign-in failed: {_scrub(exc.message)[:160]}")
+                    return self.send_error_json(exc.message, exc.status or 401)
+                return self.send_json({"ok": True, "status": "ok", "user": result["user"], "state": public_state()})
             if path == "/api/auth/token":
                 data = self.read_json()
                 token = str(data.get("token") or "")
@@ -6295,34 +6338,24 @@ class Handler(BaseHTTPRequestHandler):
                 if str(data.get("confirm") or "") != "REMOVE ALL":
                     return self.send_error_json("Type REMOVE ALL to clear every saved account.", 400)
                 stop_presence(None, quiet=True)
-                GATEWAY.stop()
+                GATEWAY.stop_all()
                 purge_mirror_webhooks(forget_on_failure=True)
                 count = STORE.remove_all_accounts()
                 with STORE.lock:
-                    STORE.state["gateway"].update(
-                        {"connected": False, "state": "offline", "error": "", "latency": None, "tokenSet": False}
-                    )
+                    STORE.state["presences"] = {}
+                    STORE.state["gateways"] = {}
+                    STORE.sync_focused()
                     STORE.save()
                 STORE.log("INFO", "Account", f"Removed all {count} saved Discord account(s).")
                 MIRROR.kick()
                 STORE.broadcast_state()
                 return self.send_json({"ok": True, "count": count, "state": public_state()})
             if path == "/api/account/refresh":
-                token = STORE.active_token()
                 active_id = STORE.active_account_id()
                 if not active_id:
                     return self.send_error_json("Not signed in.", 401)
-                if not token:
-                    try:
-                        me = refresh_oauth_account(active_id, force=True)
-                    except DiscordError as exc:
-                        STORE.broadcast_state()
-                        return self.send_error_json(exc.message, exc.status or 401)
-                    except ValueError as exc:
-                        return self.send_error_json(str(exc), 401)
-                    STORE.broadcast_state()
-                    return self.send_json({"ok": True, "user": me, "state": public_state()})
                 try:
+                    token = require_gateway_token(active_id)
                     me = _validated_account_user(token, active_id)
                 except DiscordError as exc:
                     STORE.broadcast_state()
@@ -6331,23 +6364,17 @@ class Handler(BaseHTTPRequestHandler):
                 STORE.broadcast_state()
                 return self.send_json({"ok": True, "user": me, "state": public_state()})
             if path == "/api/gateway/reconnect":
+                active_id = STORE.active_account_id()
                 try:
-                    token = require_gateway_token()
+                    require_gateway_token(active_id)
                 except DiscordError as exc:
                     return self.send_error_json(exc.message, exc.status or 401)
-                GATEWAY.start(token)
+                # Restart just this account's socket; other accounts stay online.
+                GATEWAY.stop(active_id)
+                GATEWAY.ensure(active_id)
+                GATEWAY.reconcile()
                 STORE.log("INFO", "Gateway", "Connection restart requested from the web UI.")
                 return self.send_json({"ok": True, "state": public_state()})
-            if path == "/api/auth/oauth/config":
-                data = self.read_json()
-                try:
-                    oauth = save_oauth_config(
-                        str(data.get("clientId") or ""),
-                        str(data.get("clientSecret") or ""),
-                    )
-                except ValueError as exc:
-                    return self.send_error_json(str(exc), 400)
-                return self.send_json({"ok": True, "oauth": oauth, "state": public_state()})
             if path == "/api/mirror/settings":
                 data = self.read_json()
                 mirror = set_mirror_settings(data)
@@ -6600,25 +6627,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-
-    def handle_oauth_callback(self):
-        query = self.query()
-        if query.get("error"):
-            message = query.get("error_description") or query.get("error") or "Discord sign-in was cancelled."
-            STORE.log("WARN", "Account", f"Discord OAuth sign-in was cancelled: {_scrub(message)[:160]}")
-            return self.redirect("/?oauth=error&message=" + urllib.parse.quote(_scrub(message)[:180]))
-        try:
-            oauth_complete_sign_in(query.get("code", ""), query.get("state", ""))
-        except (DiscordError, ValueError) as exc:
-            message = exc.message if isinstance(exc, DiscordError) else str(exc)
-            STORE.log("WARN", "Account", f"Discord OAuth sign-in failed: {_scrub(message)[:200]}")
-            return self.redirect("/?oauth=error&message=" + urllib.parse.quote(_scrub(message)[:180]))
-        except Exception as exc:
-            message = _scrub(str(exc))[:200] or "Unexpected sign-in error."
-            STORE.log("WARN", "Account", f"Discord OAuth sign-in failed: {message}")
-            return self.redirect("/?oauth=error&message=" + urllib.parse.quote(message[:180]))
-        STORE.broadcast_state()
-        return self.redirect("/?oauth=success#/accounts")
 
     def handle_events(self):
         q = STORE.subscribe() if STORE else None
@@ -7210,18 +7218,7 @@ def main() -> int:
     parser.add_argument("--host", default=os.environ.get("KIZZEY_HOST", "0.0.0.0"), help="Bind address (default 0.0.0.0)")
     parser.add_argument("--port", type=int, default=int(os.environ.get("KIZZEY_PORT", DEFAULT_PORT)), help="Port (default 8420)")
     parser.add_argument("--no-gateway", action="store_true", help="Do not auto-connect to Discord on startup")
-    parser.add_argument("--discord-client-id", default="", help="Discord application Client ID for OAuth sign-in")
-    parser.add_argument(
-        "--discord-client-secret",
-        default="",
-        help="Discord application Client Secret for OAuth sign-in",
-    )
     args = parser.parse_args()
-
-    if args.discord_client_id:
-        os.environ["KIZZEY_DISCORD_CLIENT_ID"] = args.discord_client_id.strip()
-    if args.discord_client_secret:
-        os.environ["KIZZEY_DISCORD_CLIENT_SECRET"] = args.discord_client_secret.strip()
 
     STORE = Store()
     STORE.log("INFO", "Server", f"Kizzey Web {VERSION} starting on {args.host}:{args.port}.")
@@ -7232,15 +7229,16 @@ def main() -> int:
             [row for row in accounts if clean_discord_token(row.get("token"))],
             key=lambda row: 0 if row.get("id") == active_id else 1,
         )
-        restored = False
+        focused = False
         for account in candidates:
+            account_id = str(account.get("id") or "")
             token = clean_discord_token(account.get("token"))
             try:
                 me = validate_token(token)
             except DiscordError as exc:
                 if exc.status == 401:
                     STORE.mark_account_auth_failed(
-                        account.get("id", ""), "Discord rejected this saved token. Add a fresh token."
+                        account_id, "Discord rejected this saved token. Add a fresh token."
                     )
                     STORE.log(
                         "WARN",
@@ -7249,53 +7247,31 @@ def main() -> int:
                     )
                     continue
                 STORE.log("WARN", "Account", f"Saved Discord session could not be verified: {exc.message}")
-                STORE.activate_account(account.get("id", ""))
-                if STORE.state.get("settings", {}).get("autoStart", True):
-                    GATEWAY.start(token)
-                restored = True
+                STORE.activate_account(account_id)
+                focused = True
                 break
             except Exception as exc:
                 STORE.log("WARN", "Account", f"Saved Discord session could not be verified: {_scrub(exc)}")
-                STORE.activate_account(account.get("id", ""))
-                if STORE.state.get("settings", {}).get("autoStart", True):
-                    GATEWAY.start(token)
-                restored = True
+                STORE.activate_account(account_id)
+                focused = True
                 break
-            STORE.activate_account(account.get("id", ""), user=me)
+            STORE.activate_account(account_id, user=me)
             STORE.log("INFO", "Account", f"Restored Discord session for {me['displayName']}.")
-            if STORE.state.get("settings", {}).get("autoStart", True):
-                GATEWAY.start(token)
-            restored = True
+            focused = True
             break
-        if not restored and candidates:
+        if not focused and candidates:
             with STORE.lock:
                 STORE.secret["token"] = ""
                 STORE.secret["tokenSetAt"] = None
                 STORE.state["account"] = None
-                STORE.state["gateway"].update(
-                    {
-                        "tokenSet": False,
-                        "error": "Every saved Discord token was rejected. Add a fresh token in Discord accounts.",
-                    }
+                STORE.sync_focused()
+                STORE.state["gateway"]["error"] = (
+                    "Every saved Discord token was rejected. Add a fresh token in Discord accounts."
                 )
             STORE.save()
-        if not restored and not candidates:
-            oauth_account = next(
-                (row for row in accounts if row.get("oauth") and row.get("user")),
-                None,
-            )
-            if oauth_account:
-                STORE.activate_account(str(oauth_account.get("id") or ""))
-                display = (oauth_account.get("user") or {}).get("displayName") or "Discord account"
-                STORE.log(
-                    "INFO",
-                    "Account",
-                    f"Restored OAuth identity for {display}. Add a user token for Rich Presence.",
-                )
-    if STORE.state.get("presence", {}).get("active"):
-        # A previous server run did not stop its presence; start clean.
-        STORE.state["presence"] = {"active": None, "startedAt": None, "activities": [], "updatedAt": now_ms()}
-        STORE.save()
+    # Nothing is running yet: every per-account presence starts empty, so no
+    # gateway socket opens until an account actually toggles something on.
+    GATEWAY.reconcile()
     TICKER.start()
     MIRROR.start()
 
@@ -7313,8 +7289,7 @@ def main() -> int:
     finally:
         MIRROR.stop()
         try:
-            GATEWAY.send_presence(None)
-            GATEWAY.stop()
+            GATEWAY.stop_all()
         except Exception:
             pass
         httpd.server_close()

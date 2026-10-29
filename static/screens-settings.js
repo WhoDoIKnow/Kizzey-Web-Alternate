@@ -73,10 +73,9 @@
       const mirror = K.get('mirror', {});
       const mirrorRules = Array.isArray(mirror?.rules) ? mirror.rules : [];
       const enabledRules = mirrorRules.filter(rule => rule?.enabled).length;
-      const oauth = K.get('auth.oauth', {}) || {};
       const discordGroup = K.settingGroup('Discord', [
         tappable('Discord accounts', accounts.length ? `${accounts.length} saved · ${account ? h(account.displayName) : 'no active account'}` : 'Add a token and switch identities safely', { route: 'accounts', icon: 'users' }),
-        tappable('Discord login', oauth.configured ? 'One-tap sign-in is ready · own Discord app' : 'Set up one-tap sign-in with Discord OAuth', { route: 'discord-login', icon: 'shield-check' }),
+        tappable('Discord login', 'Email and password, straight to Discord — or paste a token', { action: 'account-add', icon: 'shield-check' }),
         tappable('Message mirror', mirrorRules.length ? `${enabledRules} of ${mirrorRules.length} relays enabled${mirror.enabled ? '' : ' · auto paused'}` : 'Forward new messages between channels', { route: 'mirror', icon: 'repeat' }),
       ].join(''));
       const pieces = [
@@ -130,10 +129,10 @@
            ${toggle('Show update rail', 'Show the release card on Home.', 'settings.showUpdateRail', 'refresh')}`
         )}
         ${group('Startup and background',
-          `${toggle('Start gateway with the server', 'Reconnect to Discord when the Python server starts with a saved token.', 'settings.autoStart', 'play')}
-           ${toggle('Keep the gateway alive', 'Retry the socket while the server process is running.', 'settings.keepAlive', 'activity')}
+          `${toggle('Keep the gateway alive', 'Retry the socket while the server process is running.', 'settings.keepAlive', 'activity')}
            ${toggle('Reconnect notices', 'Show a toast while the server retries the Discord gateway after a drop.', 'settings.reconnect', 'refresh')}
-           ${toggle('Close to tray', 'Desktop-app preference; kept in server state for parity.', 'settings.closeToTray', 'monitor')}`
+           ${toggle('Close to tray', 'Desktop-app preference; kept in server state for parity.', 'settings.closeToTray', 'monitor')}
+           <div class="field-hint" style="padding:10px 16px 16px">Gateways open only for accounts that have a presence running or take part in an enabled mirror rule. Switching accounts never closes a presence that is already running.</div>`
         )}
         ${group('Privacy and diagnostics',
           `${toggle('Local analytics', 'Keep local feature adoption counters; nothing is sent to Kizzey.', 'settings.analytics', 'bar-chart')}
@@ -151,150 +150,6 @@
       if (path.startsWith('settings.')) K.applyTheme();
     },
   };
-
-  // ---------------------------------------------------------------------
-  // Discord OAuth login
-  // ---------------------------------------------------------------------
-  K.screens['discord-login'] = {
-    title: 'Discord login',
-    render() {
-      const oauth = K.get('auth.oauth', {}) || {};
-      const configured = !!oauth.configured;
-      const account = K.get('account');
-      const identity = account
-        ? infoRow(
-            'shield-check',
-            `Signed in as ${h(account.displayName)}`,
-            'This identity comes from Discord. Presence, chat and mirroring still require a user token.',
-            `<span class="badge ${K.hasUserToken() ? 'good' : 'plain'}">${K.hasUserToken() ? 'Token stored' : 'Identity only'}</span>`
-          )
-        : infoRow('user', 'No Discord identity yet', 'Sign in to confirm your account without pasting anything.');
-      const saveLabel = oauth.hasSecret ? 'Replace secret' : 'Save credentials';
-      const redirect = String(oauth.redirectUri || '');
-      const insecureRedirect =
-        redirect.startsWith('http://') && !/^http:\/\/(localhost|127\.0\.0\.1)([:/]|$)/.test(redirect);
-      return page(
-        'Discord login',
-        'One tap to prove who you are, with your own Discord application.',
-        `<div class="card soft" style="margin-bottom:16px">
-          <div class="card-row">
-            <div class="feature-icon" style="width:46px;height:46px;border-radius:15px;background:var(--surface-2);color:var(--primary)">${K.icon('discord')}</div>
-            <div style="flex:1;min-width:0">
-              <div class="card-title">${configured ? 'One-tap sign-in is ready' : 'One-tap sign-in is off'}</div>
-              <div class="card-sub">${configured ? `Client ID ${h(oauth.clientId)}` : 'Add a Client ID and secret to turn it on'}</div>
-            </div>
-            <span class="badge ${configured ? 'good' : 'plain'}">${configured ? 'On' : 'Off'}</span>
-          </div>
-          <div class="quick-grid-2" style="margin-top:14px">
-            <button class="btn btn-primary btn-sm" data-action="oauth-signin" ${configured ? '' : 'disabled'}>${K.icon('discord', 'sm')}Sign in with Discord</button>
-            <button class="btn btn-ghost btn-sm" data-action="oauth-copy-redirect">${K.icon('copy', 'sm')}Copy redirect URI</button>
-          </div>
-          <div class="field-hint mt-12">Redirect URI: <span class="mono-copy">${h(oauth.redirectUri || 'Not available yet')}</span></div>
-          ${insecureRedirect ? `<div class="field-hint" style="color:var(--warn)">Discord only accepts HTTPS redirect URIs, or plain HTTP on localhost. Open Kizzey at <span class="mono-copy">http://127.0.0.1:8420</span>, or set <span class="mono-copy">KIZZEY_PUBLIC_URL</span> to a public HTTPS origin.</div>` : ''}
-        </div>
-        ${K.settingGroup('Application credentials', `
-          ${identity}
-          ${K.field({
-            id: 'oauth-client-id',
-            label: 'Client ID',
-            value: oauth.clientId || '',
-            placeholder: '17-digit application ID',
-            hint: 'Discord Developer Portal → your application → OAuth2.',
-            attrs: 'inputmode="numeric" spellcheck="false" autocomplete="off"',
-          })}
-          ${K.field({
-            id: 'oauth-client-secret',
-            label: 'Client secret',
-            type: 'password',
-            value: '',
-            placeholder: oauth.hasSecret ? 'Saved — leave blank to keep it' : 'Paste the client secret',
-            hint: 'Stored only in data/secret.json. It is never returned to the browser or written to exports.',
-            suffix: `<button class="icon-btn small" data-action="oauth-toggle-secret" aria-label="Show secret">${K.icon('eye', 'sm')}</button>`,
-            attrs: 'spellcheck="false" autocomplete="new-password"',
-          })}
-          <div id="oauth-error" class="field-error hidden"></div>
-          <div class="quick-grid-2" style="padding:12px 16px 16px">
-            <button class="btn btn-primary btn-sm" data-action="oauth-save">${K.icon('check', 'sm')}${saveLabel}</button>
-            <button class="btn btn-ghost btn-sm" data-action="oauth-clear" ${configured || oauth.hasSecret ? '' : 'disabled'}>${K.icon('shield-off', 'sm')}Turn off</button>
-          </div>
-        `)}
-        ${K.settingGroup('Set it up once', `
-          <div class="login-steps" style="padding:16px">
-            <span><b class="step-num">1</b><span>Open <a href="https://discord.com/developers/applications" target="_blank" rel="noopener">discord.com/developers/applications</a> and create an application (any name).</span></span>
-            <span><b class="step-num">2</b><span>Under <b>OAuth2 → Redirects</b>, add exactly <span class="mono-copy">${h(oauth.redirectUri || '')}</span>.</span></span>
-            <span><b class="step-num">3</b><span>Copy the <b>Client ID</b> and <b>Client Secret</b> from the same page into the fields above.</span></span>
-            <span><b class="step-num">4</b><span>Sign in with Discord. Kizzey stores the identity and keeps the tokens server-side.</span></span>
-          </div>
-        `)}
-        <div class="danger-zone">
-          <div class="dz-title">What Discord OAuth can and cannot do</div>
-          <p>An OAuth2 sign-in confirms who you are. Discord does not let OAuth applications open a gateway session, read your messages or send Rich Presence, so those features still need a user token. OAuth tokens are stored in <span class="mono-copy">data/secret.json</span>, refreshed automatically, and never appear in the browser, logs or backups.</p>
-        </div>
-        <div class="field-hint" style="padding:14px 5px">Environment variables <span class="mono-copy">KIZZEY_DISCORD_CLIENT_ID</span> and <span class="mono-copy">KIZZEY_DISCORD_CLIENT_SECRET</span> override anything saved here.</div>`
-      );
-    },
-  };
-
-  K.actions['oauth-signin'] = async function () {
-    try {
-      const data = await K.api('/api/auth/oauth/start');
-      if (!data.url) throw new Error('The server did not return a Discord sign-in link.');
-      window.location.assign(data.url);
-    } catch (error) {
-      showOauthError(error.message);
-    }
-  };
-
-  K.actions['oauth-copy-redirect'] = async () => {
-    const uri = K.oauthRedirectUri();
-    if (!uri) { K.toast('No redirect URI yet', 'Load this page from the address Discord will use.', 'error'); return; }
-    await K.copy(uri, 'Redirect URI copied');
-  };
-
-  K.actions['oauth-toggle-secret'] = () => {
-    const input = document.querySelector('#oauth-client-secret');
-    if (input) input.type = input.type === 'password' ? 'text' : 'password';
-  };
-
-  K.actions['oauth-save'] = async function () {
-    const clientId = document.querySelector('#oauth-client-id')?.value.trim() || '';
-    const clientSecret = document.querySelector('#oauth-client-secret')?.value.trim() || '';
-    if (!clientId) { showOauthError('Paste the Discord application Client ID first.'); return; }
-    try {
-      const data = await K.api('/api/auth/oauth/config', { method: 'POST', body: { clientId, clientSecret } });
-      if (data.state) K.receiveState(data.state);
-      K.toast('Discord login saved', 'One-tap sign-in is ready on this server.', 'ok');
-      K.render();
-    } catch (error) {
-      showOauthError(error.message);
-    }
-  };
-
-  K.actions['oauth-clear'] = () => {
-    K.confirm({
-      title: 'Turn off Discord login?',
-      subtitle: 'The Client ID and secret are deleted from this server. Saved accounts and identity metadata stay.',
-      confirm: 'Turn off',
-      danger: true,
-      onConfirm: async () => {
-        try {
-          const data = await K.api('/api/auth/oauth/config', { method: 'POST', body: { clientId: '', clientSecret: '' } });
-          if (data.state) K.receiveState(data.state);
-          K.toast('Discord login turned off', '', 'ok');
-          K.render();
-        } catch (error) {
-          K.toast('Could not turn it off', error.message, 'error');
-        }
-      },
-    });
-  };
-
-  function showOauthError(message) {
-    const box = document.querySelector('#oauth-error');
-    if (!box) { K.toast('Discord login', message, 'error'); return; }
-    box.textContent = message;
-    box.classList.remove('hidden');
-  }
 
   K.actions['settings-reconnect-gateway'] = async () => {
     if (!K.isSignedIn()) { K.toast('Connect Discord first', '', 'error'); return; }
@@ -932,7 +787,7 @@
         ${K.settingGroup('Environment', rows.map(([label, value]) => infoRow('terminal', label, `<span style="overflow-wrap:anywhere">${h(String(value ?? ''))}</span>`, '')).join(''))}
         ${K.settingGroup('Actions', tappable('Copy diagnostics', 'Version, gateway, viewport, network and state size.', { action: 'debug-copy', icon: 'copy' }) + tappable('Download state JSON', 'Public state only; the Discord token is excluded.', { action: 'debug-download', icon: 'download' }) + tappable('Refresh state from server', 'Fetch /api/state and re-render the current screen.', { action: 'debug-refresh', icon: 'refresh' }) + tappable('Open server logs', 'Inspect the latest gateway and presence events.', { route: 'logs', icon: 'bug' }))}
         ${K.settingGroup('Recovery', tappable('Replay onboarding', 'Show the welcome flow again without touching your data.', { action: 'debug-onboarding', icon: 'sparkles' }) + tappable('Clear browser preferences', 'Remove selected room, collapsed cards and local tab notices. Server state stays intact.', { action: 'debug-clear-local', icon: 'trash' }) + tappable('Reconnect gateway', 'Close and reopen the Discord WebSocket.', { action: 'settings-reconnect-gateway', icon: 'wifi' }))}
-        <div class="danger-zone"><div class="dz-title">Do not expose this server</div><p>The API allows anyone who can reach it to control the saved Discord session, send chat messages and scan/delete your Discord messages. There is no login on the HTTP server — Discord OAuth verifies an identity but does not lock the API. Keep it on a trusted network.</p></div>
+        <div class="danger-zone"><div class="dz-title">Keep it on this machine</div><p>The API allows anyone who can reach it to control the saved Discord sessions, send chat messages and scan or delete your Discord messages. There is no HTTP login in front of the API, and signing in through Discord does not lock it. Run Kizzey on your own computer and leave the port closed to the internet.</p></div>
         <div class="field-hint" style="padding:16px 5px">Debug output never includes the Discord token. Public state strips it on the server before it reaches the browser.</div>
         <div style="height:20px"></div>`);
     },

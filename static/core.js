@@ -254,12 +254,22 @@
   K.discordStatus = function () {
     const g = K.get('gateway', {});
     if (!K.isSignedIn()) return { key: 'signedout', text: 'Not connected', color: 'off' };
-    if (!K.hasUserToken()) return { key: 'oauth', text: 'OAuth identity', color: 'warn' };
+    if (!K.hasUserToken()) return { key: 'notoken', text: 'Token missing', color: 'warn' };
     if (g.connected) return { key: 'connected', text: 'Discord connected', color: 'good' };
     if (g.state === 'connecting') return { key: 'connecting', text: 'Connecting…', color: 'warn' };
     if (g.state === 'reconnecting') return { key: 'reconnecting', text: 'Reconnecting…', color: 'warn' };
     if (g.error) return { key: 'error', text: 'Connection error', color: 'warn' };
     return { key: 'online', text: 'Signed in', color: 'off' };
+  };
+  K.accountGateway = function (accountId) {
+    const id = String(accountId || '');
+    if (!id) return K.get('gateway', {}) || {};
+    const all = K.get('gateways', {}) || {};
+    return all[id] || {};
+  };
+  K.accountRunning = function (accountId) {
+    const g = K.accountGateway(accountId);
+    return !!g.connected || g.state === 'connecting' || g.state === 'reconnecting';
   };
 
   // ---------------------------------------------------------------------
