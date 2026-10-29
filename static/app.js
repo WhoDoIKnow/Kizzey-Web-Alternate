@@ -103,7 +103,12 @@
   // ---------------------------------------------------------------------
   async function init() {
     if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-      navigator.serviceWorker.register('/sw.js').catch(() => {});
+      // updateViaCache avoids the browser reusing an HTTP-cached copy of the
+      // worker script, so a new build is always noticed on the next load.
+      navigator.serviceWorker
+        .register('/sw.js', { updateViaCache: 'none' })
+        .then(reg => reg.update())
+        .catch(() => {});
     }
     try {
       const data = await K.api('/api/state');
