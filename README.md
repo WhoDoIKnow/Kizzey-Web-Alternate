@@ -11,12 +11,16 @@ The Discord token lives on the server. The browser never receives it, not even a
 > computer you start `server.py` on. As long as the code came from this repository, it does nothing
 > outside that machine: the only outbound requests are the Discord calls you ask for, and the token
 > is written only to your own `data/secret.json`. Nothing phones home, and nothing here can reach
-> into another install or take over an account.
+> into another install or take over an account. Reading every line you would run takes a few minutes
+> — there is no third-party dependency, no obfuscation, no bundled binary, and nothing that can take
+> a token off this disk and send it elsewhere.
 
-Sign in the way you would on `discord.com`: type your email or username and password into Kizzey and
-the server performs the same login request the website does, including the two-factor step when
-Discord asks for it. A **Use a token instead** fallback stays available for a token copied out of a
-desktop browser. Only the resulting session token is kept, server-side, in `data/secret.json`.
+Sign in the way you would on `discord.com`: click **Sign in with Discord** and a real Discord web
+sign-in opens in a browser window on this computer. Sign in there exactly as you normally would —
+password, two-factor, captcha, passkey, whatever Discord asks for — and Kizzey reads the session
+Discord just created, saves the token in `data/secret.json`, and closes the window. Nothing is typed
+into Kizzey and nothing is sent anywhere except to Discord itself. Email/password and token entry
+remain available as fallbacks.
 
 Accounts are not switched one at a time. Every saved account that has something switched on — a live
 Rich Presence or a role in a message mirror rule — keeps its own gateway open alongside the others,
@@ -83,12 +87,30 @@ instead of discarding them.
 
 ## Signing in
 
+### Sign in with Discord
+
+This is the normal Discord web sign-in, not a lookalike form. The button starts a browser on this
+machine — Chrome, Edge, Brave or Chromium, whichever is already installed — on
+`https://discord.com/login`, using a throwaway profile in `data/tmp/`. That window is Discord's own
+page: password, two-factor, captcha, "verify it's you" and passkeys all work, because Discord is
+handling them.
+
+When the sign-in lands and Discord stores its session token in that profile, Kizzey reads the token
+over the browser's local debugging channel, verifies it against Discord, saves it to
+`data/secret.json`, closes the window and deletes the temporary profile. The window is separate from
+your everyday browser: it carries no cookies from it, writes nothing to it, and signing out there
+does not affect it.
+
+The token never leaves this machine and is never sent to the page. If the window cannot open (no
+Chromium-family browser installed), or you would rather not use it, both fallbacks below still work.
+
 ### Email or username and password
 
-The sign-in screen works the way `discord.com` does: type the email or username and password for the
-account, and Kizzey performs the same login request the website performs, from the server. Discord
-answers with a session token, or with a two-factor challenge — when it asks for a code, Kizzey shows
-the two-factor field and posts the current code from your authenticator app back to Discord.
+The fallback sign-in screen works the way `discord.com` does: type the email or username and password
+for the account, and Kizzey performs the same login request the website performs, from the server.
+Discord answers with a session token, or with a two-factor challenge — when it asks for a code,
+Kizzey shows the two-factor field and posts the current code from your authenticator app back to
+Discord.
 
 The password is used only for that one login request, is never logged and is never written anywhere;
 only the session token Discord returns is kept, in `data/secret.json`. If Discord answers with a

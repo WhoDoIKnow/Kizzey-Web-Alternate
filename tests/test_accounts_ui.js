@@ -443,6 +443,9 @@ function accountsState(overrides = {}) {
   check(panel.includes('Email or username'), 'login panel labels the credential field');
   check(panel.includes('runs on your own machine only') && panel.includes('never leaves your disk'), 'login panel states the code only ever runs on this machine');
   check(!/oauth/i.test(panel), 'login panel has no OAuth wording');
+  check(panel.includes('data-action="login-browser"') && panel.includes('Sign in with Discord'), 'login panel leads with the real Discord web sign-in');
+  check(panel.includes('data-browser-block="sheet"') && panel.includes('data-action="login-browser-cancel"'), 'login panel can cancel a sign-in window');
+  check(panel.includes('data-password-block="sheet"') && panel.includes('data-action="login-password-toggle"'), 'login panel tucks the password form behind a reveal');
 
   calls.sheets.length = 0;
   state = accountsState();

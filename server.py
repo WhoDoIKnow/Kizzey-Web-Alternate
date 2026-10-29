@@ -5612,15 +5612,27 @@ def sign_out() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Discord login (email/username + password)
+# Discord login
 #
-# This mirrors what discord.com itself posts when you sign in: the credentials
-# go straight to Discord from this machine, and only the resulting user token is
-# kept. Discord may answer with a captcha demand or an MFA ticket; both are
-# surfaced as normal errors instead of being swallowed.
+# The default path opens Discord's own web sign-in in a throwaway browser
+# window on this machine, lets the operator sign in normally, then reads the
+# session token Discord itself stored there. Nothing is typed into Kizzey.
+#
+# The email/username + password path is the fallback: it mirrors what
+# discord.com posts when you sign in, so the credentials go straight to Discord
+# from this machine and only the resulting user token is kept. Discord may
+# answer with a captcha demand or an MFA ticket; both are surfaced as normal
+# errors instead of being swallowed.
 # ---------------------------------------------------------------------------
 
 LOGIN_SOURCE = "https://discord.com/login"
+
+# Browser sign-in runs one window at a time; /api/auth/browser/cancel flips the
+# abort event and the waiting request closes the window and cleans up.
+BROWSER_LOGIN_URL = "https://discord.com/login"
+BROWSER_LOGIN_TIMEOUT = 300
+BROWSER_LOGIN_LOCK = threading.Lock()
+BROWSER_LOGIN_ABORT = threading.Event()
 
 
 def _login_headers() -> dict:
@@ -5762,6 +5774,587 @@ def login_with_mfa(ticket: str, code: str) -> dict:
     user = sign_in(token)
     STORE.log("INFO", "Account", f"Signed in with a password as {user['displayName']}.")
     return {"status": "ok", "user": user, "account": STORE.active_account_id()}
+
+
+# -- real browser sign-in ---------------------------------------------------
+#
+# Discord's login page is a normal web app: it stores the session token in the
+# page's own localStorage (and in the client's user store) after the operator
+# signs in. Chrome and Edge can both be driven over the DevTools protocol, which
+# lets us open discord.com/login in a throwaway profile, wait for the operator
+# to finish, and read that token back out of the page they just signed in on.
+#
+# Everything below is standard library only: a tiny RFC 6455 client for the
+# DevTools socket, a couple of HTTP calls to the DevTools endpoint, and the
+# browser launch itself. The profile is temporary and deleted afterwards, so no
+# Discord session outlives the sign-in.
+
+_BROWSER_LOGIN_JS = r"""
+(async () => {
+  const pattern = /^[\w-]{20,}(\.[\w-]{5,}){1,3}$/;
+  const looks = (value) => typeof value === 'string' && pattern.test(value.trim());
+  const unwrap = (value) => {
+    if (typeof value !== 'string') return '';
+    let text = value.trim();
+    if (!text) return '';
+    if (text.charAt(0) === '"') {
+      try { text = JSON.parse(text); } catch (err) { return ''; }
+    }
+    if (typeof text !== 'string') return '';
+    text = text.trim().replace(/^"|"$/g, '');
+    return looks(text) ? text : '';
+  };
+  try {
+    const stored = unwrap(localStorage.getItem('token'));
+    if (stored) return stored;
+  } catch (err) {}
+  try {
+    const chunks = window.webpackChunkdiscord_app;
+    if (chunks && typeof chunks.push === 'function') {
+      let found = '';
+      chunks.push([[Symbol()], {}, (req) => {
+        try {
+          const cache = req && req.c;
+          if (!cache) return;
+          const keys = Object.keys(cache);
+          for (let i = 0; i < keys.length; i += 1) {
+            const mod = cache[keys[i]] && cache[keys[i]].exports;
+            if (!mod) continue;
+            const candidates = [mod, mod.default, mod.Z, mod.ZP];
+            for (let j = 0; j < candidates.length; j += 1) {
+              const store = candidates[j];
+              try {
+                if (store && typeof store.getToken === 'function') {
+                  const token = unwrap(store.getToken());
+                  if (token) { found = token; return; }
+                }
+              } catch (err) {}
+            }
+          }
+        } catch (err) {}
+      }]);
+      chunks.pop();
+      if (found) return found;
+    }
+  } catch (err) {}
+  try {
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      let value = '';
+      try { value = localStorage.getItem(key); } catch (err) { continue; }
+      const direct = unwrap(value);
+      if (direct) return direct;
+      if (!value || value.length > 6000) continue;
+      try {
+        const parsed = JSON.parse(value);
+        if (typeof parsed === 'string' && looks(parsed.trim())) return parsed.trim();
+        if (parsed && typeof parsed === 'object') {
+          const fields = Object.keys(parsed);
+          for (let j = 0; j < fields.length; j += 1) {
+            const field = parsed[fields[j]];
+            if (typeof field === 'string' && looks(field.trim())) return field.trim();
+          }
+        }
+      } catch (err) {}
+    }
+  } catch (err) {}
+  return '';
+})()
+"""
+
+
+class _WSTimeout(Exception):
+    """The DevTools socket did not answer in time."""
+
+
+class _WSClosed(Exception):
+    """The DevTools socket closed underneath us."""
+
+
+class _WSClient:
+    """Just enough RFC 6455 to hold a conversation with Chrome's DevTools port."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.buf = bytearray()
+        self.closed = False
+
+    @classmethod
+    def connect(cls, url: str, timeout: float = 10) -> "_WSClient":
+        parsed = urllib.parse.urlparse(str(url or ""))
+        if parsed.scheme not in ("ws", "http"):
+            raise OSError(f"Unsupported DevTools URL scheme: {parsed.scheme or 'none'}")
+        host = parsed.hostname or "127.0.0.1"
+        port = int(parsed.port or 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(timeout)
+        client = cls(sock)
+        try:
+            client._handshake(host, port, path)
+        except Exception:
+            client.close()
+            raise
+        return client
+
+    def _handshake(self, host: str, port: int, path: str) -> None:
+        key = base64.b64encode(os.urandom(16)).decode()
+        request = "\r\n".join(
+            [
+                f"GET {path} HTTP/1.1",
+                f"Host: {host}:{port}",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Key: {key}",
+                "Sec-WebSocket-Version: 13",
+                "",
+                "",
+            ]
+        )
+        try:
+            self.sock.sendall(request.encode())
+        except OSError as exc:
+            raise OSError(f"Could not reach the DevTools socket: {exc}") from None
+        status = self._read_line()
+        parts = status.split(" ", 2)
+        if len(parts) < 2 or parts[1] != "101":
+            raise OSError(f"DevTools refused the WebSocket upgrade: {status[:120]}")
+        while True:
+            line = self._read_line()
+            if not line:
+                break
+
+    def _fill(self) -> None:
+        try:
+            chunk = self.sock.recv(65536)
+        except socket.timeout:
+            raise _WSTimeout("DevTools went quiet") from None
+        except OSError as exc:
+            raise _WSClosed(str(exc)) from None
+        if not chunk:
+            raise _WSClosed("DevTools closed the socket")
+        self.buf.extend(chunk)
+
+    def _read_exact(self, count: int) -> bytes:
+        while len(self.buf) < count:
+            self._fill()
+        out = bytes(self.buf[:count])
+        del self.buf[:count]
+        return out
+
+    def _read_line(self) -> str:
+        while True:
+            index = self.buf.find(b"\r\n")
+            if index >= 0:
+                line = bytes(self.buf[:index])
+                del self.buf[: index + 2]
+                return line.decode("latin-1", "replace")
+            self._fill()
+
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        if self.closed:
+            raise _WSClosed("DevTools socket is closed")
+        header = bytearray([0x80 | (opcode & 0x0F)])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack(">H", length))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack(">Q", length))
+        mask = os.urandom(4)
+        header.extend(mask)
+        masked = bytearray(payload)
+        for index in range(len(masked)):
+            masked[index] ^= mask[index & 3]
+        try:
+            self.sock.sendall(bytes(header) + bytes(masked))
+        except OSError as exc:
+            raise _WSClosed(str(exc)) from None
+
+    def send_text(self, text: str) -> None:
+        self._send_frame(0x1, text.encode("utf-8"))
+
+    def _read_frame(self) -> tuple[bool, int, bytes]:
+        first = self._read_exact(2)
+        fin = bool(first[0] & 0x80)
+        opcode = first[0] & 0x0F
+        masked = bool(first[1] & 0x80)
+        length = first[1] & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", self._read_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", self._read_exact(8))[0]
+        mask = self._read_exact(4) if masked else b""
+        payload = self._read_exact(length) if length else b""
+        if masked:
+            payload = bytes(byte ^ mask[index & 3] for index, byte in enumerate(payload))
+        return fin, opcode, payload
+
+    def recv_text(self) -> str:
+        chunks: list[bytes] = []
+        while True:
+            fin, opcode, payload = self._read_frame()
+            if opcode == 0x8:
+                self.closed = True
+                raise _WSClosed("DevTools closed the socket")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x0, 0x1, 0x2):
+                if payload:
+                    chunks.append(payload)
+                if fin:
+                    return b"".join(chunks).decode("utf-8", "replace")
+                continue
+
+    def close(self) -> None:
+        try:
+            if not self.closed:
+                self._send_frame(0x8, b"")
+        except Exception:
+            pass
+        self.closed = True
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class _CDPConn:
+    """One DevTools WebSocket, addressed by message id."""
+
+    def __init__(self, ws_url: str, timeout: float = 10):
+        self.ws = _WSClient.connect(ws_url, timeout=timeout)
+        self.next_id = 0
+
+    def call(self, method: str, params: dict | None = None) -> dict:
+        self.next_id += 1
+        message_id = self.next_id
+        self.ws.send_text(json.dumps({"id": message_id, "method": method, "params": params or {}}))
+        while True:
+            try:
+                raw = self.ws.recv_text()
+            except _WSTimeout:
+                raise DiscordError(504, "The browser stopped answering while reading the Discord session.") from None
+            except _WSClosed:
+                raise DiscordError(502, "The browser closed before the Discord session could be read.") from None
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("id") != message_id:
+                continue
+            error = payload.get("error")
+            if isinstance(error, dict):
+                detail = str(error.get("message") or "unknown error")[:200]
+                raise DiscordError(502, f"DevTools error: {detail}")
+            result = payload.get("result")
+            return result if isinstance(result, dict) else {}
+
+    def evaluate(self, expression: str):
+        result = self.call(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "returnByValue": True,
+                "awaitPromise": True,
+                "userGesture": True,
+            },
+        )
+        if result.get("exceptionDetails"):
+            return ""
+        value = result.get("result")
+        if isinstance(value, dict):
+            return value.get("value")
+        return ""
+
+    def close(self) -> None:
+        self.ws.close()
+
+
+# Discord user tokens are dot separated base64url-ish segments.
+_TOKEN_PATTERN = re.compile(r"[\w-]{20,}(?:\.[\w-]{5,}){1,3}\Z")
+
+
+def _browser_candidates() -> list[str]:
+    """Browser executables to try, in order."""
+    out: list[str] = []
+    override = str(os.environ.get("KIZZEY_BROWSER") or "").strip()
+    if override:
+        out.append(override)
+    if os.name == "nt":
+        roots = [
+            str(os.environ.get("ProgramFiles") or r"C:\Program Files"),
+            str(os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"),
+            str(os.environ.get("LOCALAPPDATA") or ""),
+        ]
+        relative = [
+            r"Google\Chrome\Application\chrome.exe",
+            r"Microsoft\Edge\Application\msedge.exe",
+            r"BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"Chromium\Application\chrome.exe",
+        ]
+        for root in roots:
+            if not root:
+                continue
+            for rel in relative:
+                out.append(os.path.join(root, rel))
+    else:
+        out.extend(
+            [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            ]
+        )
+    for name in ("chrome", "google-chrome", "google-chrome-stable", "msedge", "microsoft-edge", "brave", "brave-browser", "chromium"):
+        found = shutil.which(name)
+        if found:
+            out.append(found)
+    return out
+
+
+def _find_browser() -> str:
+    seen: set[str] = set()
+    for path in _browser_candidates():
+        if not path:
+            continue
+        try:
+            key = os.path.normcase(os.path.abspath(path))
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if os.path.isfile(path):
+                return path
+        except OSError:
+            continue
+    return ""
+
+
+def _free_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _cdp_request(port: int, path: str, timeout: float = 2):
+    url = f"http://127.0.0.1:{int(port)}{path}"
+    req = urllib.request.Request(url, headers={"Host": f"127.0.0.1:{int(port)}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    if not raw:
+        return None
+    return json.loads(raw)
+
+
+def _cdp_ready(port: int) -> bool:
+    try:
+        return isinstance(_cdp_request(port, "/json/version", timeout=1.5), dict)
+    except Exception:
+        return False
+
+
+def _cdp_targets(port: int) -> list[dict]:
+    try:
+        data = _cdp_request(port, "/json/list", timeout=2)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "") != "page":
+            continue
+        if not str(item.get("webSocketDebuggerUrl") or ""):
+            continue
+        out.append(item)
+    return out
+
+
+def _pick_page(targets: list[dict]) -> dict | None:
+    for item in targets:
+        if "discord.com" in str(item.get("url") or ""):
+            return item
+    if len(targets) == 1:
+        return targets[0]
+    return None
+
+
+def _wait_for_cdp(port: int, deadline: float, proc=None) -> bool:
+    while time.time() < deadline:
+        if BROWSER_LOGIN_ABORT.is_set():
+            return False
+        if _cdp_ready(port):
+            return True
+        if proc is not None and proc.poll() is not None and not _cdp_ready(port):
+            return False
+        time.sleep(0.3)
+    return False
+
+
+def _launch_browser(exe: str, port: int, profile: str, url: str):
+    args = [
+        exe,
+        f"--remote-debugging-port={int(port)}",
+        f"--user-data-dir={profile}",
+        "--remote-allow-origins=*",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--no-service-autorun",
+        "--disable-background-networking",
+        "--disable-features=Translate,MediaRouter,OptimizationHints",
+        "--new-window",
+        url,
+    ]
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.Popen(args, **kwargs)
+
+
+def _kill_browser(proc) -> None:
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=15,
+            )
+        else:
+            proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=6)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _remove_profile(path: str) -> bool:
+    for _ in range(6):
+        try:
+            shutil.rmtree(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except Exception:
+            time.sleep(0.4)
+    shutil.rmtree(path, ignore_errors=True)
+    return not os.path.exists(path)
+
+
+def _read_page_token(ws_url: str) -> str:
+    """Ask one page for the Discord token it is holding. Empty string on failure."""
+    conn = None
+    try:
+        conn = _CDPConn(ws_url, timeout=8)
+        value = conn.evaluate(_BROWSER_LOGIN_JS)
+    except Exception:
+        return ""
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if not isinstance(value, str):
+        return ""
+    value = clean_discord_token(value)
+    if not value or not _TOKEN_PATTERN.match(value):
+        return ""
+    return value
+
+
+def browser_login(timeout: float = BROWSER_LOGIN_TIMEOUT) -> dict:
+    """Open discord.com/login in a throwaway browser and read back the session.
+
+    Returns ``{"status": "ok", "token": ...}`` once Discord has stored a token
+    in that browser profile, or ``{"status": "cancelled"}`` if the operator hit
+    cancel. The browser is closed and its profile deleted either way.
+    """
+    exe = _find_browser()
+    if not exe:
+        raise DiscordError(
+            500,
+            "No Chrome, Edge, or Brave was found on this machine. Install one, or use the password sign-in instead.",
+        )
+    port = _free_port()
+    try:
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    profile = tempfile.mkdtemp(prefix="kizzey-browser-", dir=str(TMP_DIR))
+    proc = None
+    saw_page = False
+    deadline = time.time() + max(30.0, float(timeout))
+    try:
+        proc = _launch_browser(exe, port, profile, BROWSER_LOGIN_URL)
+        if not _wait_for_cdp(port, min(deadline, time.time() + 45.0), proc):
+            if BROWSER_LOGIN_ABORT.is_set():
+                return {"status": "cancelled"}
+            raise DiscordError(
+                502,
+                "Could not start the sign-in window. Close any stuck browser windows and try again.",
+            )
+        while time.time() < deadline:
+            if BROWSER_LOGIN_ABORT.is_set():
+                return {"status": "cancelled"}
+            targets = _cdp_targets(port)
+            if targets:
+                saw_page = True
+                page = _pick_page(targets)
+                if page is not None:
+                    token = _read_page_token(str(page.get("webSocketDebuggerUrl") or ""))
+                    if token:
+                        return {"status": "ok", "token": token}
+            elif not _cdp_ready(port):
+                if saw_page:
+                    raise DiscordError(400, "The sign-in window closed before sign-in finished.")
+                if proc is not None and proc.poll() is not None:
+                    raise DiscordError(502, "The browser closed before Discord loaded. Try again.")
+            time.sleep(0.9)
+        raise DiscordError(504, "Timed out waiting for the Discord sign-in. Try again.")
+    finally:
+        BROWSER_LOGIN_ABORT.clear()
+        _kill_browser(proc)
+        _remove_profile(profile)
 
 
 def require_gateway_token(account_id: str = "") -> str:
@@ -6300,6 +6893,41 @@ class Handler(BaseHTTPRequestHandler):
                     safe = safe_auth_error(exc.message, token)
                     STORE.log("WARN", "Account", f"Discord sign-in failed: {safe}")
                     return self.send_error_json(safe, exc.status or 401)
+            if path == "/api/auth/browser":
+                if not BROWSER_LOGIN_LOCK.acquire(blocking=False):
+                    return self.send_error_json(
+                        "A Discord sign-in window is already open. Finish it or cancel it first.",
+                        409,
+                    )
+                try:
+                    BROWSER_LOGIN_ABORT.clear()
+                    try:
+                        result = browser_login()
+                    except DiscordError as exc:
+                        STORE.log("WARN", "Account", f"Browser sign-in failed: {_scrub(exc.message)[:160]}")
+                        return self.send_error_json(exc.message, exc.status or 502)
+                    if result.get("status") == "cancelled":
+                        STORE.log("INFO", "Account", "Browser sign-in cancelled.")
+                        return self.send_json({"ok": True, "cancelled": True})
+                    token = clean_discord_token(result.get("token"))
+                    if not token:
+                        return self.send_error_json(
+                            "That sign-in did not produce a Discord session. Try again.", 502
+                        )
+                    try:
+                        user = sign_in(token)
+                    except DiscordError as exc:
+                        safe = safe_auth_error(exc.message, token)
+                        STORE.log("WARN", "Account", f"Discord sign-in failed: {safe}")
+                        return self.send_error_json(safe, exc.status or 401)
+                    STORE.log("INFO", "Account", f"Signed in through the browser as {user['displayName']}.")
+                    return self.send_json({"ok": True, "status": "ok", "user": user, "state": public_state()})
+                finally:
+                    BROWSER_LOGIN_ABORT.clear()
+                    BROWSER_LOGIN_LOCK.release()
+            if path == "/api/auth/browser/cancel":
+                BROWSER_LOGIN_ABORT.set()
+                return self.send_json({"ok": True})
             if path == "/api/auth/logout":
                 sign_out()
                 return self.send_json({"ok": True, "state": public_state()})

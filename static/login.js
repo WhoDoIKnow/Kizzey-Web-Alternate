@@ -1,4 +1,4 @@
-/* Kizzey Web — Discord sign-in panel (email/username + password, with a token fallback) */
+/* Kizzey Web — Discord sign-in panel (real discord.com sign-in in a browser, password and token fallbacks) */
 (function () {
   'use strict';
   const K = window.K;
@@ -12,26 +12,50 @@
   /**
    * Markup for both entry points (onboarding and the sign-in sheet).
    * `prefix` keeps the element ids unique when two panels could be on screen.
+   *
+   * The primary action opens Discord's own login page in a browser window on
+   * this machine and picks up the session afterwards. The email/password form
+   * and the manual token box stay available but tucked away.
    */
   K.loginPanel = function loginPanel(prefix = 'login', opts = {}) {
     const tokenOpen = !!opts.tokenOpen;
     return `<div class="login-card" data-login-panel="${prefix}" style="margin-top:0">
       <form data-login-step="credentials" data-submit-action="login-submit" novalidate>
-        <div class="field">
-          <label for="${prefix}-login"><span>Email or username</span></label>
-          <div class="input-wrap">
-            <input id="${prefix}-login" class="input" type="text" autocomplete="username" spellcheck="false" autocapitalize="none" placeholder="Email or username">
-          </div>
+        <button class="btn btn-primary btn-block btn-lg" type="button" data-action="login-browser" data-prefix="${prefix}" id="${prefix}-browser">${K.icon('login', 'sm')}Sign in with Discord</button>
+        <div class="login-hint" style="margin-top:12px">
+          ${K.icon('shield-check', 'sm')}
+          <div><b>Opens discord.com in a browser window</b><span>Sign in there like you normally would. Kizzey picks up the session when you are done and closes the window.</span></div>
         </div>
-        <div class="field">
-          <label for="${prefix}-password"><span>Password</span></label>
-          <div class="input-wrap">
-            <input id="${prefix}-password" class="input" type="password" autocomplete="current-password" placeholder="Password">
-            <span class="input-suffix"><button class="icon-btn small" type="button" data-action="login-reveal" data-prefix="${prefix}" aria-label="Show password">${K.icon('eye', 'sm')}</button></span>
+        <div id="${prefix}-browser-error" class="field-error hidden"></div>
+
+        <div class="mt-8"></div>
+        <button class="btn btn-ghost btn-block btn-sm" type="button" data-action="login-password-toggle" data-prefix="${prefix}" aria-expanded="false">${K.icon('key', 'sm')}Use email and password instead</button>
+
+        <div class="hidden" data-password-block="${prefix}">
+          <div class="field" style="margin-top:14px">
+            <label for="${prefix}-login"><span>Email or username</span></label>
+            <div class="input-wrap">
+              <input id="${prefix}-login" class="input" type="text" autocomplete="username" spellcheck="false" autocapitalize="none" placeholder="Email or username">
+            </div>
           </div>
+          <div class="field">
+            <label for="${prefix}-password"><span>Password</span></label>
+            <div class="input-wrap">
+              <input id="${prefix}-password" class="input" type="password" autocomplete="current-password" placeholder="Password">
+              <span class="input-suffix"><button class="icon-btn small" type="button" data-action="login-reveal" data-prefix="${prefix}" aria-label="Show password">${K.icon('eye', 'sm')}</button></span>
+            </div>
+          </div>
+          <div id="${prefix}-error" class="field-error hidden"></div>
+          <button class="btn btn-primary btn-block btn-lg" type="submit" data-action="login-submit" data-prefix="${prefix}" id="${prefix}-submit">Sign in</button>
         </div>
-        <div id="${prefix}-error" class="field-error hidden"></div>
-        <button class="btn btn-primary btn-block btn-lg" type="submit" data-action="login-submit" data-prefix="${prefix}" id="${prefix}-submit">Log In</button>
+
+        <div class="hidden" data-browser-block="${prefix}">
+          <div class="login-hint" style="margin-top:14px">
+            ${K.icon('external-link', 'sm')}
+            <div><b>Waiting for the sign-in window</b><span>Finish signing in to Discord in the window that just opened.</span></div>
+          </div>
+          <button class="btn btn-ghost btn-block btn-sm" type="button" data-action="login-browser-cancel" data-prefix="${prefix}" id="${prefix}-browser-cancel">Cancel</button>
+        </div>
       </form>
 
       <form data-login-step="mfa" class="hidden" data-submit-action="login-mfa">
@@ -118,12 +142,37 @@
     }
   }
 
+  function revealPasswordBlock(prefix, open) {
+    const block = document.querySelector(`[data-password-block="${prefix}"]`);
+    const toggle = document.querySelector(`[data-login-panel="${prefix}"] [data-action="login-password-toggle"]`);
+    if (!block) return;
+    block.classList.toggle('hidden', !open);
+    if (toggle) toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+
   function setBusy(prefix, id, on, label, busyLabel) {
     const button = document.querySelector(`#${prefix}-${id}`);
     busy[prefix] = !!on;
     if (!button) return;
     button.disabled = !!on;
     button.textContent = on ? busyLabel : label;
+  }
+
+  // The browser request stays open for as long as the sign-in window does, so
+  // the panel shows a waiting row with a cancel button instead of freezing.
+  function setBrowserBusy(prefix, on) {
+    busy[prefix] = !!on;
+    const button = document.querySelector(`#${prefix}-browser`);
+    if (button) button.disabled = !!on;
+    const toggle = document.querySelector(`[data-login-panel="${prefix}"] [data-action="login-password-toggle"]`);
+    if (toggle) toggle.disabled = !!on;
+    const block = document.querySelector(`[data-browser-block="${prefix}"]`);
+    if (block) block.classList.toggle('hidden', !on);
+    const cancel = document.querySelector(`#${prefix}-browser-cancel`);
+    if (cancel) {
+      cancel.disabled = false;
+      cancel.textContent = 'Cancel';
+    }
   }
 
   function finish(data) {
@@ -135,6 +184,48 @@
     if (typeof cb === 'function') cb(data);
     else K.render();
   }
+
+  K.actions['login-browser'] = async function (el) {
+    const prefix = prefixOf(el);
+    if (busy[prefix]) return;
+    clearError(prefix);
+    clearError(`${prefix}-browser`);
+    setBrowserBusy(prefix, true);
+    try {
+      // No body: the server opens discord.com/login and holds this request open
+      // until the operator finishes (or cancels) in that window.
+      const data = await K.api('/api/auth/browser', { method: 'POST', body: {} });
+      if (data && data.cancelled) {
+        K.toast('Sign-in cancelled', 'No account was added.', 'info');
+        return;
+      }
+      finish(data);
+    } catch (error) {
+      showError(`${prefix}-browser`, error.message);
+    } finally {
+      setBrowserBusy(prefix, false);
+    }
+  };
+
+  K.actions['login-browser-cancel'] = function (el) {
+    const prefix = prefixOf(el);
+    if (el) {
+      el.disabled = true;
+      el.textContent = 'Closing the window...';
+    }
+    // Fire and forget: the waiting request returns with `cancelled: true`.
+    K.api('/api/auth/browser/cancel', { method: 'POST', body: {} }).catch(() => {});
+    clearError(`${prefix}-browser`);
+  };
+
+  K.actions['login-password-toggle'] = function (el) {
+    const prefix = prefixOf(el);
+    const block = document.querySelector(`[data-password-block="${prefix}"]`);
+    if (!block) return;
+    const open = block.classList.contains('hidden');
+    revealPasswordBlock(prefix, open);
+    if (open) document.querySelector(`#${prefix}-login`)?.focus({ preventScroll: true });
+  };
 
   K.actions['login-reveal'] = function (el) {
     const prefix = prefixOf(el);
@@ -165,7 +256,7 @@
       passwordInput.focus();
       return;
     }
-    setBusy(prefix, 'submit', true, 'Log In', 'Signing in…');
+    setBusy(prefix, 'submit', true, 'Sign in', 'Signing in...');
     try {
       const data = await K.api('/api/auth/login', { method: 'POST', body: { login, password } });
       if (data.status === 'mfa') {
@@ -187,7 +278,7 @@
         passwordInput.focus();
       }
     } finally {
-      setBusy(prefix, 'submit', false, 'Log In', 'Signing in…');
+      setBusy(prefix, 'submit', false, 'Sign in', 'Signing in...');
     }
   };
 
@@ -210,7 +301,7 @@
       return;
     }
     busy[`${prefix}-mfa`] = true;
-    setBusy(prefix, 'mfa-submit', true, 'Verify', 'Checking…');
+    setBusy(prefix, 'mfa-submit', true, 'Verify', 'Checking...');
     try {
       const data = await K.api('/api/auth/mfa', { method: 'POST', body: { ticket, code } });
       finish(data);
@@ -220,7 +311,7 @@
       input.focus();
     } finally {
       busy[`${prefix}-mfa`] = false;
-      setBusy(prefix, 'mfa-submit', false, 'Verify', 'Checking…');
+      setBusy(prefix, 'mfa-submit', false, 'Verify', 'Checking...');
     }
   };
 
@@ -261,7 +352,7 @@
       input.focus();
       return;
     }
-    setBusy(prefix, 'connect', true, 'Connect with token', 'Checking with Discord…');
+    setBusy(prefix, 'connect', true, 'Connect with token', 'Checking with Discord...');
     try {
       const data = await K.api('/api/auth/token', { method: 'POST', body: { token } });
       finish(data);
@@ -270,16 +361,23 @@
       input.select();
       input.focus();
     } finally {
-      setBusy(prefix, 'connect', false, 'Connect with token', 'Checking with Discord…');
+      setBusy(prefix, 'connect', false, 'Connect with token', 'Checking with Discord...');
     }
   };
 
   K.actions['login-help'] = function () {
     K.sheet({
-      title: 'Getting a token instead',
-      subtitle: 'For when a password sign-in hits a captcha.',
+      title: 'How Discord sign-in works',
+      subtitle: 'One click, then Discord does the rest.',
       body: `<div class="setting-group" style="padding:16px">
-        <p style="font-size:0.8125rem;line-height:1.6;color:var(--text-dim);margin:0 0 12px">A user token is the same credential the Discord app itself uses. Kizzey needs it for Rich Presence and the message mirror — never a bot token.</p>
+        <p style="font-size:0.8125rem;line-height:1.6;color:var(--text-dim);margin:0 0 12px"><b>Sign in with Discord</b> opens discord.com/login in a browser window on this machine. Sign in there exactly as you normally would. When you are done Kizzey reads the session Discord just created, saves the token on this machine, and closes the window. Nothing is typed into Kizzey and nothing is sent anywhere except to Discord.</p>
+        <div class="login-hint">
+          ${K.icon('info-circle', 'sm')}
+          <div><b>Nothing to install</b><span>Kizzey uses Chrome, Edge, or Brave if one is already on this computer, in a temporary profile it deletes afterwards.</span></div>
+        </div>
+      </div>
+      <div class="setting-group" style="padding:16px;padding-top:0">
+        <p style="font-size:0.8125rem;line-height:1.6;color:var(--text-dim);margin:0 0 12px">If the window cannot open, use <b>Use email and password instead</b> or paste a token by hand. A user token is the same credential the Discord app itself uses — Kizzey needs it for Rich Presence and the message mirror, never a bot token.</p>
         <div class="login-steps">
           <span><b class="step-num">1</b><span>Open <a href="https://discord.com/login" target="_blank" rel="noopener">discord.com/login</a> in a desktop browser and sign in.</span></span>
           <span><b class="step-num">2</b><span>Press <kbd>F12</kbd>, open <b>Application</b>, then <b>Local Storage → https://discord.com</b>.</span></span>
