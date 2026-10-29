@@ -6,10 +6,22 @@ using a Python standard-library server as the browser equivalent of the Android 
 
 The Discord token lives on the server. The browser never receives it, not even a hint.
 
-Two sign-in paths are available: a normal **Sign in with Discord** OAuth2 flow for your identity,
-and an advanced user token for Rich Presence and anything that reads or writes messages. Discord
-does not grant OAuth applications gateway or channel access, so both paths exist on purpose and
-neither pretends to be the other.
+> **It runs on your machine, and only on your machine.** There is no hosted Kizzey service and no
+> telemetry of any kind. The server, the Discord traffic and the session token all stay on the
+> computer you start `server.py` on. As long as the code came from this repository, it does nothing
+> outside that machine: the only outbound requests are the Discord calls you ask for, and the token
+> is written only to your own `data/secret.json`. Nothing phones home, and nothing here can reach
+> into another install or take over an account.
+
+Sign in the way you would on `discord.com`: type your email or username and password into Kizzey and
+the server performs the same login request the website does, including the two-factor step when
+Discord asks for it. A **Use a token instead** fallback stays available for a token copied out of a
+desktop browser. Only the resulting session token is kept, server-side, in `data/secret.json`.
+
+Accounts are not switched one at a time. Every saved account that has something switched on — a live
+Rich Presence or a role in a message mirror rule — keeps its own gateway open alongside the others,
+so several accounts can hold Rich Presence at once. An account with nothing switched on holds no
+socket.
 
 ## Run it
 
@@ -43,9 +55,11 @@ needs one command:
 python3 script_pull.py --host 0.0.0.0 --port 8420
 ```
 
-It clones into `./kizzey-web` when the script is not already inside a checkout, runs
-`git pull --ff-only` when it is, and forwards every other flag to `server.py`. Runtime data in
-`data/` is git-ignored, so updates never delete accounts, settings or history.
+It clones into `./kizzey-web` when the script is not already inside a checkout, and forwards every
+other flag to `server.py`. When the script is already inside a checkout it compares the local commit
+with the tracked branch tip first: if they match it says so and starts straight away without a
+fetch, otherwise it fetches and runs `git pull --ff-only`. Runtime data in `data/` is git-ignored,
+so updates never delete accounts, settings or history.
 
 | Launcher option | Purpose |
 | --- | --- |
@@ -64,78 +78,59 @@ instead of discarding them.
 | --- | --- |
 | `--host 0.0.0.0` | Listen on every interface. Default. |
 | `--port 8420` | HTTP port. Default `8420`. |
-| `--no-gateway` | Restore the saved account without opening the Discord gateway at startup. |
+| `--no-gateway` | Restore the saved accounts without opening any gateway socket at startup. |
 | `KIZZEY_HOST` / `KIZZEY_PORT` | Environment equivalents for host and port. |
-| `--discord-client-id` / `--discord-client-secret` | Discord application credentials for OAuth sign-in. |
-| `KIZZEY_DISCORD_CLIENT_ID` / `KIZZEY_DISCORD_CLIENT_SECRET` | Environment equivalents; they override values saved in the UI. |
-| `KIZZEY_PUBLIC_URL` | Public origin used to build the OAuth redirect URI, e.g. `https://kizzey.example.com`. |
 
 ## Signing in
 
-### Sign in with Discord (OAuth2)
+### Email or username and password
 
-**Settings → Discord login** turns on a normal Discord sign-in screen. Create an application at
-<https://discord.com/developers/applications>, add the redirect URI shown on that screen, and paste
-the application's Client ID and Client Secret into Kizzey. The welcome screen and the sign-in sheet
-then offer **Continue with Discord**.
+The sign-in screen works the way `discord.com` does: type the email or username and password for the
+account, and Kizzey performs the same login request the website performs, from the server. Discord
+answers with a session token, or with a two-factor challenge — when it asks for a code, Kizzey shows
+the two-factor field and posts the current code from your authenticator app back to Discord.
 
-The flow is a standard authorization-code exchange with PKCE and a single-use `state` value,
-completed entirely on the server:
+The password is used only for that one login request, is never logged and is never written anywhere;
+only the session token Discord returns is kept, in `data/secret.json`. If Discord answers with a
+captcha challenge, the sheet reveals the token block and asks you to paste a token instead, because a
+captcha cannot be solved by the server on your behalf.
 
-1. The browser is sent to `discord.com/oauth2/authorize` with the `identify` scope.
-2. Discord redirects to `/api/auth/oauth/callback`.
-3. The server exchanges the code, reads `/users/@me`, stores the identity, and returns to the app.
-
-Access and refresh tokens are written to `data/secret.json`, refreshed automatically when they
-expire, and never appear in public state, API responses, logs or exports. The client secret stays
-server-side too. Credentials saved in the UI are used only when the environment variables are not
-set.
-
-Discord does not let OAuth applications open a gateway session, read channel history or send Rich
-Presence. An OAuth account therefore shows as an **OAuth identity** with no gateway, and presence,
-chat tools and message mirroring explain that they need a user token for that account. Adding a
-token later keeps the OAuth identity linked to the same row.
-
-For a hosted instance, set `KIZZEY_PUBLIC_URL` (or use the exact host and port people open) so the
-redirect URI registered at Discord matches the one Kizzey sends. Discord accepts HTTPS redirects and
-plain HTTP only on `localhost`, so a LAN address such as `http://192.168.1.14:8420` needs a TLS
-reverse proxy or a tunnel before the round trip can complete. The settings screen warns when the
-derived URI cannot be registered.
-
-### Connect with a user token
+### Use a token instead
 
 Rich Presence is sent through the user gateway, not a bot account, so the presence and message
-features need a Discord user token. The sign-in sheet keeps that path behind **Use a user token
-instead**: open Discord in a desktop browser, copy the `token` value from Local Storage, and paste
-it once. This is the web equivalent of the Android app's WebView session.
+features need a Discord user token. The sign-in sheet keeps that path behind **Use a token instead**:
+open Discord in a desktop browser, copy the `token` value from Local Storage, and paste it once.
+This is the web equivalent of the Android app's WebView session, and it is also the fallback when a
+login hits a captcha or a two-factor method the server cannot drive.
 
 The token is validated against Discord, stored in `data/secret.json`, and used server-side. Public
-state, logs, API responses and state exports never include it. Use a token only on a server you
-control, keep the server off untrusted networks, and remember that Discord user tokens carry
-account risk.
+state, logs, API responses and state exports never include it. A token is a live credential to the
+account, so treat it like a password: keep it on this machine and out of anything you share.
 
 ### Multiple Discord accounts
 
-Open **Settings → Discord accounts**, or choose the same item in the drawer, to save and switch
-identities. Up to eight accounts are kept in a private `accounts` array in `data/secret.json`;
-the legacy `token` field remains as a compatibility copy of the active token. The browser only
+Open **Settings → Discord accounts**, or choose the same item in the drawer, to add, focus and remove
+identities. Up to eight accounts are kept in a private `accounts` array in `data/secret.json`; the
+legacy `token` field remains as a compatibility copy of the focused account's token. The browser only
 receives account IDs, usernames, display names, avatars, timestamps, the credential kind
-(`token`/`oauth`), and boolean token and gateway status — never a token, OAuth token, token
-fragment or hint.
+(`token`/`none`), and boolean token and gateway status — never a token, token fragment or hint.
 
-An account can hold an OAuth identity, a user token, or both. OAuth-only rows can be selected and
-labelled, but they do not open a gateway or back a mirror rule until a token is added.
+Accounts do not replace one another. Every account whose presence is running, or which is named by an
+enabled message-mirror rule, keeps its own gateway open at the same time, so several accounts can
+hold Rich Presence at once and a mirror source and destination can each stay connected
+independently. An account with nothing switched on holds no socket: adding an account only validates
+and stores the token.
 
-One gateway and one live presence run at a time. Switching validates the target token, stops the
-old presence and socket, then opens the target session. Replacing the token of the live account
-restarts its gateway too. Removing the active account falls back to the next saved account that
-has a token; if none remains, the server has no active session. **Remove all accounts** clears
-every token and pauses account-backed relays. Tokens remain server-only, so each saved identity
-can be switched from any browser that can reach this server.
+Focus selects which account the editor and the status screens act on; it never stops the others.
+Switching focus to a second account leaves the first account's presence and socket running, and
+switching back changes nothing. Stopping a presence closes that account's gateway, except while a
+mirror rule still needs it. An account whose token Discord rejects — a revoked token, a banned or
+deleted account — has only its own token cleared; the other accounts keep running. **Remove all
+accounts** clears every token and closes every socket.
 
-This is sequential account switching, not simultaneous Rich Presence for several accounts. The
-Android app's **Multiple Account RPC** concerns several RPC sources; Kizzey Web instead offers
-saved-account switching plus the message forwarder below.
+Rich Presence on several accounts is possible at once. The Android app's **Multiple Account RPC**
+instead concerns several RPC sources for one account; Kizzey Web offers per-account presence plus the
+message forwarder below.
 
 ## Message mirror
 
@@ -157,8 +152,10 @@ Two post formats are available per rule:
   removed, and purged when every account is removed. DMs, group DMs and threads cannot use
   webhook mode.
 
-The server is a poller, not a gateway listener. A new rule records the newest source message as
-its starting cursor, so existing history is never backfilled. Only messages after that cursor
+The server is a poller, not a gateway listener: messages are read over the REST API on an interval,
+so an enabled rule keeps the gateways of the accounts it names open but never takes its messages
+from them. A new rule records the newest source message as its starting cursor, so existing history
+is never backfilled. Only messages after that cursor
 are copied. The cursor and delivery counters persist across restarts. At most 30 messages are
 processed per rule per check, posts are paced at roughly one per second, and Discord 429
 responses set a retry cooldown. Background checks need both the global auto-mirror switch and the
@@ -240,7 +237,7 @@ python3 -m py_compile server.py
 for file in static/*.js; do node --check "$file"; done
 python3 tests/test_kizzey_import.py
 python3 tests/test_accounts_mirror.py
-python3 tests/test_oauth_login.py
+python3 tests/test_password_login.py
 python3 tests/test_launcher.py
 node tests/test_import_ui.js
 node tests/test_gallery_apply.js
@@ -264,8 +261,8 @@ against a stubbed Material runtime.
 - Start, stop, refresh, preview, status display type and status-line rolling
 - Persistent history, server logs and usage counters
 - Saved presets, a gallery with local submissions, and automation schedules
-- Up to eight saved Discord accounts with server-side token isolation and active fallback
-- Normal **Sign in with Discord** OAuth2 flow with PKCE, state, server-side refresh and no token capture
+- Up to eight saved Discord accounts, each able to hold its own live Rich Presence at once
+- Discord email/username and password sign-in with a two-factor step, plus a user-token fallback
 - A real, rate-limited message mirror with normal and managed-webhook identity formats
 - Optional album-art backdrop and artwork-sampled accent colour in Display settings
 - Custom CSS variables, text scaling, themes, AMOLED mode and Material You-style accents
@@ -295,7 +292,7 @@ are deliberate and shown honestly in the interface:
 | Native chat/voice backend | Local persisted rooms and voice state; microphone test has no live audio relay |
 | Android overlays, tiles, Android Auto | UI controls and honest preview/state analogues |
 | APK/system installer | PWA "Add to Home screen" |
-| Simultaneous multi-account RPC | One live gateway, saved-account switching and a message mirror |
+| Simultaneous multi-account RPC | Each account with a running presence holds its own gateway; several run at once |
 | Stripe checkout | Local Kizzey+ and KCoin demo mechanisms |
 
 Discord's relationship endpoint returns friends but not their live activities. Live friend
@@ -336,8 +333,8 @@ created automatically. Removing `secret.json` signs the server out of Discord.
 The frontend uses JSON endpoints and an SSE stream. The main groups are:
 
 - `GET /api/state`, `/api/events`, `/api/accounts`, `/api/mirror`; `POST /api/patch`
-- `POST /api/auth/token`, `/api/auth/logout`, `/api/account/refresh`, `/api/gateway/reconnect`
-- `GET /api/auth/oauth/config`, `/api/auth/oauth/start`, `/api/auth/oauth/callback`; `POST /api/auth/oauth/config`
+- `POST /api/auth/login`, `/api/auth/mfa`, `/api/auth/token`, `/api/auth/logout`
+- `POST /api/account/refresh`, `/api/gateway/reconnect`
 - `POST /api/accounts/{add,switch,remove,remove-all}`
 - `POST /api/mirror/settings`, `/api/mirror/rules`, `/api/mirror/rules/{toggle,delete}`, `/api/mirror/run`
 - `POST /api/rpc/{start,stop,refresh,preview}`
@@ -347,9 +344,11 @@ The frontend uses JSON endpoints and an SSE stream. The main groups are:
 - `POST /api/wallet/daily`, `/api/shop/buy`, `/api/premium/{unlock,reset}`
 - `GET /api/export`, `/api/logs`, `/api/history`; `POST /api/import`, `/api/logs/clear`, `/api/history/clear`
 
-Unknown `/api/*` paths return JSON 404s. SSE recovers in the browser; the gateway reconnects only
-while Keep gateway alive is enabled. Auto-start separately controls restoration when the server
-launches.
+Unknown `/api/*` paths return JSON 404s. SSE recovers in the browser. Gateways are opened on demand:
+one starts for an account as soon as its presence runs or an enabled mirror rule needs it, and closes
+again when neither is true. Keep gateway alive only controls whether the socket retries while the
+server process runs; startup restores the focused account and opens sockets only for accounts an
+enabled mirror rule still references, so an idle install holds none.
 
 ## Credits and licence
 

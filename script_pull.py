@@ -9,9 +9,10 @@ Pulls the latest Kizzey Web sources and starts the server in one step.
     python3 script_pull.py --dir ~/kizzey --branch main
     python3 script_pull.py --update-only
 
-Everything after the launcher's own flags is forwarded to server.py. Local
-runtime data (``data/``, uploads, logs) is never touched: it is git-ignored and
-lives beside the sources.
+Everything after the launcher's own flags is forwarded to server.py. When the
+checkout already matches the tracked branch tip, the launcher says so and skips
+the download instead of fetching on every start. Local runtime data (``data/``,
+uploads, logs) is never touched: it is git-ignored and lives beside the sources.
 
 Only the Python standard library and a ``git`` binary are required.
 """
@@ -51,13 +52,52 @@ def default_dir(script_dir: Path) -> Path:
     return Path.cwd() / "kizzey-web"
 
 
+def local_head(target: Path) -> str:
+    """The commit this checkout is sitting on, or "" when it cannot be read."""
+    rev = run_git(["rev-parse", "HEAD"], cwd=target)
+    return rev.stdout.strip() if rev.returncode == 0 else ""
+
+
+def remote_head(target: Path, repo: str, branch: str) -> str:
+    """Ask the remote for the branch tip without touching the working tree."""
+    listed = run_git(["ls-remote", repo, f"refs/heads/{branch}"], cwd=target)
+    if listed.returncode != 0:
+        return ""
+    for line in listed.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == f"refs/heads/{branch}":
+            return parts[0].strip()
+    return ""
+
+
 def pull(target: Path, repo: str, branch: str) -> int:
     if (target / ".git").exists():
-        print(f"  Updating {target}")
+        print(f"  Checking {target}")
+
+        # Cheap path: compare the local commit with the remote tip. When they
+        # already match there is nothing to download, so skip the fetch and the
+        # network round trip entirely.
+        local = local_head(target)
+        ahead = remote_head(target, repo, branch)
+        if ahead and local and ahead == local:
+            print("  Already up to date; nothing to pull.")
+            return 0
+
         fetched = run_git(["fetch", "--prune", "origin", branch], cwd=target)
         if fetched.returncode != 0:
             print(fetched.stdout.rstrip())
             return fail("Could not fetch from origin. Check your network and repository access.")
+
+        # ls-remote can be blocked or unavailable; fall back to the tip the
+        # fetch just recorded before deciding whether a merge is needed.
+        if not ahead:
+            tracked = run_git(["rev-parse", f"origin/{branch}"], cwd=target)
+            ahead = tracked.stdout.strip() if tracked.returncode == 0 else ""
+        local = local_head(target)
+        if ahead and local and ahead == local:
+            print("  Already up to date; nothing to pull.")
+            return 0
+
         pulled = run_git(["pull", "--ff-only", "origin", branch], cwd=target)
         print(pulled.stdout.rstrip())
         if pulled.returncode != 0:

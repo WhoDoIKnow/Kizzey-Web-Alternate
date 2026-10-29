@@ -93,6 +93,16 @@ const K = {
   discordStatus() { return { color: 'good', text: 'Discord connected' }; },
   relTime() { return '2m ago'; },
   displayName() { return 'Alpha'; },
+  accountGateway(accountId) {
+    const id = String(accountId || '');
+    if (!id) return K.get('gateway', {}) || {};
+    const all = K.get('gateways', {}) || {};
+    return all[id] || {};
+  },
+  accountRunning(accountId) {
+    const g = K.accountGateway(accountId);
+    return !!g.connected || g.state === 'connecting' || g.state === 'reconnecting';
+  },
 };
 
 function input(value = '', checked = false) {
@@ -136,6 +146,12 @@ function accountsState(overrides = {}) {
     accountLimit: 8,
     activeAccountId: alpha.id,
     gateway: { connected: true, state: 'ready', tokenSet: true },
+    // Two sockets up: every saved account keeps its own gateway while it has
+    // something switched on. The focused one drives the screens.
+    gateways: {
+      acct_alpha1: { connected: true, state: 'ready', tokenSet: true },
+      acct_beta22: { connected: true, state: 'ready', tokenSet: true },
+    },
     mirrorRuleLimit: 20,
     mirror: {
       enabled: true, interval: 20, lastRunAt: Date.now(), lastError: '', rules: [{
@@ -159,8 +175,10 @@ function accountsState(overrides = {}) {
   state = accountsState();
   let html = K.screens.accounts.render();
   check(html.includes('Alpha') && html.includes('@alpha'), 'account screen shows the active identity');
-  check(html.includes('IN USE') && html.includes('User token'), 'active account is marked and token state is summarised');
+  check(html.includes('FOCUS') && html.includes('User token'), 'active account is marked and token state is summarised');
   check(html.includes('Beta') && html.includes('Switch'), 'inactive account offers a switch action');
+  check((html.match(/Running/g) || []).length >= 2, 'every account with a live gateway is marked as running');
+  check(html.includes('Every saved account runs its own gateway') && html.includes('Gateways close when idle'), 'account screen explains simultaneous gateways');
   check(html.includes('2/8') && html.includes('Add account'), 'account list shows usage against the account limit');
   check(html.includes('data-route="mirror"'), 'account screen links to the message mirror');
   check(html.includes('data/secret.json'), 'account privacy copy names the private store');
@@ -233,9 +251,9 @@ function accountsState(overrides = {}) {
   K.actions['account-add']();
   let sheet = calls.sheets.at(-1);
   check(sheet && sheet.title === 'Add a Discord account', 'add-account action opens a sheet');
-  check(sheet.body.includes('type="password"') && sheet.body.includes('data/secret.json'), 'account sheet uses a password field and private-store copy');
-  check(sheet.body.includes('id="account-make-active" type="checkbox" checked'), 'the first account is active by default');
-  check(sheet.body.includes('data-action="account-submit" data-id=""'), 'account sheet submits through the account API');
+  check(sheet.body.includes('data-submit-action="login-submit"') && sheet.body.includes('id="account-password"') && sheet.body.includes('id="account-login"'), 'account sheet is the discord.com password login');
+  check(sheet.body.includes('runs on your own machine only') && sheet.body.includes('id="account-token"'), 'account sheet keeps the token fallback and own-machine note');
+  check(!sheet.body.includes('account-make-active'), 'a password sign-in does not ask about focus — it becomes the account in use');
   check(!sheet.body.includes('value="tok-'), 'account sheet never embeds a token');
 
   state = accountsState();
@@ -244,7 +262,7 @@ function accountsState(overrides = {}) {
   state.accounts[1].tokenSet = false;
   K.actions['account-readd']({ dataset: { id: 'acct_beta22' } });
   sheet = calls.sheets.at(-1);
-  check(sheet.title === 'Update Discord token' && sheet.body.includes('Replace token'), 're-authentication opens the token update sheet');
+  check(sheet.title === 'Update Discord token' && sheet.subtitle.includes('Replace the saved token'), 're-authentication opens the token update sheet');
   check(sheet.subtitle.includes('&lt;b&gt;Bold&lt;/b&gt;'), 'token update subtitle escapes the account name');
   check(sheet.body.includes('id="account-make-active" type="checkbox"'), 'an inactive re-authentication does not force a switch');
 
@@ -415,46 +433,29 @@ function accountsState(overrides = {}) {
   await K.actions['mirror-run'](input());
   check(calls.toasts.at(-1).title === 'Relay is cooling down' && /5s|4s/.test(calls.toasts.at(-1).message), 'manual run explains a cooldown');
 
-  // OAuth sign-in surfaces
-  const oauthOn = { auth: { oauth: { configured: true, clientId: '123456789012345678', hasSecret: true, redirectUri: 'http://127.0.0.1:8420/api/auth/oauth/callback' } } };
-  state = accountsState(oauthOn);
-  html = K.screens.accounts.render();
-  check(html.includes('User token') && html.includes('IN USE'), 'token-backed rows label the credential kind');
-
-  const oauthRow = {
-    id: 'acct_oauth3', userId: '100000000000000003', username: 'gamma', displayName: 'Gamma',
-    avatarUrl: '', tokenSet: false, oauthLinked: true, authKind: 'oauth', canGateway: false,
-    needsAuth: false, authError: '', addedAt: 3, lastUsedAt: null,
-  };
-  state = accountsState(Object.assign({ accounts: accountsState().accounts.concat([oauthRow]) }, oauthOn));
-  html = K.screens.accounts.render();
-  check(html.includes('OAuth identity') && html.includes('No gateway'), 'an OAuth-only row is labelled without a gateway');
-  check(html.includes('data-action="account-readd" data-id="acct_oauth3"'), 'an OAuth-only row offers a user token');
-  check(html.includes('data-action="account-switch" data-id="acct_oauth3"'), 'an OAuth-only row can still be selected');
+  // Password sign-in surfaces (no OAuth anywhere)
+  const panel = K.loginPanel('sheet');
+  check(panel.includes('data-submit-action="login-submit"') && panel.includes('id="sheet-login"'), 'login panel posts an email/username form like discord.com');
+  check(panel.includes('id="sheet-password"') && panel.includes('autocomplete="current-password"'), 'login panel collects a password field');
+  check(panel.includes('data-submit-action="login-mfa"') && panel.includes('id="sheet-code"'), 'login panel carries a two-factor step');
+  check(panel.includes('data-action="login-token-toggle"') && panel.includes('data-token-block="sheet"'), 'login panel keeps the token path behind an explicit toggle');
+  check(panel.includes('id="sheet-token"') && panel.includes('login-token-block hidden" data-token-block="sheet"'), 'login panel keeps the token block hidden until asked');
+  check(panel.includes('Email or username'), 'login panel labels the credential field');
+  check(panel.includes('runs on your own machine only') && panel.includes('never leaves your disk'), 'login panel states the code only ever runs on this machine');
+  check(!/oauth/i.test(panel), 'login panel has no OAuth wording');
 
   calls.sheets.length = 0;
-  state = accountsState(oauthOn);
+  state = accountsState();
   K.actions['account-add']();
   let addSheet = calls.sheets.at(-1);
-  check(!!addSheet && addSheet.body.includes('data-action="account-oauth"'), 'add-account sheet offers Discord sign-in when configured');
-  check(!!addSheet && addSheet.body.includes('data/secret.json'), 'token field still explains server-side storage');
+  check(!!addSheet && addSheet.body.includes('data-submit-action="login-submit"') && addSheet.body.includes('id="account-login"'), 'add-account sheet reuses the password login panel');
+  check(!!addSheet && !/oauth/i.test(addSheet.body), 'add-account sheet has no OAuth branch');
+  check(!!addSheet && addSheet.subtitle.includes('discord.com'), 'add-account sheet points at the normal discord.com login');
 
-  calls.sheets.length = 0;
-  state = accountsState({ auth: { oauth: { configured: false, clientId: '', hasSecret: false, redirectUri: '' } } });
-  K.actions['account-add']();
-  addSheet = calls.sheets.at(-1);
-  check(!!addSheet && !addSheet.body.includes('data-action="account-oauth"'), 'add-account sheet hides Discord sign-in when it is off');
-
-  state = accountsState(oauthOn);
-  const panel = K.loginPanel('sheet');
-  check(panel.includes('Continue with Discord') && panel.includes('data-action="login-oauth"'), 'login panel offers Discord sign-in');
-  check(panel.includes('Use a user token instead') && panel.includes('id="sheet-token"'), 'login panel keeps the token path behind an explicit toggle');
-  check(panel.includes('does not give OAuth apps those permissions'), 'login panel is honest about what OAuth cannot do');
-
-  state = accountsState({ auth: { oauth: { configured: false, clientId: '', hasSecret: false, redirectUri: '' } } });
-  const offPanel = K.loginPanel('welcome');
-  check(offPanel.includes('Set up Discord login') && !offPanel.includes('data-action="login-oauth"'), 'unconfigured login panel points at setup');
-  check(offPanel.includes('id="welcome-token"') && !offPanel.includes('hidden" data-token-block'), 'unconfigured login panel shows the token field');
+  state = accountsState();
+  html = K.screens.accounts.render();
+  check(html.includes('Remove all accounts') && html.includes('data/secret.json'), 'remove-all copy names the private store');
+  check(!/oauth/i.test(html), 'account screen has no OAuth wording');
 
   const index = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
   const app = fs.readFileSync(path.join(root, 'static', 'app.js'), 'utf8');
@@ -468,7 +469,8 @@ function accountsState(overrides = {}) {
   check(settings.includes("route: 'accounts'") && settings.includes("route: 'mirror'"), 'settings links target the new routes');
   check(serviceWorker.includes('/screens-accounts.js') && serviceWorker.includes('/login.js'), 'service worker caches the new screens');
   check(index.includes('/login.js') && index.indexOf('/login.js') < index.indexOf('/app.js'), 'login panel loads before the router');
-  check(settings.includes("route: 'discord-login'"), 'settings links to the Discord login screen');
+  check(settings.includes("tappable('Discord login'") && settings.includes("action: 'account-add'"), 'settings opens the password login sheet');
+  check(!/oauth/i.test(settings), 'settings has no OAuth wording');
   check(css.includes('.account-list-row') && css.includes('.mirror-route') && css.includes('.mirror-toggle'), 'new components have Material styles');
 
   console.log(`\n${checks - failed}/${checks} account and mirror UI checks passed`);

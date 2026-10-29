@@ -5680,13 +5680,16 @@ def _login_error_message(status: int, info: dict) -> str:
             "Discord wants a captcha for this sign-in, which this app cannot solve. "
             "Sign in at discord.com in your browser, then paste the token instead."
         )
-    if status == 401 or "invalid" in str(info.get("message") or "").lower():
+    message_text = str(info.get("message") or "").strip()
+    lowered = message_text.lower()
+    if "two factor" in lowered or "two-factor" in lowered or "2fa" in lowered or "mfa" in lowered:
+        return "That two-factor code was not accepted. Try the current code from your authenticator app."
+    if status == 401 or "invalid" in lowered:
         return "Wrong email/username or password."
     if info.get("mfa") or info.get("mfa_required"):
         return "Discord needs your two-factor code."
-    message = str(info.get("message") or "").strip()
-    if message:
-        return message[:220]
+    if message_text:
+        return message_text[:220]
     if status == 400:
         return "Discord rejected that sign-in. Check the email/username and password."
     return f"Discord returned HTTP {status}."
@@ -6268,7 +6271,7 @@ class Handler(BaseHTTPRequestHandler):
                     result = login_with_password(login, password)
                 except DiscordError as exc:
                     STORE.log("WARN", "Account", f"Password sign-in failed: {_scrub(exc.message)[:160]}")
-                    return self.send_error_json(exc.message, exc.status or 401, extra={"captcha": bool(exc.data.get("captcha_key"))})
+                    return self.send_error_json(exc.message, exc.status or 401, captcha=bool(exc.data.get("captcha_key")))
                 if result.get("status") == "mfa":
                     return self.send_json(
                         {
