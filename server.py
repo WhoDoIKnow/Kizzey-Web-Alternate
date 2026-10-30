@@ -5691,10 +5691,13 @@ def _login_error_message(status: int, info: dict) -> str:
         wait = wait or 60
         return f"Discord is rate limiting this sign-in. Wait {wait} seconds and try again."
     if info.get("captcha_key") or info.get("captcha_sitekey"):
-        return (
-            "Discord wants a captcha before it will finish this sign-in. "
-            "Solve the check below, or use a token instead."
-        )
+        service = str(info.get("captcha_service") or "").strip().lower() or "hcaptcha"
+        if service == "hcaptcha" and info.get("captcha_sitekey"):
+            return (
+                "Discord wants a captcha before it will finish this sign-in. "
+                "Solve the check in the sign-in sheet, or use a token instead."
+            )
+        return "Discord wants a captcha this app cannot display. Use a token instead."
     message_text = str(info.get("message") or "").strip()
     lowered = message_text.lower()
     if "two factor" in lowered or "two-factor" in lowered or "2fa" in lowered or "mfa" in lowered:

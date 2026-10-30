@@ -652,7 +652,7 @@
         </div>
       </div>
       <div class="setting-group" style="padding:16px;padding-top:0">
-        <p style="font-size:0.8125rem;line-height:1.6;color:var(--text-dim);margin:0 0 12px">If the window cannot open, use <b>Use email and password instead</b> or paste a token by hand. A user token is the same credential the Discord app itself uses — Kizzey needs it for Rich Presence and the message mirror, never a bot token.</p>
+        <p style="font-size:0.8125rem;line-height:1.6;color:var(--text-dim);margin:0 0 12px">If the window cannot open, use <b>Use email and password instead</b> or paste a token by hand. When Discord asks for a captcha on the password path, it appears in this sheet and you solve it on the device you are using. A user token is the same credential the Discord app itself uses — Kizzey needs it for Rich Presence and the message mirror, never a bot token.</p>
         <div class="login-steps">
           <span><b class="step-num">1</b><span>Open <a href="https://discord.com/login" target="_blank" rel="noopener">discord.com/login</a> in a desktop browser and sign in.</span></span>
           <span><b class="step-num">2</b><span>Press <kbd>F12</kbd>, open <b>Application</b>, then <b>Local Storage → https://discord.com</b>.</span></span>
