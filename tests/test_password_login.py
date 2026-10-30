@@ -6,6 +6,7 @@ endpoint and the identity endpoint with deterministic fakes, so no request
 leaves the machine. Everything is written to a temporary data directory.
 """
 import atexit
+import base64
 import copy
 import json
 import shutil
@@ -190,7 +191,9 @@ def fake_login_post(url, body, timeout=25, extra_headers=None):
         if headers.get("X-Captcha-Key") == "solved-token-abc":
             return {"token": "tok-delta-captcha-444"}
         info = {
-            "captcha_key": ["captcha-required"],
+            "captcha_key": ["captcha-required", "invalid-input-response"]
+            if headers.get("X-Captcha-Key")
+            else ["captcha-required"],
             "captcha_sitekey": "site-key-abc",
             "captcha_service": "hcaptcha",
             "captcha_session_id": "session-abc",
@@ -322,6 +325,14 @@ def main():
         check((state.get("auth") or {}) is None or "oauth" not in (state.get("auth") or {}), "no OAuth surface remains")
         check("oauth" not in json.dumps(initial).lower(), "state never mentions OAuth")
         check(state.get("accounts") == [], "a fresh install has no accounts")
+        login_headers = server._login_headers()
+        login_props = json.loads(base64.b64decode(login_headers["X-Super-Properties"]))
+        check(
+            login_props.get("browser") == "Chrome"
+            and login_props.get("browser_user_agent") == login_headers.get("User-Agent"),
+            "the password flow identifies as the same web client that solves the captcha",
+            str(login_props)[:220],
+        )
 
         # --- input validation -------------------------------------------------
         status, blank_login = request("POST", "/api/auth/login", {"login": "", "password": "x"})
@@ -346,6 +357,7 @@ def main():
         check(challenge.get("sessionId") == "session-abc", "the captcha challenge carries its session id", str(challenge)[:220])
         check(challenge.get("rqdata") == "rqdata-abc" and challenge.get("rqtoken") == "rqtoken-abc", "the captcha challenge carries its Enterprise request data", str(challenge)[:220])
         check(challenge.get("invisible") is False, "a visible challenge is reported as visible")
+        check(challenge.get("errors") == ["captcha-required"], "a fresh challenge carries Discord's reason", str(challenge)[:220])
 
         # --- rate limiting ----------------------------------------------------
         status, slow = request("POST", "/api/auth/login", {"login": "delta", "password": "slow-password"})
@@ -360,6 +372,7 @@ def main():
         # --- captcha answer ---------------------------------------------------
         status, stale = request("POST", "/api/auth/login", {"login": "delta", "password": "captcha-password", "captchaKey": "stale-token"})
         check(status == 400 and (stale.get("challenge") or {}).get("sitekey") == "site-key-abc", "a rejected captcha answer returns a fresh challenge", str(stale)[:220])
+        check((stale.get("challenge") or {}).get("errors") == ["captcha-required", "invalid-input-response"], "a rejected captcha answer names Discord's reason", str(stale)[:220])
         check(accounts().get("accounts") == [], "a rejected captcha answer creates no account")
 
         status, solved = request("POST", "/api/auth/login", {

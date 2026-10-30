@@ -90,7 +90,7 @@ DISCORD_LOGIN_API = "https://discord.com/api/v9/auth/login"
 DISCORD_MFA_API = "https://discord.com/api/v9/auth/mfa/totp"
 DISCORD_LOGIN_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/138.0.7204.251 Safari/537.36"
 )
 
 MIME_OVERRIDES = {
@@ -5636,6 +5636,10 @@ BROWSER_LOGIN_ABORT = threading.Event()
 
 
 def _login_headers() -> dict:
+    # The password flow drives a web hCaptcha widget, so it must look like the
+    # web client too. Pairing a Chrome user agent with Android client properties
+    # makes Discord issue a challenge for a different client than the one that
+    # solves it.
     return {
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
@@ -5643,10 +5647,35 @@ def _login_headers() -> dict:
         "Origin": "https://discord.com",
         "Referer": LOGIN_SOURCE,
         "User-Agent": DISCORD_LOGIN_UA,
-        "X-Super-Properties": super_properties(),
+        "X-Super-Properties": web_super_properties(),
         "X-Discord-Locale": "en-US",
         "X-Discord-Timezone": "Europe/London",
+        "Sec-Ch-Ua": '"Google Chrome";v="138", "Chromium";v="138", "Not_A Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
     }
+
+
+def web_super_properties() -> str:
+    """Client properties matching DISCORD_LOGIN_UA, for the web password flow."""
+    props = {
+        "os": "Windows",
+        "browser": "Chrome",
+        "device": "",
+        "system_locale": "en-US",
+        "browser_user_agent": DISCORD_LOGIN_UA,
+        "browser_version": "138.0.7204.251",
+        "os_version": "10",
+        "referrer": "",
+        "referring_domain": "",
+        "referrer_current": "",
+        "referring_domain_current": "",
+        "release_channel": "stable",
+        "client_build_number": 655747,
+        "client_event_source": None,
+    }
+    raw = json.dumps(props, separators=(",", ":")).encode()
+    return base64.b64encode(raw).decode()
 
 
 def _login_post(url: str, body: dict, timeout: float = 25, extra_headers: dict | None = None) -> dict:
@@ -5744,7 +5773,21 @@ def captcha_challenge(info: dict) -> dict:
         "rqdata": _captcha_text(info.get("captcha_rqdata"), 8192),
         "rqtoken": _captcha_text(info.get("captcha_rqtoken"), 8192),
         "invisible": bool(info.get("should_serve_invisible")),
+        "errors": _captcha_errors(info),
     }
+
+
+def _captcha_errors(info: dict) -> list[str]:
+    """Discord's own captcha rejection codes, safe to show to the operator."""
+    raw = info.get("captcha_key") if isinstance(info, dict) else None
+    if not isinstance(raw, list):
+        return []
+    codes = []
+    for value in raw[:4]:
+        text = _captcha_text(value, 120)
+        if text and text not in codes:
+            codes.append(text)
+    return codes
 
 
 def _captcha_headers(captcha: dict | None) -> dict:

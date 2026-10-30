@@ -38,7 +38,10 @@
     if (hcaptchaLoader) return hcaptchaLoader;
     hcaptchaLoader = new Promise((resolve, reject) => {
       const script = document.createElement('script');
-      script.src = 'https://js.hcaptcha.com/1/api.js?render=explicit&hl=en';
+      // Discord's challenge is minted for discord.com. Tell hCaptcha the host
+      // explicitly, the same way the mobile SDK does inside a webview, so the
+      // solved token is not stamped with this server's LAN address.
+      script.src = 'https://js.hcaptcha.com/1/api.js?render=explicit&hl=en&host=discord.com';
       script.async = true;
       script.defer = true;
       script.onload = () => {
@@ -344,7 +347,11 @@
         // The token was rejected or the password was wrong; Discord issued a
         // fresh challenge. Render that one instead of reusing the dead token.
         await showCaptcha(prefix, next);
-        showError(`${prefix}-captcha`, error.message);
+        const codes = (next.errors || []).filter(code => code && code !== 'captcha-required');
+        showError(
+          `${prefix}-captcha`,
+          codes.length ? `${error.message} Discord said: ${codes.join(', ')}.` : error.message
+        );
         return;
       }
       setStep(prefix, 'credentials');
@@ -373,7 +380,7 @@
     const slot = document.querySelector(`[data-captcha-slot="${prefix}"]`);
     if (!slot) return;
     const button = document.querySelector(`#${prefix}-captcha-submit`);
-    if (button) button.disabled = true;
+    if (button) button.disabled = false;
     slot.innerHTML = '<div class="captcha-loading">Loading the check…</div>';
     let api;
     try {
@@ -395,7 +402,10 @@
     const options = {
       sitekey: challenge.sitekey,
       theme: document.documentElement.dataset.theme === 'light' ? 'light' : 'dark',
-      size: challenge.invisible ? 'invisible' : 'compact',
+      // Enterprise request data is only honoured by execute(), not render():
+      // render() drops unknown keys, so the check always runs invisibly and is
+      // started with the rqdata value Discord sent.
+      size: 'invisible',
       callback: token => {
         state.token = token;
         clearError(`${prefix}-captcha`);
@@ -404,13 +414,18 @@
       },
       'expired-callback': () => {
         state.token = '';
-        if (button) button.disabled = true;
+        if (button) button.disabled = false;
         showError(`${prefix}-captcha`, 'That check expired. Solve it again.');
-        try { api.reset(state.widget); } catch (err) {}
+        runCaptcha(prefix);
+      },
+      'close-callback': () => {
+        if (!state.token) {
+          showError(`${prefix}-captcha`, 'The check was closed before it finished. Try again.');
+        }
       },
       'error-callback': () => {
         state.token = '';
-        if (button) button.disabled = true;
+        if (button) button.disabled = false;
         showError(
           `${prefix}-captcha`,
           'The captcha could not run in this browser. Use a token instead.'
@@ -418,7 +433,6 @@
         revealTokenBlock(prefix, true);
       },
     };
-    if (challenge.rqdata) options.rqdata = challenge.rqdata;
     try {
       state.widget = api.render(slot, options);
     } catch (error) {
@@ -426,9 +440,20 @@
       revealTokenBlock(prefix, true);
       return;
     }
-    if (challenge.invisible) {
-      try { api.execute(state.widget); } catch (err) {}
+    runCaptcha(prefix);
+  }
+
+  function runCaptcha(prefix) {
+    const state = captchaState(prefix);
+    if (state.widget === null || !window.hcaptcha) return;
+    const data = {};
+    if (state.challenge && state.challenge.rqdata) data.rqdata = state.challenge.rqdata;
+    // execute() carries rqdata into hCaptcha's challenge request. setData()
+    // covers builds that read Enterprise data from the widget instead.
+    if (data.rqdata && typeof window.hcaptcha.setData === 'function') {
+      try { window.hcaptcha.setData(state.widget, { rqdata: data.rqdata }); } catch (err) {}
     }
+    try { window.hcaptcha.execute(state.widget, data); } catch (err) {}
   }
 
   K.actions['login-captcha'] = function (el) {
@@ -443,11 +468,11 @@
       submitCaptcha(prefix, state.token);
       return;
     }
-    if (state.challenge.invisible && window.hcaptcha && state.widget !== null) {
-      try { window.hcaptcha.execute(state.widget); } catch (err) {}
+    if (state.widget !== null) {
+      runCaptcha(prefix);
       return;
     }
-    showError(`${prefix}-captcha`, 'Solve the check first.');
+    showError(`${prefix}-captcha`, 'The check is still loading. Try again in a moment.');
   };
 
   K.actions['login-browser'] = async function (el) {

@@ -475,6 +475,7 @@ function accountsState(overrides = {}) {
   check(index.includes('/login.js') && index.indexOf('/login.js') < index.indexOf('/app.js'), 'login panel loads before the router');
   const loginJs = fs.readFileSync(path.join(root, 'static', 'login.js'), 'utf8');
   check(loginJs.includes('js.hcaptcha.com') && loginJs.includes('captchaRqToken'), 'the captcha runs in the browser and returns only a solved token');
+  check(loginJs.includes("data.rqdata") && /execute\(state\.widget,\s*data\)/.test(loginJs) && !/options\.rqdata/.test(loginJs), 'Enterprise challenge data is sent to the widget, not dropped by render');
   check(!/2captcha|capsolver|anti-captcha/i.test(loginJs), 'the captcha is not outsourced to a solver service');
   check(settings.includes("tappable('Discord login'") && settings.includes("action: 'account-add'"), 'settings opens the password login sheet');
   check(!/oauth/i.test(settings), 'settings has no OAuth wording');
