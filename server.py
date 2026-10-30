@@ -3253,7 +3253,7 @@ class WSClient:
             elif length == 127:
                 length = struct.unpack("!Q", self._read_exact(8))[0]
             if length > 64 * 1024 * 1024:
-                raise GatewayClosed("gateway frame too large")
+                raise GatewayClosed(f"gateway frame too large ({length} bytes)")
             mask_key = self._read_exact(4) if masked else b""
             payload = self._read_exact(length)
             if masked:
