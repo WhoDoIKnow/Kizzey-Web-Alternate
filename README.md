@@ -162,17 +162,23 @@ Kizzey shows the two-factor field and posts the current code from your authentic
 Discord.
 
 The password is used only for that one login request, is never logged and is never written anywhere;
-only the session token Discord returns is kept, in `data/secret.json`. If Discord answers with a
-captcha challenge, the sheet reveals the token block and asks you to paste a token instead, because a
-captcha cannot be solved by the server on your behalf.
+only the session token Discord returns is kept, in `data/secret.json`.
+
+Discord frequently answers a password login from a datacenter or headless server with a captcha.
+Kizzey relays that challenge to the browser you are using: the sign-in sheet loads Discord's hCaptcha
+widget, you solve it on your phone or laptop, and only the solved response token goes back to Discord
+with the retry. The server neither solves the challenge itself nor sends it to a third-party solver,
+and the challenge data is never written to disk. The widget is the only external script the app
+loads; hCaptcha sees the browser's IP address and the Kizzey address, never the password. If the
+widget cannot load on that device, the sheet falls back to the token box.
 
 ### Use a token instead
 
 Rich Presence is sent through the user gateway, not a bot account, so the presence and message
 features need a Discord user token. The sign-in sheet keeps that path behind **Use a token instead**:
 open Discord in a desktop browser, copy the `token` value from Local Storage, and paste it once.
-This is the web equivalent of the Android app's WebView session, and it is also the fallback when a
-login hits a captcha or a two-factor method the server cannot drive.
+This is the web equivalent of the Android app's WebView session, and it is also the fallback when the
+captcha widget cannot load or a two-factor method cannot be driven.
 
 The token is validated against Discord, stored in `data/secret.json`, and used server-side. Public
 state, logs, API responses and state exports never include it. A token is a live credential to the
@@ -334,7 +340,7 @@ against a stubbed Material runtime.
 - Persistent history, server logs and usage counters
 - Saved presets, a gallery with local submissions, and automation schedules
 - Up to eight saved Discord accounts, each able to hold its own live Rich Presence at once
-- Discord web sign-in in a local browser or a remote Chrome DevTools endpoint, plus email/password with two-factor and a user-token fallback
+- Discord web sign-in in a local browser or a remote Chrome DevTools endpoint, plus email/password with an in-browser captcha relay, two-factor and a user-token fallback
 - A real, rate-limited message mirror with normal and managed-webhook identity formats
 - Optional album-art backdrop and artwork-sampled accent colour in Display settings
 - Custom CSS variables, text scaling, themes, AMOLED mode and Material You-style accents

@@ -438,6 +438,7 @@ function accountsState(overrides = {}) {
   check(panel.includes('data-submit-action="login-submit"') && panel.includes('id="sheet-login"'), 'login panel posts an email/username form like discord.com');
   check(panel.includes('id="sheet-password"') && panel.includes('autocomplete="current-password"'), 'login panel collects a password field');
   check(panel.includes('data-submit-action="login-mfa"') && panel.includes('id="sheet-code"'), 'login panel carries a two-factor step');
+  check(panel.includes('data-submit-action="login-captcha"') && panel.includes('data-captcha-slot="sheet"'), 'login panel carries an in-browser captcha step');
   check(panel.includes('data-action="login-token-toggle"') && panel.includes('data-token-block="sheet"'), 'login panel keeps the token path behind an explicit toggle');
   check(panel.includes('id="sheet-token"') && panel.includes('login-token-block hidden" data-token-block="sheet"'), 'login panel keeps the token block hidden until asked');
   check(panel.includes('Email or username'), 'login panel labels the credential field');
@@ -472,6 +473,9 @@ function accountsState(overrides = {}) {
   check(settings.includes("route: 'accounts'") && settings.includes("route: 'mirror'"), 'settings links target the new routes');
   check(serviceWorker.includes('/screens-accounts.js') && serviceWorker.includes('/login.js'), 'service worker caches the new screens');
   check(index.includes('/login.js') && index.indexOf('/login.js') < index.indexOf('/app.js'), 'login panel loads before the router');
+  const loginJs = fs.readFileSync(path.join(root, 'static', 'login.js'), 'utf8');
+  check(loginJs.includes('js.hcaptcha.com') && loginJs.includes('captchaRqToken'), 'the captcha runs in the browser and returns only a solved token');
+  check(!/2captcha|capsolver|anti-captcha/i.test(loginJs), 'the captcha is not outsourced to a solver service');
   check(settings.includes("tappable('Discord login'") && settings.includes("action: 'account-add'"), 'settings opens the password login sheet');
   check(!/oauth/i.test(settings), 'settings has no OAuth wording');
   check(css.includes('.account-list-row') && css.includes('.mirror-route') && css.includes('.mirror-toggle'), 'new components have Material styles');

@@ -5649,9 +5649,12 @@ def _login_headers() -> dict:
     }
 
 
-def _login_post(url: str, body: dict, timeout: float = 25) -> dict:
+def _login_post(url: str, body: dict, timeout: float = 25, extra_headers: dict | None = None) -> dict:
     data = json.dumps(body).encode()
-    req = urllib.request.Request(url, data=data, headers=_login_headers(), method="POST")
+    headers = _login_headers()
+    for name, value in (extra_headers or {}).items():
+        headers[str(name)] = str(value)
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
@@ -5689,8 +5692,8 @@ def _login_error_message(status: int, info: dict) -> str:
         return f"Discord is rate limiting this sign-in. Wait {wait} seconds and try again."
     if info.get("captcha_key") or info.get("captcha_sitekey"):
         return (
-            "Discord wants a captcha for this sign-in, which this app cannot solve. "
-            "Sign in at discord.com in your browser, then paste the token instead."
+            "Discord wants a captcha before it will finish this sign-in. "
+            "Solve the check below, or use a token instead."
         )
     message_text = str(info.get("message") or "").strip()
     lowered = message_text.lower()
@@ -5707,11 +5710,63 @@ def _login_error_message(status: int, info: dict) -> str:
     return f"Discord returned HTTP {status}."
 
 
-def discord_password_login(login: str, password: str) -> dict:
+def _captcha_text(value, limit: int = 8192) -> str:
+    """A header-safe challenge value, or "" when it cannot be used."""
+    text = str(value or "").strip()
+    if not text or len(text) > limit or "\r" in text or "\n" in text:
+        return ""
+    return text
+
+
+def captcha_challenge(info: dict) -> dict:
+    """The challenge a browser needs to show, from Discord's 400 response.
+
+    Discord's hCaptcha site key is per-request, so it has to travel back to the
+    browser together with the Enterprise request data. Unknown services get an
+    empty challenge: the panel then falls back to the token box instead of
+    rendering a widget it cannot drive.
+    """
+    if not isinstance(info, dict) or not (info.get("captcha_key") or info.get("captcha_sitekey")):
+        return {}
+    service = str(info.get("captcha_service") or "").strip().lower() or "hcaptcha"
+    sitekey = _captcha_text(info.get("captcha_sitekey"), 256)
+    if service != "hcaptcha":
+        return {}
+    if not sitekey:
+        return {}
+    return {
+        "service": service,
+        "sitekey": sitekey,
+        "sessionId": _captcha_text(info.get("captcha_session_id"), 512),
+        "rqdata": _captcha_text(info.get("captcha_rqdata"), 8192),
+        "rqtoken": _captcha_text(info.get("captcha_rqtoken"), 8192),
+        "invisible": bool(info.get("should_serve_invisible")),
+    }
+
+
+def _captcha_headers(captcha: dict | None) -> dict:
+    """Discord takes a solved captcha in headers, not the JSON body."""
+    if not isinstance(captcha, dict):
+        return {}
+    key = _captcha_text(captcha.get("key"))
+    if not key:
+        return {}
+    headers = {"X-Captcha-Key": key}
+    session_id = _captcha_text(captcha.get("sessionId"), 512)
+    if session_id:
+        headers["X-Captcha-Session-Id"] = session_id
+    rqtoken = _captcha_text(captcha.get("rqtoken"))
+    if rqtoken:
+        headers["X-Captcha-Rqtoken"] = rqtoken
+    return headers
+
+
+def discord_password_login(login: str, password: str, captcha: dict | None = None) -> dict:
     """Sign in with email/username + password.
 
     Returns ``{"status": "ok", "token": ...}`` or
-    ``{"status": "mfa", "ticket": ..., "methods": [...]}``.
+    ``{"status": "mfa", "ticket": ..., "methods": [...]}``. A ``captcha`` dict
+    holds a solved hCaptcha response and the challenge tokens that came with it.
     """
     login = str(login or "").strip()
     password = str(password or "")
@@ -5719,16 +5774,20 @@ def discord_password_login(login: str, password: str) -> dict:
         raise DiscordError(400, "Enter your Discord email or username.")
     if not password:
         raise DiscordError(400, "Enter your Discord password.")
+    captcha_headers = _captcha_headers(captcha)
+    body = {
+        "login": login,
+        "password": password,
+        "undelete": False,
+        "login_source": None,
+        "gift_code_sku_id": None,
+    }
+    if not captcha_headers:
+        body["captcha_key"] = None
     payload = _login_post(
         DISCORD_LOGIN_API,
-        {
-            "login": login,
-            "password": password,
-            "undelete": False,
-            "login_source": None,
-            "gift_code_sku_id": None,
-            "captcha_key": None,
-        },
+        body,
+        extra_headers=captcha_headers,
     )
     token = clean_discord_token(payload.get("token"))
     if token:
@@ -5758,9 +5817,9 @@ def discord_mfa_login(ticket: str, code: str) -> str:
     return token
 
 
-def login_with_password(login: str, password: str) -> dict:
+def login_with_password(login: str, password: str, captcha: dict | None = None) -> dict:
     """Sign in and save the account. Returns the MFA challenge or the user."""
-    result = discord_password_login(login, password)
+    result = discord_password_login(login, password, captcha=captcha)
     if result["status"] == "mfa":
         STORE.log("INFO", "Account", "Discord asked for a two-factor code.")
         return {"status": "mfa", "ticket": result["ticket"], "methods": result["methods"]}
@@ -7104,11 +7163,33 @@ class Handler(BaseHTTPRequestHandler):
                 data = self.read_json()
                 login = str(data.get("login") or data.get("email") or data.get("username") or "")
                 password = str(data.get("password") or "")
+                captcha_key = _captcha_text(
+                    data.get("captchaKey") or data.get("captcha_key") or ""
+                )
+                captcha = None
+                if captcha_key:
+                    captcha = {
+                        "key": captcha_key,
+                        "sessionId": data.get("captchaSessionId")
+                        or data.get("captcha_session_id")
+                        or "",
+                        "rqtoken": data.get("captchaRqToken")
+                        or data.get("captcha_rqtoken")
+                        or "",
+                    }
                 try:
-                    result = login_with_password(login, password)
+                    result = login_with_password(login, password, captcha=captcha)
                 except DiscordError as exc:
                     STORE.log("WARN", "Account", f"Password sign-in failed: {_scrub(exc.message)[:160]}")
-                    return self.send_error_json(exc.message, exc.status or 401, captcha=bool(exc.data.get("captcha_key")))
+                    extra = {
+                        "captcha": bool(
+                            exc.data.get("captcha_key") or exc.data.get("captcha_sitekey")
+                        )
+                    }
+                    challenge = captcha_challenge(exc.data)
+                    if challenge:
+                        extra["challenge"] = challenge
+                    return self.send_error_json(exc.message, exc.status or 401, **extra)
                 if result.get("status") == "mfa":
                     return self.send_json(
                         {

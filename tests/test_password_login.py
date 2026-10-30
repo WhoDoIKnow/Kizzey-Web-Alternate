@@ -155,6 +155,7 @@ GAMMA_ID = "100000000000000003"
 USERS = {
     "tok-delta-pw-111": fake_user(DELTA_ID, "delta", "Delta"),
     "tok-delta-mfa-222": fake_user(DELTA_ID, "delta", "Delta"),
+    "tok-delta-captcha-444": fake_user(DELTA_ID, "delta", "Delta"),
     "tok-gamma-333": fake_user(GAMMA_ID, "gamma", "Gamma"),
 }
 BAD_TOKEN = "tok-bad-999"
@@ -162,10 +163,12 @@ BAD_TOKEN = "tok-bad-999"
 MFA_CODE = "123456"
 
 LOGIN_CALLS = []
+LOGIN_HEADERS = []
 
 
-def fake_login_post(url, body, timeout=25):
+def fake_login_post(url, body, timeout=25, extra_headers=None):
     LOGIN_CALLS.append((url, dict(body or {})))
+    LOGIN_HEADERS.append(dict(extra_headers or {}))
     if url == server.DISCORD_MFA_API:
         code = str((body or {}).get("data") or "")
         if code != MFA_CODE:
@@ -183,9 +186,17 @@ def fake_login_post(url, body, timeout=25):
         info = {"message": "Invalid Form Body", "code": 50035}
         raise server.DiscordError(401, server._login_error_message(401, info), info)
     if password == "captcha-password":
+        headers = extra_headers or {}
+        if headers.get("X-Captcha-Key") == "solved-token-abc":
+            return {"token": "tok-delta-captcha-444"}
         info = {
             "captcha_key": ["captcha-required"],
             "captcha_sitekey": "site-key-abc",
+            "captcha_service": "hcaptcha",
+            "captcha_session_id": "session-abc",
+            "captcha_rqdata": "rqdata-abc",
+            "captcha_rqtoken": "rqtoken-abc",
+            "should_serve_invisible": False,
             "message": "Invalid Form Body",
         }
         raise server.DiscordError(400, server._login_error_message(400, info), info)
@@ -280,6 +291,7 @@ def data_files_containing(needles):
 PRIVATE = [
     "tok-delta-pw-111",
     "tok-delta-mfa-222",
+    "tok-delta-captcha-444",
     "tok-gamma-333",
     BAD_TOKEN,
 ]
@@ -329,6 +341,11 @@ def main():
         check("captcha" in captcha.get("error", "").lower(), "a captcha demand is explained", str(captcha)[:220])
         check(captcha.get("captcha") is True, "a captcha demand sets the captcha flag")
         check(accounts().get("accounts") == [], "a captcha demand creates no account")
+        challenge = captcha.get("challenge") or {}
+        check(challenge.get("service") == "hcaptcha" and challenge.get("sitekey") == "site-key-abc", "the captcha challenge carries its service and site key", str(challenge)[:220])
+        check(challenge.get("sessionId") == "session-abc", "the captcha challenge carries its session id", str(challenge)[:220])
+        check(challenge.get("rqdata") == "rqdata-abc" and challenge.get("rqtoken") == "rqtoken-abc", "the captcha challenge carries its Enterprise request data", str(challenge)[:220])
+        check(challenge.get("invisible") is False, "a visible challenge is reported as visible")
 
         # --- rate limiting ----------------------------------------------------
         status, slow = request("POST", "/api/auth/login", {"login": "delta", "password": "slow-password"})
@@ -339,6 +356,25 @@ def main():
         status, nothing = request("POST", "/api/auth/login", {"login": "delta", "password": "empty-password"})
         check(status == 502, "an empty login response is a bad gateway", str(nothing)[:200])
         check(accounts().get("accounts") == [], "an empty login response creates no account")
+
+        # --- captcha answer ---------------------------------------------------
+        status, stale = request("POST", "/api/auth/login", {"login": "delta", "password": "captcha-password", "captchaKey": "stale-token"})
+        check(status == 400 and (stale.get("challenge") or {}).get("sitekey") == "site-key-abc", "a rejected captcha answer returns a fresh challenge", str(stale)[:220])
+        check(accounts().get("accounts") == [], "a rejected captcha answer creates no account")
+
+        status, solved = request("POST", "/api/auth/login", {
+            "login": "delta",
+            "password": "captcha-password",
+            "captchaKey": "solved-token-abc",
+            "captchaSessionId": "session-abc",
+            "captchaRqToken": "rqtoken-abc",
+        })
+        check(status == 200 and solved.get("status") == "ok", "a solved captcha finishes the sign-in", str(solved)[:220])
+        solved_headers = LOGIN_HEADERS[-1]
+        check(solved_headers.get("X-Captcha-Key") == "solved-token-abc", "the solved token travels in the captcha header", str(solved_headers)[:220])
+        check(solved_headers.get("X-Captcha-Session-Id") == "session-abc", "the captcha session id travels in its header", str(solved_headers)[:220])
+        check(solved_headers.get("X-Captcha-Rqtoken") == "rqtoken-abc", "the captcha request token travels in its header", str(solved_headers)[:220])
+        check(len(solved.get("state", {}).get("accounts") or []) == 1, "a solved captcha saves the account")
 
         # --- successful password sign-in -------------------------------------
         status, signed = request("POST", "/api/auth/login", {"login": "delta@example.com", "password": "right-password"})
@@ -362,6 +398,7 @@ def main():
         check(not leaks(accounts(), PRIVATE), "the account list exposes no token")
         check(not leaks(request("GET", "/api/state")[1], PRIVATE), "public state exposes no token")
         check(data_files_containing(["right-password", "wrong-password", "captcha-password", "slow-password"]) == [], "no password text is written to disk")
+        check(data_files_containing(["solved-token-abc", "rqdata-abc", "rqtoken-abc"]) == [], "no captcha answer is written to disk")
 
         delta_id = row.get("id")
 

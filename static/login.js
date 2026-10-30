@@ -9,6 +9,51 @@
   const mfaTickets = {};
   const busy = {};
 
+  // A captcha challenge belongs to one password attempt: the site key is
+  // per-request and the solved token is single-use, so each panel keeps its
+  // own widget and challenge until the retry comes back.
+  const captchas = {};
+  let hcaptchaLoader = null;
+
+  function captchaState(prefix) {
+    if (!captchas[prefix]) {
+      captchas[prefix] = { challenge: null, widget: null, token: '', submitting: false };
+    }
+    return captchas[prefix];
+  }
+
+  function clearCaptcha(prefix) {
+    const state = captchas[prefix];
+    if (!state) return;
+    if (state.widget !== null && window.hcaptcha) {
+      try { window.hcaptcha.remove(state.widget); } catch (err) {}
+    }
+    state.widget = null;
+    state.token = '';
+    state.challenge = null;
+  }
+
+  function loadHCaptcha() {
+    if (window.hcaptcha) return Promise.resolve(window.hcaptcha);
+    if (hcaptchaLoader) return hcaptchaLoader;
+    hcaptchaLoader = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://js.hcaptcha.com/1/api.js?render=explicit&hl=en';
+      script.async = true;
+      script.defer = true;
+      script.onload = () => {
+        if (window.hcaptcha) resolve(window.hcaptcha);
+        else reject(new Error('hCaptcha did not start.'));
+      };
+      script.onerror = () => reject(new Error('hCaptcha could not be loaded.'));
+      document.head.appendChild(script);
+    }).catch(error => {
+      hcaptchaLoader = null;
+      throw error;
+    });
+    return hcaptchaLoader;
+  }
+
   // Browser sign-in runs locally or against KIZZEY_BROWSER_CDP; the panel asks
   // the server which one so the hint matches what the button will actually do.
   let browserInfo = null;
@@ -121,6 +166,17 @@
         <div class="text-center mt-8"><button class="btn btn-ghost btn-sm" type="button" data-action="login-back" data-prefix="${prefix}">Use a different account</button></div>
       </form>
 
+      <form data-login-step="captcha" class="hidden" data-submit-action="login-captcha" novalidate>
+        <div class="login-hint" style="margin-bottom:14px">
+          ${K.icon('shield-check', 'sm')}
+          <div><b>Discord wants a quick check</b><span>Solve the captcha below. It runs in this browser, so the server never has to see it.</span></div>
+        </div>
+        <div class="captcha-slot" data-captcha-slot="${prefix}"></div>
+        <div id="${prefix}-captcha-error" class="field-error hidden"></div>
+        <button class="btn btn-primary btn-block btn-lg" type="submit" data-action="login-captcha" data-prefix="${prefix}" id="${prefix}-captcha-submit" disabled>Continue</button>
+        <div class="text-center mt-8"><button class="btn btn-ghost btn-sm" type="button" data-action="login-back" data-prefix="${prefix}">Use a different account</button></div>
+      </form>
+
       <div class="login-or"><span>or</span></div>
       <button class="btn btn-ghost btn-block btn-sm" type="button" data-action="login-token-toggle" data-prefix="${prefix}" aria-expanded="${tokenOpen ? 'true' : 'false'}" data-open="${tokenOpen ? 'true' : 'false'}">
         ${K.icon('key', 'sm')}Use a token instead
@@ -226,6 +282,7 @@
   }
 
   function finish(data) {
+    Object.keys(captchas).forEach(clearCaptcha);
     K.receiveState(data.state || K.state);
     K.closeSheet();
     K.toast('Discord connected', `Signed in as ${K.displayName()}.`, 'ok');
@@ -234,6 +291,164 @@
     if (typeof cb === 'function') cb(data);
     else K.render();
   }
+
+  // -- captcha relay --------------------------------------------------------
+  //
+  // Discord answers a datacenter password sign-in with an hCaptcha demand. The
+  // server cannot solve that, so the challenge is handed to whichever browser
+  // is using Kizzey: the site key and Enterprise request data come from the
+  // 400 response, the widget runs here, and only the solved response token goes
+  // back. Nothing is outsourced to a solver service.
+
+  function captchaRetryBody(prefix, token) {
+    const state = captchaState(prefix);
+    const challenge = state.challenge || {};
+    const login = (document.querySelector(`#${prefix}-login`)?.value || '').trim();
+    const password = document.querySelector(`#${prefix}-password`)?.value || '';
+    return {
+      login,
+      password,
+      captchaKey: token,
+      captchaSessionId: challenge.sessionId || '',
+      captchaRqToken: challenge.rqtoken || '',
+    };
+  }
+
+  async function submitCaptcha(prefix, token) {
+    const state = captchaState(prefix);
+    if (state.submitting) return;
+    if (!token) {
+      showError(`${prefix}-captcha`, 'Solve the check first.');
+      return;
+    }
+    const body = captchaRetryBody(prefix, token);
+    if (!body.login || !body.password) {
+      setStep(prefix, 'credentials');
+      showError(prefix, 'Enter your Discord email and password again.');
+      return;
+    }
+    state.submitting = true;
+    setBusy(prefix, 'captcha-submit', true, 'Continue', 'Checking...');
+    try {
+      const data = await K.api('/api/auth/login', { method: 'POST', body });
+      if (data.status === 'mfa') {
+        mfaTickets[prefix] = data.ticket || '';
+        setStep(prefix, 'mfa');
+        setTimeout(() => document.querySelector(`#${prefix}-code`)?.focus({ preventScroll: true }), 40);
+        return;
+      }
+      finish(data);
+    } catch (error) {
+      const next = error.data && error.data.challenge;
+      if (next && next.sitekey) {
+        // The token was rejected or the password was wrong; Discord issued a
+        // fresh challenge. Render that one instead of reusing the dead token.
+        await showCaptcha(prefix, next);
+        showError(`${prefix}-captcha`, error.message);
+        return;
+      }
+      setStep(prefix, 'credentials');
+      showError(prefix, error.message);
+      if (error.status === 401) {
+        const password = document.querySelector(`#${prefix}-password`);
+        if (password) {
+          password.select();
+          password.focus();
+        }
+      } else {
+        revealTokenBlock(prefix, true);
+      }
+    } finally {
+      state.submitting = false;
+      setBusy(prefix, 'captcha-submit', false, 'Continue', 'Checking...');
+    }
+  }
+
+  async function showCaptcha(prefix, challenge) {
+    const state = captchaState(prefix);
+    state.challenge = challenge;
+    state.token = '';
+    setStep(prefix, 'captcha');
+    clearError(`${prefix}-captcha`);
+    const slot = document.querySelector(`[data-captcha-slot="${prefix}"]`);
+    if (!slot) return;
+    const button = document.querySelector(`#${prefix}-captcha-submit`);
+    if (button) button.disabled = true;
+    slot.innerHTML = '<div class="captcha-loading">Loading the check…</div>';
+    let api;
+    try {
+      api = await loadHCaptcha();
+    } catch (error) {
+      slot.innerHTML = '';
+      showError(
+        `${prefix}-captcha`,
+        'The captcha could not be loaded on this device. Check the connection, or use a token instead.'
+      );
+      revealTokenBlock(prefix, true);
+      return;
+    }
+    if (state.widget !== null) {
+      try { api.remove(state.widget); } catch (err) {}
+      state.widget = null;
+    }
+    slot.innerHTML = '';
+    const options = {
+      sitekey: challenge.sitekey,
+      theme: document.documentElement.dataset.theme === 'light' ? 'light' : 'dark',
+      size: challenge.invisible ? 'invisible' : 'compact',
+      callback: token => {
+        state.token = token;
+        clearError(`${prefix}-captcha`);
+        if (button) button.disabled = false;
+        submitCaptcha(prefix, token);
+      },
+      'expired-callback': () => {
+        state.token = '';
+        if (button) button.disabled = true;
+        showError(`${prefix}-captcha`, 'That check expired. Solve it again.');
+        try { api.reset(state.widget); } catch (err) {}
+      },
+      'error-callback': () => {
+        state.token = '';
+        if (button) button.disabled = true;
+        showError(
+          `${prefix}-captcha`,
+          'The captcha could not run in this browser. Use a token instead.'
+        );
+        revealTokenBlock(prefix, true);
+      },
+    };
+    if (challenge.rqdata) options.rqdata = challenge.rqdata;
+    try {
+      state.widget = api.render(slot, options);
+    } catch (error) {
+      showError(`${prefix}-captcha`, 'The captcha could not start. Use a token instead.');
+      revealTokenBlock(prefix, true);
+      return;
+    }
+    if (challenge.invisible) {
+      try { api.execute(state.widget); } catch (err) {}
+    }
+  }
+
+  K.actions['login-captcha'] = function (el) {
+    const prefix = prefixOf(el);
+    const state = captchaState(prefix);
+    if (state.submitting) return;
+    if (!state.challenge) {
+      setStep(prefix, 'credentials');
+      return;
+    }
+    if (state.token) {
+      submitCaptcha(prefix, state.token);
+      return;
+    }
+    if (state.challenge.invisible && window.hcaptcha && state.widget !== null) {
+      try { window.hcaptcha.execute(state.widget); } catch (err) {}
+      return;
+    }
+    showError(`${prefix}-captcha`, 'Solve the check first.');
+  };
 
   K.actions['login-browser'] = async function (el) {
     const prefix = prefixOf(el);
@@ -321,10 +536,14 @@
       }
       finish(data);
     } catch (error) {
-      const captcha = !!(error.data && error.data.captcha);
+      const challenge = error.data && error.data.challenge;
+      if (challenge && challenge.sitekey) {
+        await showCaptcha(prefix, challenge);
+        return;
+      }
       showError(prefix, error.message);
-      if (captcha) {
-        // Discord blocked the password path; the token route is the way through.
+      if (error.data && error.data.captcha) {
+        // The challenge could not be rendered here; the token route is the way through.
         revealTokenBlock(prefix, true);
         setTimeout(() => document.querySelector(`#${prefix}-token`)?.focus({ preventScroll: true }), 40);
       } else if (error.status === 401) {
@@ -372,6 +591,8 @@
   K.actions['login-back'] = function (el) {
     const prefix = prefixOf(el);
     mfaTickets[prefix] = '';
+    clearCaptcha(prefix);
+    clearError(`${prefix}-captcha`);
     const code = document.querySelector(`#${prefix}-code`);
     if (code) code.value = '';
     clearError(`${prefix}-mfa`);

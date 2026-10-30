@@ -843,6 +843,9 @@ html[data-theme="light"] .map-card iframe { filter: saturate(.9); }
 .login-hint { display: flex; gap: 10px; padding: 12px 13px; border-radius: 16px; background: var(--surface-2); color: var(--muted); font-size: 0.75rem; line-height: 1.5; }
 .login-hint .icon { width: 16px; height: 16px; flex: none; margin-top: 2px; color: var(--primary); }
 .login-hint b { display: block; color: var(--text); font-size: 0.8125rem; margin-bottom: 2px; }
+.captcha-slot { display: flex; justify-content: center; margin: 2px 0 12px; min-height: 0; }
+.captcha-slot iframe { max-width: 100%; border-radius: 8px; }
+.captcha-loading { color: var(--faint); font-size: 0.75rem; padding: 18px 0; }
 
 /* ---------- drawer ---------- */
 .scrim { position: fixed; inset: 0; background: rgba(5, 3, 8, .58); backdrop-filter: blur(3px); z-index: 40; opacity: 0; pointer-events: none; transition: opacity .24s var(--ease); }
