@@ -206,9 +206,12 @@ mirror rule still needs it. An account whose token Discord rejects — a revoked
 deleted account — has only its own token cleared; the other accounts keep running. **Remove all
 accounts** clears every token and closes every socket.
 
-Rich Presence on several accounts is possible at once. The Android app's **Multiple Account RPC**
-instead concerns several RPC sources for one account; Kizzey Web offers per-account presence plus the
-message forwarder below.
+Rich Presence on several accounts is possible at once, and each account keeps its own **Custom RPC**
+card. The name, description, state line, artwork, buttons, timestamps and presence status you edit on
+the Custom RPC screen belong to the focused account. Switch accounts to design a different card,
+then start each one; both presences stay live with their own text. The Android app's **Multiple
+Account RPC** instead concerns several RPC sources for one account; Kizzey Web offers per-account
+presence plus the message forwarder below.
 
 ## Message mirror
 
@@ -340,7 +343,7 @@ against a stubbed Material runtime.
 - Start, stop, refresh, preview, status display type and status-line rolling
 - Persistent history, server logs and usage counters
 - Saved presets, a gallery with local submissions, and automation schedules
-- Up to eight saved Discord accounts, each able to hold its own live Rich Presence at once
+- Up to eight saved Discord accounts, each with its own Custom RPC card and live presence
 - Discord web sign-in in a local browser or a remote Chrome DevTools endpoint, plus email/password with an in-browser captcha relay, two-factor and a user-token fallback
 - A real, rate-limited message mirror with normal and managed-webhook identity formats
 - Optional album-art backdrop and artwork-sampled accent colour in Display settings

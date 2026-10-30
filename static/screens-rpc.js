@@ -612,8 +612,9 @@
     title: 'Custom RPC',
     render() {
       const c = K.get('custom', {});
+      const who = K.esc(K.displayName());
       return `<div class="page">
-        ${rpcHeader('custom', 'Custom RPC', 'Build a card that feels like you.', `<button class="icon-btn" data-action="open-preset-manager" aria-label="Presets">${K.icon('layers')}</button><button class="icon-btn" data-action="save-preset" aria-label="Save preset">${K.icon('bookmark')}</button>`)}
+        ${rpcHeader('custom', 'Custom RPC', `Editing ${who}'s card. Every account keeps its own.`, `<button class="icon-btn" data-action="open-preset-manager" aria-label="Presets">${K.icon('layers')}</button><button class="icon-btn" data-action="save-preset" aria-label="Save preset">${K.icon('bookmark')}</button>`)}
         ${statusCard('custom', 'Custom RPC', 'All changes save as you type.')}
         <div class="preview-wrap" id="rpc-preview">${customPreview(c)}</div>
         ${K.sectionLabel('Start from a preset', `<span style="font-size:0.65625rem;color:var(--faint);text-transform:none;letter-spacing:0">${K.presetLibrary.length} cards</span>`)}

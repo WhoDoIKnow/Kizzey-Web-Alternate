@@ -22,7 +22,7 @@ function esc(value) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-const calls = { api: [], sheets: [], confirms: [], toasts: [], renders: 0, closed: 0 };
+const calls = { api: [], sheets: [], confirms: [], toasts: [], renders: 0, closed: 0, flushes: 0 };
 let state = {};
 let apiReply = null;
 
@@ -83,6 +83,7 @@ const K = {
   closeSheet() { calls.closed++; },
   confirm(opts) { calls.confirms.push(opts); },
   toast(title, message, type = '') { calls.toasts.push({ title, message, type }); },
+  async flush() { calls.flushes++; },
   async api(endpoint, options = {}) {
     calls.api.push({ endpoint, options });
     if (apiReply instanceof Error) throw apiReply;
@@ -300,6 +301,7 @@ function accountsState(overrides = {}) {
   state = accountsState();
   calls.api.length = 0;
   await K.actions['account-switch']({ dataset: { id: 'acct_beta22' }, disabled: false });
+  check(calls.flushes >= 1, 'account switch flushes pending edits before changing focus');
   check(calls.api.at(-1).endpoint === '/api/accounts/switch' && calls.api.at(-1).options.body.id === 'acct_beta22', 'account switch posts the selected account ID');
   check(calls.toasts.at(-1).title === 'Switched account', 'account switch reports success');
 

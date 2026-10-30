@@ -763,6 +763,110 @@ def main():
         check(hook_id not in (secret.get("mirrorWebhooks") or {}), "deleting a relay removes its webhook token")
         check(again_hook.get("id") in fake_discord.webhook_deletes, "deleting a relay removes its Discord webhook")
 
+        # Custom RPC is a per-account editor: switching focus must not overwrite
+        # the other account's card, and both cards can run simultaneously.
+        status, beta_card = request(
+            "POST",
+            "/api/patch",
+            {
+                "updates": {
+                    "custom": {
+                        "name": "Beta card",
+                        "details": "Only beta shows this",
+                        "state": "beta state",
+                        "status": "dnd",
+                    }
+                }
+            },
+        )
+        beta_custom = state_of(beta_card).get("custom") or {}
+        check(status == 200 and beta_custom.get("name") == "Beta card", "beta edits its own Custom RPC card", str(beta_card)[:240])
+
+        status, switched_alpha = request("POST", "/api/accounts/switch", {"id": alpha_row.get("id")})
+        alpha_custom = state_of(switched_alpha).get("custom") or {}
+        check(status == 200 and alpha_custom.get("name") != "Beta card", "switching accounts shows the other card, not the last edit")
+        status, alpha_card = request(
+            "POST",
+            "/api/patch",
+            {
+                "updates": {
+                    "custom": {
+                        "name": "Alpha card",
+                        "details": "Only alpha shows this",
+                        "state": "alpha state",
+                        "status": "idle",
+                    }
+                }
+            },
+        )
+        alpha_custom = state_of(alpha_card).get("custom") or {}
+        check(status == 200 and alpha_custom.get("name") == "Alpha card", "alpha edits a different Custom RPC card")
+
+        status, switched_beta = request("POST", "/api/accounts/switch", {"id": beta_row.get("id")})
+        beta_custom = state_of(switched_beta).get("custom") or {}
+        check(beta_custom.get("name") == "Beta card" and beta_custom.get("details") == "Only beta shows this", "beta's card survives the round trip")
+        status, switched_alpha = request("POST", "/api/accounts/switch", {"id": alpha_row.get("id")})
+        alpha_custom = state_of(switched_alpha).get("custom") or {}
+        check(alpha_custom.get("name") == "Alpha card" and alpha_custom.get("status") == "idle", "alpha's card and status survive the round trip")
+
+        status, beta_started = request(
+            "POST",
+            "/api/rpc/start",
+            {"kind": "custom", "accountId": beta_row.get("id")},
+        )
+        check(status == 200 and (beta_started.get("presence") or {}).get("active", {}).get("kind") == "custom", "a background account can start its own Custom RPC")
+        status, alpha_started = request("POST", "/api/rpc/start", {"kind": "custom"})
+        check(status == 200 and (alpha_started.get("presence") or {}).get("active", {}).get("kind") == "custom", "the focused account starts its own Custom RPC")
+
+        def last_activity(account_id):
+            for owner, presence in reversed(fake_gateway.presences):
+                if owner == account_id and presence:
+                    return (presence.get("activities") or [{}])[0], presence
+            return {}, {}
+
+        beta_activity, beta_payload = last_activity(beta_row.get("id"))
+        alpha_activity, alpha_payload = last_activity(alpha_row.get("id"))
+        check(beta_activity.get("name") == "Beta card" and beta_activity.get("details") == "Only beta shows this", "beta's live Discord payload uses beta's description", str(beta_activity)[:240])
+        check(alpha_activity.get("name") == "Alpha card" and alpha_activity.get("details") == "Only alpha shows this", "alpha's live Discord payload uses alpha's description", str(alpha_activity)[:240])
+        check(beta_payload.get("status") == "dnd" and alpha_payload.get("status") == "idle", "each account keeps its own presence status")
+
+        saved_state = json.loads((DATA / "state.json").read_text(encoding="utf-8"))
+        saved_customs = saved_state.get("customs") or {}
+        check(saved_customs.get(alpha_row.get("id"), {}).get("name") == "Alpha card", "alpha's card is persisted per account")
+        check(saved_customs.get(beta_row.get("id"), {}).get("name") == "Beta card", "beta's card is persisted per account")
+
+        status, beta_stopped = request(
+            "POST", "/api/rpc/stop", {"accountId": beta_row.get("id")}
+        )
+        check(status == 200 and beta_stopped.get("stopped") is True, "a background account can be stopped on its own")
+        with server.STORE.lock:
+            alpha_still = bool(
+                ((server.STORE.state.get("presences") or {}).get(alpha_row.get("id")) or {}).get("active")
+            )
+        check(alpha_still, "stopping one account leaves the other presence running")
+
+        status, beta_restarted = request(
+            "POST",
+            "/api/rpc/start",
+            {"kind": "custom", "accountId": beta_row.get("id")},
+        )
+        check(status == 200, "beta can restart while alpha stays focused")
+        status, stopped_all = request("POST", "/api/rpc/stop", {})
+        stopped_ids = set(stopped_all.get("stoppedAccounts") or [])
+        check(
+            status == 200 and stopped_ids == {alpha_row.get("id"), beta_row.get("id")},
+            "Stop all clears every account's presence",
+            str(stopped_all)[:300],
+        )
+        with server.STORE.lock:
+            still_running = [
+                aid
+                for aid in (alpha_row.get("id"), beta_row.get("id"))
+                if ((server.STORE.state.get("presences") or {}).get(aid) or {}).get("active")
+            ]
+        check(still_running == [], "Stop all leaves no account with a live presence", still_running)
+        request("POST", "/api/accounts/switch", {"id": beta_row.get("id")})
+
         status, exported = request("GET", "/api/export")
         check(status == 200 and exported.get("format") == "kizzey-web-backup", "web backup remains available")
         blob = json.dumps(exported)
@@ -851,7 +955,12 @@ def main():
             "/api/import",
             {
                 "format": "kizzey-web-backup",
-                "state": {"mirror": imported_mirror},
+                "state": {
+                    "mirror": imported_mirror,
+                    "customs": {
+                        alpha_row.get("id"): {"name": "Restored alpha card"},
+                    },
+                },
             },
         )
         imported_state = state_of(imported)
@@ -863,6 +972,11 @@ def main():
         check(imported_rule and imported_rule.get("mode") == "webhook" and imported_rule.get("webhookSet") is False, "an imported webhook relay has no webhook until reviewed")
         check(any("mirror rule" in warning.lower() for warning in (imported.get("import") or {}).get("warnings", [])), "import reports the paused relay")
         check(imported_rule and imported_rule.get("lastSeenId") == "8011", "import preserves the cursor for review")
+        check(
+            ((imported_state.get("customs") or {}).get(alpha_row.get("id")) or {}).get("name")
+            == "Restored alpha card",
+            "per-account Custom RPC cards survive a backup import",
+        )
 
         status, deleted = request("POST", "/api/mirror/rules/delete", {"id": "mirror_imported1"})
         check(status == 200 and (state_of(deleted).get("mirror") or {}).get("rules") == [], "a mirror rule can be deleted")

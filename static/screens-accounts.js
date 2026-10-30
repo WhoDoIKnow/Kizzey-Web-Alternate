@@ -279,6 +279,8 @@
     const id = el.dataset.id || '';
     if (!id) return;
     const row = accountById(id);
+    // A queued Custom RPC edit belongs to the account that is still focused.
+    await K.flush().catch(() => {});
     el.disabled = true;
     try {
       const data = await K.api('/api/accounts/switch', { method: 'POST', body: { id } });

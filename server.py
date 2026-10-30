@@ -397,6 +397,35 @@ def empty_presence() -> dict:
     }
 
 
+def default_custom() -> dict:
+    """A blank Custom RPC card, copied once per Discord account."""
+    return {
+        "name": "",
+        "details": "",
+        "state": "",
+        "partyCurrentSize": "",
+        "partyMaxSize": "",
+        "timestampsStart": "",
+        "timestampsStop": "",
+        "platform": "android",
+        "status": "online",
+        "button1": "",
+        "button1link": "",
+        "button2": "",
+        "button2link": "",
+        "largeImg": "",
+        "largeText": "",
+        "smallImg": "",
+        "smallText": "",
+        "type": "0",
+        "url": "",
+        "applicationId": "",
+        "statusDisplayType": -1,
+        "largeUrl": "",
+        "smallUrl": "",
+    }
+
+
 def default_state() -> dict:
     t = now_ms()
     return {
@@ -466,31 +495,8 @@ def default_state() -> dict:
             "offlineMode": False,
             "fontScale": 1.0,
         },
-        "custom": {
-            "name": "",
-            "details": "",
-            "state": "",
-            "partyCurrentSize": "",
-            "partyMaxSize": "",
-            "timestampsStart": "",
-            "timestampsStop": "",
-            "platform": "android",
-            "status": "online",
-            "button1": "",
-            "button1link": "",
-            "button2": "",
-            "button2link": "",
-            "largeImg": "",
-            "largeText": "",
-            "smallImg": "",
-            "smallText": "",
-            "type": "0",
-            "url": "",
-            "applicationId": "",
-            "statusDisplayType": -1,
-            "largeUrl": "",
-            "smallUrl": "",
-        },
+        "custom": default_custom(),
+        "customs": {},
         "savedConfigs": [],
         "recent": [],
         "usage": {},
@@ -1008,6 +1014,7 @@ class Store:
         self.state["version"] = VERSION
         self.state["logs"] = []
         self._normalize_accounts()
+        self._normalize_customs()
         self.save()
 
     @staticmethod
@@ -1137,6 +1144,74 @@ class Store:
             self.state["gateway"]["tokenSet"] = bool(self.secret.get("token"))
             self.secret.setdefault("authError", "")
 
+    def _normalize_customs(self) -> None:
+        """Give every saved account its own Custom RPC card.
+
+        Older state files had one global ``custom`` object. Seed each account
+        from it once, then keep ``state["custom"]`` as the focused account's
+        view so the existing editor code needs no special cases.
+        """
+        with self.lock:
+            customs = self.state.get("customs")
+            if not isinstance(customs, dict):
+                customs = {}
+            seed = self.state.get("custom")
+            if not isinstance(seed, dict):
+                seed = default_custom()
+            account_ids = [
+                str(row.get("id") or "")
+                for row in (self.secret.get("accounts") or [])
+                if str(row.get("id") or "")
+            ]
+            active = str(self.secret.get("activeId") or "")
+            if active and active not in account_ids:
+                account_ids.append(active)
+            for account_id in account_ids:
+                if not isinstance(customs.get(account_id), dict):
+                    customs[account_id] = copy.deepcopy(seed)
+            self.state["customs"] = customs
+            if active:
+                chosen = customs.get(active)
+                self.state["custom"] = copy.deepcopy(chosen if isinstance(chosen, dict) else seed)
+            elif not isinstance(self.state.get("custom"), dict):
+                self.state["custom"] = copy.deepcopy(seed)
+
+    def _custom_seed(self) -> dict:
+        seed = self.state.get("custom")
+        return copy.deepcopy(seed) if isinstance(seed, dict) else default_custom()
+
+    def custom_for(self, account_id: str = "") -> dict:
+        """Return the Custom RPC card for one account, creating it lazily."""
+        with self.lock:
+            account_id = str(account_id or "") or self.active_account_id()
+            customs = self.state.setdefault("customs", {})
+            if not isinstance(customs, dict):
+                customs = {}
+                self.state["customs"] = customs
+            record = customs.get(account_id) if account_id else None
+            if not isinstance(record, dict):
+                if account_id:
+                    record = self._custom_seed()
+                    customs[account_id] = record
+                else:
+                    record = self.state.get("custom")
+                    if not isinstance(record, dict):
+                        record = default_custom()
+            return record
+
+    def adopt_focused_custom(self) -> None:
+        """Write imported or legacy custom edits back to the focused account."""
+        with self.lock:
+            account_id = self.active_account_id()
+            custom = self.state.get("custom")
+            if not account_id or not isinstance(custom, dict):
+                return
+            customs = self.state.setdefault("customs", {})
+            if not isinstance(customs, dict):
+                customs = {}
+                self.state["customs"] = customs
+            customs[account_id] = copy.deepcopy(custom)
+
     def public_accounts(self) -> list[dict]:
         with self.lock:
             return [_account_public(account) for account in self.secret.get("accounts", []) or []]
@@ -1216,6 +1291,7 @@ class Store:
                 existing["authKind"] = "token"
                 existing["needsAuth"] = False
                 existing["authError"] = ""
+            self.custom_for(existing.get("id"))
             self.save()
             return copy.deepcopy(existing), created
 
@@ -1278,6 +1354,9 @@ class Store:
                 return None
             was_active = str(self.secret.get("activeId") or "") == account_id
             self.secret["accounts"] = [row for row in accounts if row.get("id") != account_id]
+            customs = self.state.get("customs")
+            if isinstance(customs, dict):
+                customs.pop(account_id, None)
             rules = self.state.setdefault("mirror", {}).get("rules", []) or []
             for rule in rules:
                 if account_id in (rule.get("sourceAccountId"), rule.get("destAccountId")):
@@ -1319,6 +1398,7 @@ class Store:
             self.secret["authError"] = ""
             self.state["account"] = None
             self.state["gateway"]["tokenSet"] = False
+            self.state["customs"] = {}
             for rule in self.state.setdefault("mirror", {}).get("rules", []) or []:
                 rule["enabled"] = False
                 rule["lastError"] = "No Discord account is available."
@@ -1342,6 +1422,18 @@ class Store:
                 record["connected"] = False
             self.state["gateway"] = record
             self.state["presence"] = copy.deepcopy(presences.get(account_id) or empty_presence())
+            if account_id:
+                customs = self.state.setdefault("customs", {})
+                if not isinstance(customs, dict):
+                    customs = {}
+                    self.state["customs"] = customs
+                custom = customs.get(account_id)
+                if not isinstance(custom, dict):
+                    custom = self._custom_seed()
+                    customs[account_id] = custom
+                self.state["custom"] = copy.deepcopy(custom)
+            elif not isinstance(self.state.get("custom"), dict):
+                self.state["custom"] = default_custom()
 
     # -- events ----------------------------------------------------------
     def subscribe(self) -> queue.Queue:
@@ -1481,6 +1573,7 @@ PROTECTED_PATCH_KEYS = {
     "firstRun",
     "chat",
     "mirror",
+    "customs",
     "tokenSet",
     "tokenHint",
     "serverTime",
@@ -1494,7 +1587,7 @@ def visible_patch(obj: dict) -> dict:
 
 
 IMPORTABLE_STATE_GROUPS = {
-    "settings", "custom", "apps", "media", "console", "experimental", "cycling",
+    "settings", "custom", "customs", "apps", "media", "console", "experimental", "cycling",
     "multiple", "health", "location", "weather", "navigation", "androidAuto",
     "samsung", "emulation", "screenRead", "automation", "drawer", "chatProfile",
     "wallet", "premium", "quickControls", "ui", "recent", "usage", "savedConfigs",
@@ -5228,9 +5321,24 @@ def build_screen_read_activity(state: dict) -> dict:
     }
 
 
-def build_activity(state: dict, kind: str, cycling_index: int = 0) -> dict:
+def account_view(state: dict, account_id: str = "") -> dict:
+    """A shallow state view whose template identity is the given account."""
+    account = STORE.account_by_id(account_id) if STORE and account_id else None
+    if not account:
+        return state
+    view = dict(state)
+    view["account"] = copy.deepcopy(account.get("user") or {})
+    return view
+
+
+def build_activity(
+    state: dict,
+    kind: str,
+    cycling_index: int = 0,
+    custom_cfg: dict | None = None,
+) -> dict:
     if kind == "custom":
-        return build_custom_activity(state)
+        return build_custom_activity(state, custom_cfg)
     if kind == "apps":
         return build_apps_activity(state)
     if kind == "media":
@@ -5247,7 +5355,7 @@ def build_activity(state: dict, kind: str, cycling_index: int = 0) -> dict:
         sources = state.get("multiple", {}).get("sources") or []
         for source in sources:
             try:
-                return build_activity(state, source)
+                return build_activity(state, source, custom_cfg=custom_cfg)
             except Exception:
                 continue
         raise ValueError("Choose at least one working source for Multiple RPC.")
@@ -5255,7 +5363,7 @@ def build_activity(state: dict, kind: str, cycling_index: int = 0) -> dict:
         cyc = state.get("cycling", {})
         types = cyc.get("types") or [0]
         type_value = int(types[cycling_index % len(types)]) if types else 0
-        cfg = dict(state.get("custom", {}))
+        cfg = dict(custom_cfg or state.get("custom", {}))
         cfg["type"] = str(type_value)
         cfg["name"] = cfg.get("name") or "RPC Cycling"
         if type_value == 1:
@@ -5337,6 +5445,8 @@ def send_current_presence(
         if cycle_index is not None:
             record["cycleIndex"] = cycle_index
         idx = cycle_index if cycle_index is not None else record.get("cycleIndex", 0)
+        custom_cfg = copy.deepcopy(store.custom_for(account_id))
+        view = account_view(store.state, account_id)
         sources = []
         if kind == "multiple":
             sources = list(store.state.get("multiple", {}).get("sources") or [])
@@ -5345,16 +5455,16 @@ def send_current_presence(
             if kind == "multiple":
                 for source in sources:
                     try:
-                        activities.append(build_activity(store.state, source))
+                        activities.append(build_activity(view, source, custom_cfg=custom_cfg))
                     except Exception as exc:
                         store.log("WARN", "Presence", f"{source}: {exc}")
             else:
-                activities.append(build_activity(store.state, kind, idx))
+                activities.append(build_activity(view, kind, idx, custom_cfg=custom_cfg))
         except Exception as exc:
             store.log("ERROR", "Presence", f"Could not build presence: {exc}")
             return None
         status = normalize_status(
-            store.state.get("custom", {}).get("status")
+            custom_cfg.get("status")
             if kind == "custom"
             else store.state.get("settings", {}).get("rpcStatus", "online")
         )
@@ -5435,7 +5545,8 @@ class Ticker:
                 return
             kind = active.get("kind")
             started = presence.get("startedAt") or now_ms()
-            cfg = dict(STORE.state.get("custom") or {})
+            cfg = dict(STORE.custom_for(account_id) or {})
+            view = account_view(STORE.state, account_id)
             interval = 0
             if kind == "cycling":
                 cyc = STORE.state.get("cycling") or {}
@@ -5455,9 +5566,9 @@ class Ticker:
             # Refresh dynamic clock/date tokens once a minute when running.
             now = time.time()
             if kind == "custom" and now - self.last_sent.get(account_id, 0.0) >= 60:
-                rendered = expand_template(cfg.get("name", ""), STORE.state) + "|" + expand_template(
-                    cfg.get("details", ""), STORE.state
-                ) + "|" + expand_template(cfg.get("state", ""), STORE.state)
+                rendered = expand_template(cfg.get("name", ""), view) + "|" + expand_template(
+                    cfg.get("details", ""), view
+                ) + "|" + expand_template(cfg.get("state", ""), view)
                 if rendered != self.last_template.get(account_id, ""):
                     self.last_template[account_id] = rendered
                     self.last_sent[account_id] = now
@@ -6792,8 +6903,11 @@ def stop_presence(kind: str | None = None, quiet: bool = False, account_id: str 
         record.clear()
         record.update(empty_presence())
         record["updatedAt"] = now_ms()
-        STORE.state["custom"]["status"] = "online"
         if not quiet:
+            custom = STORE.custom_for(account_id)
+            custom["status"] = "online"
+            if account_id == STORE.active_account_id():
+                STORE.state["custom"] = copy.deepcopy(custom)
             STORE.log("INFO", "Presence", "Stopped all rich presence.")
         STORE.sync_focused()
         focused = account_id == STORE.active_account_id()
@@ -6820,7 +6934,10 @@ def start_presence(kind: str, payload: dict | None = None, account_id: str = "")
         # Feature-specific quick updates from the client.
         with STORE.lock:
             if kind == "custom" and isinstance(payload.get("custom"), dict):
-                deep_merge(STORE.state["custom"], visible_patch(payload["custom"]))
+                custom = STORE.custom_for(account_id)
+                deep_merge(custom, visible_patch(payload["custom"]))
+                if account_id == STORE.active_account_id():
+                    STORE.state["custom"] = copy.deepcopy(custom)
             for key in (
                 "apps",
                 "media",
@@ -6844,7 +6961,8 @@ def start_presence(kind: str, payload: dict | None = None, account_id: str = "")
     try:
         with STORE.lock:
             snapshot = json.loads(json.dumps(STORE.state, ensure_ascii=False))
-        first = build_activity(snapshot, kind)
+            custom_cfg = copy.deepcopy(STORE.custom_for(account_id))
+        first = build_activity(account_view(snapshot, account_id), kind, custom_cfg=custom_cfg)
     except Exception as exc:
         raise ValueError(str(exc)) from exc
     # stop the previous routine for this account, mirroring the Android
@@ -7490,7 +7608,9 @@ class Handler(BaseHTTPRequestHandler):
                 data = self.read_json()
                 kind = str(data.get("kind") or "custom")
                 try:
-                    presence = start_presence(kind, data)
+                    presence = start_presence(
+                        kind, data, account_id=str(data.get("accountId") or "")
+                    )
                     return self.send_json({"ok": True, "presence": presence, "state": public_state()})
                 except DiscordError as exc:
                     return self.send_error_json(exc.message, exc.status or 400, loginRequired=exc.status == 401)
@@ -7498,10 +7618,36 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_error_json(str(exc), 400)
             if path == "/api/rpc/stop":
                 data = self.read_json()
-                stopped = stop_presence(data.get("kind") or None)
+                if not isinstance(data, dict):
+                    data = {}
+                kind = data.get("kind") or None
+                account_id = str(data.get("accountId") or "")
+                # An empty body is the UI's Stop all: clear every account's
+                # presence, not just the focused one. A body with kind: null
+                # still means "stop the focused account".
+                if not account_id and "kind" not in data:
+                    with STORE.lock:
+                        account_ids = [
+                            str(row.get("id") or "")
+                            for row in (STORE.secret.get("accounts") or [])
+                            if str(row.get("id") or "")
+                        ]
+                    stopped_accounts = [
+                        aid for aid in account_ids if stop_presence(None, account_id=aid)
+                    ]
+                    return self.send_json(
+                        {
+                            "ok": True,
+                            "stopped": bool(stopped_accounts),
+                            "stoppedAccounts": stopped_accounts,
+                            "state": public_state(),
+                        }
+                    )
+                stopped = stop_presence(kind, account_id=account_id)
                 return self.send_json({"ok": True, "stopped": stopped, "state": public_state()})
             if path == "/api/rpc/refresh":
-                presence = refresh_presence()
+                data = self.read_json()
+                presence = refresh_presence(str(data.get("accountId") or ""))
                 if presence is None:
                     return self.send_error_json("No presence is running.", 409)
                 return self.send_json({"ok": True, "presence": presence, "state": public_state()})
@@ -7510,12 +7656,17 @@ class Handler(BaseHTTPRequestHandler):
                 kind = str(data.get("kind") or "custom")
                 cfg = data.get("config")
                 with STORE.lock:
+                    account_id = STORE.active_account_id()
                     if kind == "custom" and isinstance(cfg, dict):
-                        merged = dict(STORE.state.get("custom") or {})
+                        merged = copy.deepcopy(STORE.custom_for(account_id) or {})
                         deep_merge(merged, visible_patch(cfg))
-                        activity = build_custom_activity(STORE.state, merged)
+                        activity = build_custom_activity(
+                            account_view(STORE.state, account_id), merged
+                        )
                     else:
-                        activity = build_activity(STORE.state, kind)
+                        activity = build_activity(
+                            account_view(STORE.state, account_id), kind
+                        )
                 return self.send_json({"ok": True, "activity": activity})
             if path == "/api/upload":
                 return self.handle_upload()
@@ -8067,10 +8218,28 @@ class Handler(BaseHTTPRequestHandler):
                         STORE.state["mirror"] = imported_mirror
                         web_warnings.extend(mirror_notes)
                         continue
+                    if key == "customs":
+                        if not isinstance(value, dict):
+                            continue
+                        customs = STORE.state.setdefault("customs", {})
+                        if not isinstance(customs, dict):
+                            customs = {}
+                            STORE.state["customs"] = customs
+                        for account_id, card in value.items():
+                            if not isinstance(card, dict):
+                                continue
+                            current = customs.get(str(account_id))
+                            if isinstance(current, dict):
+                                deep_merge(current, card)
+                            else:
+                                customs[str(account_id)] = copy.deepcopy(card)
+                        continue
                     if isinstance(value, dict) and isinstance(STORE.state.get(key), dict):
                         deep_merge(STORE.state[key], value)
                     else:
                         STORE.state[key] = value
+                if "custom" in incoming:
+                    STORE.adopt_focused_custom()
                 STORE.save()
                 saved_count = len(STORE.state.get("savedConfigs") or [])
             STORE.log("INFO", "Backup", "Settings imported from a Kizzey Web backup.")
@@ -8127,6 +8296,7 @@ class Handler(BaseHTTPRequestHandler):
                     note = f"{dropped} older saved preset{'s were' if dropped != 1 else ' was'} dropped at the local limit of {KIZZEY_SAVED_LIMIT}."
                     if note not in report["warnings"]:
                         report["warnings"] = (report["warnings"] + [note])[:KIZZEY_WARNING_LIMIT]
+            STORE.adopt_focused_custom()
             STORE.save()
 
         detail_parts = []
@@ -8153,7 +8323,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_error_json("Nothing to update.", 400)
         with STORE.lock:
             for key, value in updates.items():
-                if key in ("settings", "custom", "apps", "media", "console", "experimental", "cycling", "multiple", "health", "location", "weather", "navigation", "androidAuto", "samsung", "emulation", "screenRead", "automation", "drawer", "chatProfile", "wallet", "quickControls", "ui", "recent", "usage", "savedConfigs", "bulk", "plugins", "gallery", "appCatalog"):
+                if key == "custom":
+                    # The Custom RPC editor edits the focused account's card only.
+                    if not isinstance(value, dict):
+                        continue
+                    account_id = STORE.active_account_id()
+                    if account_id:
+                        target = STORE.custom_for(account_id)
+                        deep_merge(target, value)
+                        STORE.state["custom"] = copy.deepcopy(target)
+                    else:
+                        target = STORE.state.get("custom")
+                        if not isinstance(target, dict):
+                            target = default_custom()
+                            STORE.state["custom"] = target
+                        deep_merge(target, value)
+                    continue
+                if key in ("settings", "apps", "media", "console", "experimental", "cycling", "multiple", "health", "location", "weather", "navigation", "androidAuto", "samsung", "emulation", "screenRead", "automation", "drawer", "chatProfile", "wallet", "quickControls", "ui", "recent", "usage", "savedConfigs", "bulk", "plugins", "gallery", "appCatalog"):
                     if isinstance(value, dict) and isinstance(STORE.state.get(key), dict):
                         deep_merge(STORE.state[key], value)
                     else:
