@@ -45,6 +45,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -3156,6 +3157,9 @@ class WSClient:
             self.path += "?" + parsed.query
         self.sock = None
         self.buf = b""
+        self.compressed = bytearray()
+        self.compressed_mode = False
+        self.inflator = zlib.decompressobj()
         self.send_lock = threading.Lock()
         self.headers = {
             "Host": self.host,
@@ -3248,7 +3252,7 @@ class WSClient:
                 length = struct.unpack("!H", self._read_exact(2))[0]
             elif length == 127:
                 length = struct.unpack("!Q", self._read_exact(8))[0]
-            if length > 16 * 1024 * 1024:
+            if length > 64 * 1024 * 1024:
                 raise GatewayClosed("gateway frame too large")
             mask_key = self._read_exact(4) if masked else b""
             payload = self._read_exact(length)
@@ -3271,13 +3275,27 @@ class WSClient:
                     code,
                 )
             if opcode == 0x1:
+                self.compressed_mode = False
+                self.compressed.clear()
                 fragments.append(payload)
                 if fin:
                     return b"".join(fragments).decode("utf-8", "replace")
-            elif opcode == 0x2:
-                fragments.append(payload)
-                if fin:
-                    return b"".join(fragments).decode("utf-8", "replace")
+            elif opcode in (0x2, 0x0) and (opcode == 0x2 or self.compressed_mode):
+                # Transport compression (compress=zlib-stream) sends each
+                # gateway event as a zlib chunk ending in Z_SYNC_FLUSH.
+                # A large event can arrive as a binary frame plus continuation
+                # frames, so keep feeding the same inflater until the marker.
+                self.compressed_mode = True
+                self.compressed.extend(payload)
+                if self.compressed[-4:] != b"\x00\x00\xff\xff":
+                    continue
+                try:
+                    data = self.inflator.decompress(bytes(self.compressed))
+                except zlib.error as exc:
+                    raise GatewayClosed(f"gateway frame could not be decompressed: {exc}") from None
+                self.compressed.clear()
+                self.compressed_mode = False
+                return data.decode("utf-8", "replace")
             elif opcode == 0x0:
                 fragments.append(payload)
                 if fin:
@@ -3517,7 +3535,7 @@ class DiscordGateway:
     def _connect_once(self) -> None:
         self.stop_event.clear()
         self.set_gateway_state("connecting", error="")
-        ws = WSClient("wss://gateway.discord.gg/?v=10&encoding=json")
+        ws = WSClient("wss://gateway.discord.gg/?v=10&encoding=json&compress=zlib-stream")
         self.ws = ws
         hello = None
         deadline = time.time() + 12
