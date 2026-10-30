@@ -165,15 +165,20 @@ MFA_CODE = "123456"
 
 LOGIN_CALLS = []
 LOGIN_HEADERS = []
+MFA_BODIES = []
 
 
 def fake_login_post(url, body, timeout=25, extra_headers=None):
     LOGIN_CALLS.append((url, dict(body or {})))
     LOGIN_HEADERS.append(dict(extra_headers or {}))
     if url == server.DISCORD_MFA_API:
-        code = str((body or {}).get("data") or "")
+        MFA_BODIES.append(dict(body or {}))
+        code = str((body or {}).get("code") or "")
         if code != MFA_CODE:
-            info = {"message": "Invalid two-factor code", "code": 50035}
+            info = {"message": "Invalid Form Body", "code": 50035}
+            raise server.DiscordError(401, server._login_error_message(401, info), info)
+        if (body or {}).get("login_instance_id") not in (None, "instance-abc"):
+            info = {"message": "Invalid Form Body", "code": 50035}
             raise server.DiscordError(401, server._login_error_message(401, info), info)
         return {"token": "tok-delta-mfa-222"}
     if url != server.DISCORD_LOGIN_API:
@@ -182,7 +187,7 @@ def fake_login_post(url, body, timeout=25, extra_headers=None):
     if password == "right-password":
         return {"token": "tok-delta-pw-111"}
     if password == "mfa-password":
-        return {"ticket": "ticket-abc", "mfa": ["totp"]}
+        return {"ticket": "ticket-abc", "mfa": ["totp"], "login_instance_id": "instance-abc"}
     if password == "wrong-password":
         info = {"message": "Invalid Form Body", "code": 50035}
         raise server.DiscordError(401, server._login_error_message(401, info), info)
@@ -418,15 +423,16 @@ def main():
         # --- MFA challenge ----------------------------------------------------
         status, challenge = request("POST", "/api/auth/login", {"login": "delta@example.com", "password": "mfa-password"})
         check(status == 200 and challenge.get("status") == "mfa", "an MFA account returns a challenge", str(challenge)[:220])
+        check(challenge.get("loginInstanceId") == "instance-abc", "the MFA challenge carries Discord's login instance", str(challenge)[:220])
         check(challenge.get("ticket") == "ticket-abc" and challenge.get("methods") == ["totp"], "the challenge carries its ticket and methods")
         check(len(accounts().get("accounts") or []) == 1, "an MFA challenge creates no new account")
         check(not leaks(challenge, PRIVATE), "the MFA challenge exposes no token")
 
-        status, bad_code = request("POST", "/api/auth/mfa", {"ticket": "ticket-abc", "code": "000000"})
+        status, bad_code = request("POST", "/api/auth/mfa", {"ticket": "ticket-abc", "code": "000000", "loginInstanceId": "instance-abc"})
         check(status == 401, "a bad MFA code is a 401", str(bad_code)[:200])
         check("two-factor" in bad_code.get("error", "").lower(), "a bad MFA code is explained", str(bad_code)[:220])
 
-        status, good_code = request("POST", "/api/auth/mfa", {"ticket": "ticket-abc", "code": MFA_CODE})
+        status, good_code = request("POST", "/api/auth/mfa", {"ticket": "ticket-abc", "code": MFA_CODE, "loginInstanceId": "instance-abc"})
         good_state = state_of(good_code)
         check(status == 200 and good_code.get("status") == "ok", "a good MFA code signs in", str(good_code)[:220])
         check(good_state.get("activeAccountId") == delta_id, "the MFA sign-in keeps the same account")
@@ -434,6 +440,16 @@ def main():
         stored = json.loads(secret_dump())
         check((stored.get("accounts") or [{}])[0].get("token") == "tok-delta-mfa-222", "the MFA sign-in replaces the stored token")
         check(fake_gateway.sockets == {}, "the MFA sign-in never opens a gateway")
+        mfa_body = MFA_BODIES[-1]
+        check(
+            mfa_body.get("code") == MFA_CODE
+            and mfa_body.get("ticket") == "ticket-abc"
+            and "mfa_type" not in mfa_body
+            and "data" not in mfa_body,
+            "the MFA code travels in Discord's code/ticket shape",
+            str(mfa_body)[:220],
+        )
+        check(mfa_body.get("login_instance_id") == "instance-abc", "the MFA retry carries the login instance", str(mfa_body)[:220])
 
         # --- token fallback ---------------------------------------------------
         status, token_add = request("POST", "/api/auth/token", {"token": "tok-gamma-333"})

@@ -7,6 +7,7 @@
 
   // MFA tickets are short-lived; keep them per panel so two panels can coexist.
   const mfaTickets = {};
+  const mfaInstances = {};
   const busy = {};
 
   // A captcha challenge belongs to one password attempt: the site key is
@@ -223,7 +224,10 @@
     panel.querySelectorAll('[data-login-step]').forEach(node => {
       node.classList.toggle('hidden', node.dataset.loginStep !== step);
     });
-    if (step === 'credentials') mfaTickets[prefix] = '';
+    if (step === 'credentials') {
+      mfaTickets[prefix] = '';
+      mfaInstances[prefix] = '';
+    }
   }
 
   function showError(id, message) {
@@ -336,6 +340,7 @@
       const data = await K.api('/api/auth/login', { method: 'POST', body });
       if (data.status === 'mfa') {
         mfaTickets[prefix] = data.ticket || '';
+        mfaInstances[prefix] = data.loginInstanceId || '';
         setStep(prefix, 'mfa');
         setTimeout(() => document.querySelector(`#${prefix}-code`)?.focus({ preventScroll: true }), 40);
         return;
@@ -555,6 +560,7 @@
       const data = await K.api('/api/auth/login', { method: 'POST', body: { login, password } });
       if (data.status === 'mfa') {
         mfaTickets[prefix] = data.ticket || '';
+        mfaInstances[prefix] = data.loginInstanceId || '';
         setStep(prefix, 'mfa');
         setTimeout(() => document.querySelector(`#${prefix}-code`)?.focus({ preventScroll: true }), 40);
         return;
@@ -601,7 +607,10 @@
     busy[`${prefix}-mfa`] = true;
     setBusy(prefix, 'mfa-submit', true, 'Verify', 'Checking...');
     try {
-      const data = await K.api('/api/auth/mfa', { method: 'POST', body: { ticket, code } });
+      const data = await K.api('/api/auth/mfa', {
+        method: 'POST',
+        body: { ticket, code, loginInstanceId: mfaInstances[prefix] || '' },
+      });
       finish(data);
     } catch (error) {
       showError(`${prefix}-mfa`, error.message);
@@ -616,6 +625,7 @@
   K.actions['login-back'] = function (el) {
     const prefix = prefixOf(el);
     mfaTickets[prefix] = '';
+    mfaInstances[prefix] = '';
     clearCaptcha(prefix);
     clearError(`${prefix}-captcha`);
     const code = document.querySelector(`#${prefix}-code`);

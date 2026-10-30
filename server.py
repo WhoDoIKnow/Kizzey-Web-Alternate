@@ -5841,11 +5841,21 @@ def discord_password_login(login: str, password: str, captcha: dict | None = Non
     ticket = str(payload.get("ticket") or "")
     if ticket:
         methods = payload.get("mfa") if isinstance(payload.get("mfa"), list) else []
-        return {"status": "mfa", "ticket": ticket, "methods": [str(m) for m in methods]}
+        result = {"status": "mfa", "ticket": ticket, "methods": [str(m) for m in methods]}
+        instance_id = _login_instance(payload.get("login_instance_id"))
+        if instance_id:
+            result["loginInstanceId"] = instance_id
+        return result
     raise DiscordError(502, "Discord did not return a session for that sign-in.")
 
 
-def discord_mfa_login(ticket: str, code: str) -> str:
+def _login_instance(value) -> str:
+    """The per-attempt id newer Discord clients send with the MFA ticket."""
+    text = str(value or "").strip()
+    return text[:512] if text else ""
+
+
+def discord_mfa_login(ticket: str, code: str, login_instance_id: str = "") -> str:
     """Finish a login that Discord answered with an MFA ticket."""
     ticket = str(ticket or "")
     code = str(code or "").strip().replace(" ", "")
@@ -5853,10 +5863,28 @@ def discord_mfa_login(ticket: str, code: str) -> str:
         raise DiscordError(400, "That two-factor step expired. Sign in again.")
     if not code:
         raise DiscordError(400, "Enter the 6-digit code from your authenticator app.")
-    payload = _login_post(
-        DISCORD_MFA_API,
-        {"ticket": ticket, "mfa_type": "totp", "data": code},
-    )
+    body = {
+        "code": code,
+        "ticket": ticket,
+        "login_source": None,
+        "gift_code_sku_id": None,
+    }
+    instance_id = _login_instance(login_instance_id)
+    if instance_id:
+        body["login_instance_id"] = instance_id
+    try:
+        payload = _login_post(DISCORD_MFA_API, body)
+    except DiscordError as exc:
+        info = exc.data if isinstance(exc.data, dict) else {}
+        if exc.status in (400, 401) and not (
+            info.get("captcha_key") or info.get("captcha_sitekey")
+        ):
+            raise DiscordError(
+                exc.status,
+                "That two-factor code was not accepted. Try the current code from your authenticator app.",
+                info,
+            ) from None
+        raise
     token = clean_discord_token(payload.get("token"))
     if not token:
         raise DiscordError(401, "Discord did not accept that two-factor code.")
@@ -5868,14 +5896,21 @@ def login_with_password(login: str, password: str, captcha: dict | None = None) 
     result = discord_password_login(login, password, captcha=captcha)
     if result["status"] == "mfa":
         STORE.log("INFO", "Account", "Discord asked for a two-factor code.")
-        return {"status": "mfa", "ticket": result["ticket"], "methods": result["methods"]}
+        challenge = {
+            "status": "mfa",
+            "ticket": result["ticket"],
+            "methods": result["methods"],
+        }
+        if result.get("loginInstanceId"):
+            challenge["loginInstanceId"] = result["loginInstanceId"]
+        return challenge
     user = sign_in(result["token"])
     STORE.log("INFO", "Account", f"Signed in with a password as {user['displayName']}.")
     return {"status": "ok", "user": user, "account": STORE.active_account_id()}
 
 
-def login_with_mfa(ticket: str, code: str) -> dict:
-    token = discord_mfa_login(ticket, code)
+def login_with_mfa(ticket: str, code: str, login_instance_id: str = "") -> dict:
+    token = discord_mfa_login(ticket, code, login_instance_id)
     user = sign_in(token)
     STORE.log("INFO", "Account", f"Signed in with a password as {user['displayName']}.")
     return {"status": "ok", "user": user, "account": STORE.active_account_id()}
@@ -7243,13 +7278,18 @@ class Handler(BaseHTTPRequestHandler):
                             "status": "mfa",
                             "ticket": result["ticket"],
                             "methods": result["methods"],
+                            "loginInstanceId": result.get("loginInstanceId", ""),
                         }
                     )
                 return self.send_json({"ok": True, "status": "ok", "user": result["user"], "state": public_state()})
             if path == "/api/auth/mfa":
                 data = self.read_json()
                 try:
-                    result = login_with_mfa(str(data.get("ticket") or ""), str(data.get("code") or ""))
+                    result = login_with_mfa(
+                        str(data.get("ticket") or ""),
+                        str(data.get("code") or ""),
+                        str(data.get("loginInstanceId") or data.get("login_instance_id") or ""),
+                    )
                 except DiscordError as exc:
                     STORE.log("WARN", "Account", f"Two-factor sign-in failed: {_scrub(exc.message)[:160]}")
                     return self.send_error_json(exc.message, exc.status or 401)
