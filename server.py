@@ -32,6 +32,7 @@ import random
 import re
 import secrets
 import shutil
+import signal
 import socket
 import ssl
 import struct
@@ -8583,7 +8584,23 @@ def main() -> int:
         os.environ["KIZZEY_BROWSER_CDP"] = str(args.browser_cdp).strip()
 
     STORE = Store()
-    STORE.log("INFO", "Server", f"Kizzey Web {VERSION} starting on {args.host}:{args.port}.")
+    STORE.log(
+        "INFO",
+        "Server",
+        f"Kizzey Web {VERSION} starting on {args.host}:{args.port} (data: {DATA_DIR}).",
+    )
+    with STORE.lock:
+        saved_live = [
+            str(account_id)
+            for account_id, record in (STORE.state.get("presences") or {}).items()
+            if isinstance(record, dict) and record.get("active")
+        ]
+    if saved_live:
+        STORE.log(
+            "INFO",
+            "Presence",
+            f"Found {len(saved_live)} live presence{'s' if len(saved_live) != 1 else ''} in the saved session.",
+        )
     if not args.no_gateway:
         accounts = STORE.secret.get("accounts", []) or []
         active_id = STORE.active_account_id()
@@ -8659,6 +8676,20 @@ def main() -> int:
         MIRROR.stop()
         return 1
     banner(args.host, args.port)
+
+    def _stop_signal(signum, frame):
+        # Docker/free servers usually stop with SIGTERM, not Ctrl+C. Treat it
+        # like a normal stop so the live session is written before exit.
+        try:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        except (AttributeError, ValueError, OSError):
+            pass
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _stop_signal)
+    except (AttributeError, ValueError, OSError):
+        pass
     try:
         httpd.serve_forever(poll_interval=0.4)
     except KeyboardInterrupt:
