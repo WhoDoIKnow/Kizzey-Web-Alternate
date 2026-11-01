@@ -7093,6 +7093,7 @@ def resume_live_presences() -> int:
                 if isinstance(record, dict):
                     record.clear()
                     record.update(empty_presence())
+                STORE.sync_focused()
             STORE.log(
                 "WARN",
                 "Presence",
@@ -7110,6 +7111,7 @@ def resume_live_presences() -> int:
                 if isinstance(record, dict):
                     record.clear()
                     record.update(empty_presence())
+                STORE.sync_focused()
             STORE.log("WARN", "Presence", "A saved presence could not be rebuilt and was cleared.")
             continue
         resumed += 1

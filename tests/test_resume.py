@@ -220,7 +220,8 @@ resumed = server.resume_live_presences()
 check(
     resumed == 0
     and not active_sends(server.GATEWAY)
-    and not (store.state["presences"].get(alpha["id"]) or {}).get("active"),
+    and not (store.state["presences"].get(alpha["id"]) or {}).get("active")
+    and not (store.state.get("presence") or {}).get("active"),
     "an unbuildable saved card is cleared on resume",
 )
 
