@@ -82,7 +82,7 @@ instead of discarding them.
 | --- | --- |
 | `--host 0.0.0.0` | Listen on every interface. Default. |
 | `--port 8420` | HTTP port. Default `8420`. |
-| `--no-gateway` | Restore the saved accounts without opening any gateway socket at startup. |
+| `--no-gateway` | Restore saved accounts without resuming live presences or opening any gateway socket at startup. |
 | `--browser-cdp URL` | Drive a Chrome/Chromium DevTools endpoint on another machine instead of a local browser. |
 | `KIZZEY_HOST` / `KIZZEY_PORT` | Environment equivalents for host and port. |
 | `KIZZEY_BROWSER_CDP` | Environment equivalent for `--browser-cdp`, for example `http://127.0.0.1:9222` or `ws://browser:3000?token=…`. |
@@ -206,6 +206,11 @@ mirror rule still needs it. An account whose token Discord rejects — a revoked
 deleted account — has only its own token cleared; the other accounts keep running. **Remove all
 accounts** clears every token and closes every socket.
 
+Live presences are part of the saved session. If the server restarts — including after a container
+restart — each account that was still running reconnects its gateway and restores its own card,
+status and original start time. Accounts you stopped stay stopped. Starting with `--no-gateway`
+skips this resume and clears the live session without opening any socket.
+
 Rich Presence on several accounts is possible at once, and each account keeps its own **Custom RPC**
 card. The name, description, state line, artwork, buttons, timestamps and presence status you edit on
 the Custom RPC screen belong to the focused account. Switch accounts to design a different card,
@@ -318,6 +323,7 @@ python3 -m py_compile server.py
 for file in static/*.js; do node --check "$file"; done
 python3 tests/test_kizzey_import.py
 python3 tests/test_accounts_mirror.py
+python3 tests/test_resume.py
 python3 tests/test_password_login.py
 python3 tests/test_browser_remote.py
 python3 tests/test_launcher.py
@@ -393,7 +399,7 @@ and foreground-app detection cannot be reproduced from a regular web page.
 State is JSON under `data/`:
 
 ```text
-data/state.json     settings, presets, mirror rules, chat, history, wallet, UI state
+data/state.json     settings, presets, mirror rules, chat, history, wallet, active presences, UI state
 data/secret.json    private Discord tokens, active-account ID and managed webhook URLs
 data/history.json   presence-history mirror
 data/kizzey.log     server event log
@@ -429,8 +435,8 @@ The frontend uses JSON endpoints and an SSE stream. The main groups are:
 Unknown `/api/*` paths return JSON 404s. SSE recovers in the browser. Gateways are opened on demand:
 one starts for an account as soon as its presence runs or an enabled mirror rule needs it, and closes
 again when neither is true. Keep gateway alive only controls whether the socket retries while the
-server process runs; startup restores the focused account and opens sockets only for accounts an
-enabled mirror rule still references, so an idle install holds none.
+server process runs; startup restores the focused account, resumes every presence that was live when
+the process stopped, and opens mirror sockets for enabled rules, so an idle install holds none.
 
 ## Credits and licence
 

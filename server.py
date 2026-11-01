@@ -997,9 +997,8 @@ class Store:
         for room in self.state["chat"].get("rooms", []):
             if room.get("id") not in self.state["chat"].setdefault("messages", {}):
                 self.state["chat"]["messages"][room.get("id")] = []
-        # The server always owns these runtime fields.
-        self.state["presence"] = empty_presence()
-        self.state["presences"] = {}
+        # Gateway sockets are runtime-only, but presence records are the saved
+        # session. Keep them long enough to resume live cards after a restart.
         self.state["gateway"] = default_gateway_record()
         self.state["gateways"] = {}
         self.state["mirror"] = normalize_mirror_state(self.state.get("mirror"))
@@ -1015,6 +1014,8 @@ class Store:
         self.state["logs"] = []
         self._normalize_accounts()
         self._normalize_customs()
+        self._restore_presences()
+        self.sync_focused()
         self.save()
 
     @staticmethod
@@ -1143,6 +1144,56 @@ class Store:
             self.state["gateway"] = self.state.get("gateway") or {}
             self.state["gateway"]["tokenSet"] = bool(self.secret.get("token"))
             self.secret.setdefault("authError", "")
+
+    def _restore_presences(self) -> None:
+        """Rebuild saved presence records for accounts that can still run.
+
+        Presence activities are rebuilt on startup from the current settings,
+        but the active kind and original start time are kept. Records without a
+        token or with an unknown kind are dropped so a stale state file cannot
+        leave a phantom live card in the interface.
+        """
+        with self.lock:
+            raw = self.state.get("presences")
+            if not isinstance(raw, dict):
+                raw = {}
+            accounts = {
+                str(row.get("id") or ""): row
+                for row in (self.secret.get("accounts") or [])
+                if str(row.get("id") or "")
+            }
+            restored: dict[str, dict] = {}
+            for account_id, record in raw.items():
+                account_id = str(account_id or "")
+                account = accounts.get(account_id)
+                if not account or not clean_discord_token(account.get("token")):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                active = record.get("active")
+                if not isinstance(active, dict):
+                    continue
+                kind = str(active.get("kind") or "")
+                if kind not in PRESENCE_KINDS:
+                    continue
+                started = safe_int(record.get("startedAt"), 0) or safe_int(
+                    active.get("startedAt"), 0
+                ) or now_ms()
+                cleaned = empty_presence()
+                cleaned["active"] = {
+                    "kind": kind,
+                    "title": str(active.get("title") or "")[:200],
+                    "startedAt": started,
+                }
+                cleaned["startedAt"] = started
+                cleaned["updatedAt"] = safe_int(record.get("updatedAt"), None)
+                cleaned["cycleIndex"] = max(0, safe_int(record.get("cycleIndex"), 0) or 0)
+                restored[account_id] = cleaned
+            self.state["presences"] = restored
+            active_id = str(self.secret.get("activeId") or "")
+            self.state["presence"] = copy.deepcopy(
+                restored.get(active_id) or empty_presence()
+            )
 
     def _normalize_customs(self) -> None:
         """Give every saved account its own Custom RPC card.
@@ -7018,6 +7069,61 @@ def refresh_presence(account_id: str = "") -> dict | None:
         return copy.deepcopy(presence_record(account_id) or {})
 
 
+def resume_live_presences() -> int:
+    """Rebuild and queue every presence that was live before the restart.
+
+    The gateway may not be ready yet, so `send_current_presence` stores the
+    payload as the gateway's last presence and it is sent on READY. A record
+    that cannot be rebuilt is cleared instead of leaving a phantom live card.
+    """
+    assert STORE is not None
+    with STORE.lock:
+        records = STORE.state.get("presences") or {}
+        account_ids = [
+            str(account_id)
+            for account_id, record in records.items()
+            if isinstance(record, dict) and record.get("active")
+        ]
+    resumed = 0
+    for account_id in account_ids:
+        account = STORE.account_by_id(account_id, include_token=True)
+        if not clean_discord_token((account or {}).get("token")):
+            with STORE.lock:
+                record = (STORE.state.get("presences") or {}).get(account_id)
+                if isinstance(record, dict):
+                    record.clear()
+                    record.update(empty_presence())
+            STORE.log(
+                "WARN",
+                "Presence",
+                "A saved presence could not resume because its account has no token.",
+            )
+            continue
+        payload = None
+        try:
+            payload = send_current_presence(STORE, force=True, account_id=account_id)
+        except Exception as exc:
+            STORE.log("WARN", "Presence", f"Could not resume presence: {_scrub(str(exc))}")
+        if payload is None:
+            with STORE.lock:
+                record = (STORE.state.get("presences") or {}).get(account_id)
+                if isinstance(record, dict):
+                    record.clear()
+                    record.update(empty_presence())
+            STORE.log("WARN", "Presence", "A saved presence could not be rebuilt and was cleared.")
+            continue
+        resumed += 1
+        STORE.log("INFO", "Presence", f"Resumed {presence_title(payload)}.")
+    if resumed:
+        STORE.log(
+            "INFO",
+            "Presence",
+            f"Restored {resumed} live presence{'s' if resumed != 1 else ''} from the previous session.",
+        )
+    STORE.save()
+    return resumed
+
+
 # ---------------------------------------------------------------------------
 # Chat / wallet operations
 # ---------------------------------------------------------------------------
@@ -8523,8 +8629,23 @@ def main() -> int:
                     "Every saved Discord token was rejected. Add a fresh token in Discord accounts."
                 )
             STORE.save()
-    # Nothing is running yet: every per-account presence starts empty, so no
-    # gateway socket opens until an account actually toggles something on.
+    if args.no_gateway:
+        with STORE.lock:
+            had_saved_session = any(
+                isinstance(record, dict) and record.get("active")
+                for record in (STORE.state.get("presences") or {}).values()
+            )
+            STORE.state["presences"] = {}
+            STORE.state["presence"] = empty_presence()
+        if had_saved_session:
+            STORE.log(
+                "INFO",
+                "Presence",
+                "Session resume is skipped because --no-gateway is set.",
+            )
+        STORE.save()
+    else:
+        resume_live_presences()
     GATEWAY.reconcile()
     TICKER.start()
     MIRROR.start()
