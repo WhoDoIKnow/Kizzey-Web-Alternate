@@ -3,7 +3,7 @@
    bytes change, so every browser installs the new worker, purges the old
    shell cache, and reloads the open windows onto it. */
 
-const BUILD = 'v12';
+const BUILD = 'v13';
 const CACHE = 'kizzey-shell-' + BUILD;
 
 const SHELL = [
@@ -15,6 +15,7 @@ const SHELL = [
   '/screens-tools2.js?b=' + BUILD,
   '/screens-social.js?b=' + BUILD,
   '/screens-social2.js?b=' + BUILD,
+  '/screens-discord-voice.js?b=' + BUILD,
   '/screens-settings.js?b=' + BUILD,
   '/screens-accounts.js?b=' + BUILD,
   '/login.js?b=' + BUILD,

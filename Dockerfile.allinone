@@ -1,0 +1,45 @@
+# Kizzey Web — single-container build with the Discord voice service.
+#
+# This image runs both processes in one container, which is useful on hosts
+# that only allow one service. For a normal deployment use docker-compose.yml.
+#
+#   docker build -f Dockerfile.allinone -t kizzey-voice .
+#   docker run -p 8420:8420 \
+#     -e KIZZEY_VOICE_TOKEN=change-me \
+#     -e DISCORD_TOKEN=your-bot-token \
+#     -v kizzey-data:/app/data \
+#     kizzey-voice
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    KIZZEY_HOST=0.0.0.0 \
+    KIZZEY_PORT=8420 \
+    KIZZEY_VOICE_URL=http://127.0.0.1:8421 \
+    VOICE_HOST=127.0.0.1 \
+    VOICE_PORT=8421 \
+    VOICE_RECORDINGS_DIR=/app/data/voice_recordings
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates git libopus0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY voice_service/requirements.txt ./voice_service/requirements.txt
+RUN pip install --no-cache-dir -r voice_service/requirements.txt
+
+COPY server.py script_pull.py ./
+COPY static ./static
+COPY voice_service/voice_service.py ./voice_service/voice_service.py
+
+RUN mkdir -p /app/data/voice_recordings
+VOLUME ["/app/data"]
+EXPOSE 8420
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python3 -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('KIZZEY_PORT','8420')+'/api/health', timeout=3).read()"
+
+# The voice service owns the Discord UDP/RTP session; Kizzey owns the UI and
+# the proxy. The shell forwards SIGTERM so both children finalise recordings and
+# save state instead of being killed abruptly.
+CMD ["sh", "-c", "python3 /app/voice_service/voice_service.py --host 127.0.0.1 --port 8421 & v=$!; python3 /app/server.py --host 0.0.0.0 --port 8420 & s=$!; trap 'kill -TERM $v $s 2>/dev/null' TERM INT; wait $s; code=$?; kill -TERM $v 2>/dev/null; wait $v; exit $code"]

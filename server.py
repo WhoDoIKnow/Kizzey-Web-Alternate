@@ -86,6 +86,18 @@ MIRROR_MODES = ("normal", "webhook")
 MIRROR_WEBHOOK_LOCK = threading.RLock()
 SERVER_STARTED = time.monotonic()
 
+# Discord voice companion service. The service owns the Discord voice
+# connection (voice gateway + UDP/RTP + Opus); Kizzey only proxies commands and
+# never exposes the service token to the browser.
+VOICE_SERVICE_URL = str(os.environ.get("KIZZEY_VOICE_URL") or "http://127.0.0.1:8421").strip().rstrip("/")
+VOICE_SERVICE_TOKEN = str(os.environ.get("KIZZEY_VOICE_TOKEN") or "").strip()
+try:
+    VOICE_SERVICE_TIMEOUT = float(os.environ.get("KIZZEY_VOICE_TIMEOUT") or "30")
+except ValueError:
+    VOICE_SERVICE_TIMEOUT = 30.0
+VOICE_RECORDING_RE = re.compile(r"^[A-Za-z0-9_.-]{1,160}$")
+VOICE_RECORDING_MIME = "audio/ogg"
+
 # Discord sign-in posts the operator's own credentials straight to Discord from
 # the machine running this server. Nothing is stored but the resulting token.
 DISCORD_LOGIN_API = "https://discord.com/api/v9/auth/login"
@@ -7349,6 +7361,105 @@ def voice_update(client_id: str, patch: dict) -> dict:
     return voice
 
 
+def voice_service_call(
+    path: str,
+    payload: dict | None = None,
+    *,
+    method: str | None = None,
+    timeout: float | None = None,
+    raw: bool = False,
+):
+    """Talk to the optional Discord voice companion service.
+
+    The service address and shared secret live only in the server environment,
+    so the browser never sees the token and cannot reach the voice service
+    directly. Returns parsed JSON, or ``(bytes, content_type)`` when ``raw``.
+    """
+    if not VOICE_SERVICE_URL:
+        raise ValueError("The Discord voice service is not configured.")
+    url = VOICE_SERVICE_URL + (path if path.startswith("/") else "/" + path)
+    headers = {"Accept": "application/json", "User-Agent": f"KizzeyWeb/{VERSION}"}
+    if VOICE_SERVICE_TOKEN:
+        headers["Authorization"] = "Bearer " + VOICE_SERVICE_TOKEN
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers,
+        method=method or ("POST" if data is not None else "GET"),
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout or VOICE_SERVICE_TIMEOUT) as response:
+            body = response.read()
+            content_type = response.headers.get("Content-Type") or ""
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8"))
+            message = str(detail.get("error") or f"Voice service returned HTTP {exc.code}.")
+        except Exception:
+            message = f"Voice service returned HTTP {exc.code}."
+        raise ValueError(_scrub(message)) from None
+    except (urllib.error.URLError, TimeoutError, socket.timeout):
+        raise ValueError(
+            f"The voice service at {VOICE_SERVICE_URL} is not reachable. Start voice_service.py and set KIZZEY_VOICE_URL."
+        ) from None
+    if raw:
+        return body, content_type
+    try:
+        parsed = json.loads(body.decode("utf-8")) if body else {}
+    except Exception:
+        raise ValueError("The voice service returned an unreadable response.") from None
+    if isinstance(parsed, dict) and parsed.get("ok") is False and parsed.get("error"):
+        raise ValueError(_scrub(str(parsed["error"])))
+    return parsed
+
+
+def voice_service_state() -> dict:
+    """One payload for the Discord voice screen: health, live state, recordings."""
+    info = {
+        "ok": True,
+        "configured": bool(VOICE_SERVICE_URL),
+        "url": VOICE_SERVICE_URL,
+        "reachable": False,
+        "ready": False,
+        "error": "",
+        "state": None,
+        "health": None,
+        "recordings": [],
+    }
+    if not VOICE_SERVICE_URL:
+        info["error"] = "Set KIZZEY_VOICE_URL to the address of the voice service."
+        return info
+    try:
+        health = voice_service_call("/health", timeout=4)
+    except ValueError as exc:
+        info["error"] = str(exc)
+        return info
+    info["reachable"] = True
+    info["health"] = health
+    try:
+        result = voice_service_call("/state", timeout=8)
+        info["state"] = result.get("state") if isinstance(result, dict) else None
+        info["ready"] = bool((info["state"] or {}).get("ready"))
+    except ValueError as exc:
+        info["error"] = str(exc)
+    try:
+        listing = voice_service_call("/recordings", timeout=8)
+        if isinstance(listing, dict):
+            info["recordings"] = listing.get("recordings") or []
+    except ValueError:
+        pass
+    return info
+
+
+def voice_service_post(path: str, payload: dict | None = None) -> dict:
+    """POST a command to the voice service (empty object for no-argument calls)."""
+    return voice_service_call(path, payload if isinstance(payload, dict) else {}, method="POST")
+
+
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
@@ -7476,6 +7587,25 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(
                 {"ok": True, "voice": STORE.state.get("chat", {}).get("voice", {}) if STORE else {}}
             )
+        if path in ("/api/voice/discord", "/api/voice/discord/state"):
+            return self.send_json(voice_service_state())
+        if path.startswith("/api/voice/discord/recordings/"):
+            recording_id = path.rsplit("/", 1)[-1]
+            if not VOICE_RECORDING_RE.match(recording_id):
+                return self.send_error_json("Invalid recording id.", 400)
+            body, content_type = voice_service_call(f"/recordings/{recording_id}", raw=True, timeout=120)
+            self.send_response(200)
+            self.send_header("Content-Type", content_type or VOICE_RECORDING_MIME)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Disposition", f'attachment; filename="{recording_id}.ogg"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         if path.startswith("/api/"):
             return self.send_error_json("Not found.", 404)
         return self.handle_static(path)
@@ -7863,6 +7993,58 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/voice/state":
                 data = self.read_json()
                 return self.send_json({"ok": True, "voice": voice_update(str(data.get("clientId") or ""), data)})
+            if path == "/api/voice/discord/join":
+                data = self.read_json()
+                payload = {"guildId": str(data.get("guildId") or ""), "channelId": str(data.get("channelId") or "")}
+                if data.get("token"):
+                    payload["token"] = str(data["token"])
+                result = voice_service_post("/join", payload)
+                if STORE:
+                    channel = (result.get("state") or {}).get("channelName") or payload["channelId"]
+                    STORE.log("INFO", "Voice", f"Joined Discord voice channel {channel}.")
+                return self.send_json({"ok": True, "state": result.get("state")})
+            if path == "/api/voice/discord/leave":
+                self.read_json()
+                result = voice_service_post("/leave")
+                if STORE:
+                    STORE.log("INFO", "Voice", "Left the Discord voice channel.")
+                return self.send_json({"ok": True, "state": result.get("state")})
+            if path == "/api/voice/discord/play":
+                data = self.read_json()
+                result = voice_service_post("/play", {"query": str(data.get("query") or ""), "volume": data.get("volume", 1.0)})
+                if STORE:
+                    STORE.log("INFO", "Voice", f"Discord voice play: {str(data.get('query') or '')[:120]}")
+                return self.send_json({"ok": True, **{k: v for k, v in result.items() if k != "ok"}})
+            if path == "/api/voice/discord/control":
+                data = self.read_json()
+                result = voice_service_post("/control", {"action": str(data.get("action") or ""), "value": data.get("value")})
+                return self.send_json({"ok": True, "state": result.get("state")})
+            if path == "/api/voice/discord/record":
+                data = self.read_json()
+                if str(data.get("action") or "start") == "stop":
+                    result = voice_service_post("/record/stop")
+                    if STORE:
+                        STORE.log("INFO", "Voice", "Stopped the Discord call recording.")
+                else:
+                    result = voice_service_post(
+                        "/record/start",
+                        {
+                            "mode": str(data.get("mode") or "mix"),
+                            "bitrate": data.get("bitrate", 32),
+                            "mix": bool(data.get("mix", True)),
+                        },
+                    )
+                    if STORE:
+                        STORE.log("INFO", "Voice", "Started recording the Discord call.")
+                return self.send_json({"ok": True, "state": result.get("state")})
+            if path == "/api/voice/discord/recordings/compress":
+                data = self.read_json()
+                result = voice_service_post("/recordings/compress", {"id": str(data.get("id") or ""), "bitrate": data.get("bitrate", 32)})
+                return self.send_json({"ok": True, "recording": result.get("recording")})
+            if path == "/api/voice/discord/recordings/delete":
+                data = self.read_json()
+                result = voice_service_post("/recordings/delete", {"id": str(data.get("id") or "")})
+                return self.send_json({"ok": True, "deleted": result.get("deleted")})
             if path == "/api/presets/save":
                 return self.handle_preset_save()
             if path == "/api/presets/delete":

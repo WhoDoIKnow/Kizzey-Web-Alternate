@@ -262,6 +262,62 @@ is restored paused until it is reviewed. Imported webhook rules have no webhook 
 saved or enabled. Forwarding with user tokens is self-bot behaviour and may conflict with
 Discord's terms; use relays only in channels you control.
 
+## Discord voice
+
+The **Tools → Discord voice** screen joins a real Discord voice channel, plays music from a URL or
+search query, and records the call. Discord voice is an always-on voice gateway plus UDP/RTP and
+Opus, so it runs in a small companion process instead of the standard-library-only Kizzey server.
+Kizzey proxies commands to it and never sends the Discord token or the service token to the browser.
+
+```bash
+# 1. the companion (Python packages + ffmpeg)
+cd voice_service
+pip install -r requirements.txt
+VOICE_TOKEN=change-me DISCORD_TOKEN=your-bot-token python3 voice_service.py --host 0.0.0.0 --port 8421
+
+# 2. Kizzey, pointed at the companion
+KIZZEY_VOICE_URL=http://127.0.0.1:8421 KIZZEY_VOICE_TOKEN=change-me python3 server.py
+```
+
+The bot needs **Connect** permission in the channel. Guild and channel IDs are enough; the guild is
+resolved from the channel. The service asks only for the non-privileged Guilds and Voice States
+intents; enable the privileged **Server Members** intent in the Developer Portal and set
+`VOICE_MEMBERS_INTENT=1` if you want speakers labelled by name instead of id. Music can be a direct
+audio/video URL, a local path, or a search that `yt-dlp` resolves. Playback supports pause, resume,
+skip, stop and volume, with a small queue.
+
+Recording asks the voice client for decoded 48 kHz PCM and pipes each speaker into its own ffmpeg
+process, which encodes **mono Opus in an OGG container** live. The bot's own playback is tapped into
+the same recorder, so music is part of the recording. At the default 32 kbps that is about
+240 KB per minute per speaker; the bitrate selector also offers 16, 24, 48 and 64 kbps. With mixing
+enabled, stopping also writes a separate mixed track. Existing recordings can be re-encoded smaller
+from the same screen. Files live in the companion's `VOICE_RECORDINGS_DIR` and are downloaded through
+Kizzey, so the voice port itself can stay on a private network.
+
+Discord encrypts voice channels end to end with **DAVE**. Sending audio (music) is unaffected, but
+receiving voices only works when the installed Discord voice stack decrypts DAVE. The screen shows an
+encryption chip: `DAVE encrypted` means the connection reports an active DAVE session, `no DAVE`
+means recordings will be silent, and `DAVE n/a` means the library does not report it. The pinned
+stack in `voice_service/requirements.txt` is **py-cord** on its `fix/voice-rec-2` branch, which is the
+verified path; the service also accepts discord.py plus `discord-ext-voice-recv` and reports which
+backend it loaded.
+
+Two deployment shapes are included:
+
+```bash
+# two containers, recordings in a named volume
+docker compose up --build
+
+# or one container running both processes
+docker build -f Dockerfile.allinone -t kizzey-voice .
+docker run --rm -p 8420:8420 -e KIZZEY_VOICE_TOKEN=change-me \
+  -e DISCORD_TOKEN=your-bot-token -v kizzey-data:/app/data kizzey-voice
+```
+
+Set `DISCORD_TOKEN` and `KIZZEY_VOICE_TOKEN` in `.env` for Compose. The voice service refuses
+non-loopback requests when `VOICE_TOKEN` is empty, and Kizzey never exposes its recordings directory
+as a static path.
+
 ## Importing from Kizzey for Android
 
 **Backup & restore** reads the JSON files the Android app writes:
@@ -327,9 +383,12 @@ python3 tests/test_resume.py
 python3 tests/test_password_login.py
 python3 tests/test_browser_remote.py
 python3 tests/test_launcher.py
+python3 tests/test_gateway.py
+python3 tests/test_voice_service.py
 node tests/test_import_ui.js
 node tests/test_gallery_apply.js
 node tests/test_accounts_ui.js
+node tests/test_voice_ui.js
 ```
 
 The Python integration tests boot temporary server state and replace Discord with deterministic
@@ -359,6 +418,7 @@ against a stubbed Material runtime.
 
 - Kizzey Chat with rooms, replies, reactions, attachments, local notifications and SSE updates
 - Voice-room roster, mute/deafen/speaking state, heartbeat and local microphone level test
+- Discord voice via the optional companion: join a channel, play music from the web, record speakers to small Opus/OGG files
 - Moments, leaderboard, Discord friends list, presence browser, profile and usage/history screens
 - KCoin wallet, shop, cosmetic equip actions and a no-payment Kizzey+ demo
 - Weather/geocoding via Open-Meteo, driving routes via OSRM
@@ -377,7 +437,7 @@ are deliberate and shown honestly in the interface:
 | Health Connect | Manual readings, JSON import and approximate device-motion steps |
 | Shizuku shell | Host statistics from the Python server |
 | System screen capture + OCR | Browser tab/window capture or image upload, OCR'd server-side |
-| Native chat/voice backend | Local persisted rooms and voice state; microphone test has no live audio relay |
+| Native chat/voice backend | Local persisted rooms and voice state; live Discord voice (join, music, recording) runs in the optional `voice_service` companion |
 | Android overlays, tiles, Android Auto | UI controls and honest preview/state analogues |
 | APK/system installer | PWA "Add to Home screen" |
 | Simultaneous multi-account RPC | Each account with a running presence holds its own gateway; several run at once |
@@ -429,6 +489,8 @@ The frontend uses JSON endpoints and an SSE stream. The main groups are:
 - `POST /api/presets/{save,delete}`; `GET /api/presets/export` (`?id=`, `?current=1`, `?pack=1`)
 - `GET /api/weather`, `/api/geocode`, `/api/route`, `/api/friends`, `/api/hoststats`, `/api/update`
 - `POST /api/upload`, `/api/image`, `/api/ocr`, `/api/chat/*`, `/api/voice/*`, `/api/moments/*`
+- `GET /api/voice/discord`; `POST /api/voice/discord/{join,leave,play,control,record}`
+- `POST /api/voice/discord/recordings/{compress,delete}`; `GET /api/voice/discord/recordings/{id}`
 - `POST /api/wallet/daily`, `/api/shop/buy`, `/api/premium/{unlock,reset}`
 - `GET /api/export`, `/api/logs`, `/api/history`; `POST /api/import`, `/api/logs/clear`, `/api/history/clear`
 
