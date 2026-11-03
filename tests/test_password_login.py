@@ -228,6 +228,31 @@ def fake_login_post(url, body, timeout=25, extra_headers=None):
             "message": "Invalid Form Body",
         }
         raise server.DiscordError(400, server._login_error_message(400, info), info)
+    if password == "captcha-mfa-password":
+        # Discord can require a captcha and hand back the ticket together; the
+        # captcha must be solved before that ticket is usable.
+        info = {
+            "captcha_key": ["captcha-required"],
+            "captcha_sitekey": "site-key-abc",
+            "captcha_service": "hcaptcha",
+            "captcha_session_id": "session-mfa",
+            "captcha_rqdata": "rqdata-mfa",
+            "captcha_rqtoken": "rqtoken-mfa",
+            "should_serve_invisible": False,
+            "message": "Invalid Form Body",
+            "mfa": ["totp"],
+            "ticket": "ticket-captcha",
+            "login_instance_id": INSTANCE,
+        }
+        raise server.DiscordError(400, server._login_error_message(400, info), info)
+    if password == "captcha-mfa-2xx-password":
+        return {
+            "captcha_key": ["captcha-required"],
+            "captcha_sitekey": "site-key-abc",
+            "captcha_service": "hcaptcha",
+            "mfa": ["totp"],
+            "ticket": "ticket-captcha-2xx",
+        }
     if password == "slow-password":
         info = {"message": "You are being rate limited.", "retry_after": 8.0, "global": False}
         raise server.DiscordError(429, server._login_error_message(429, info), info)
@@ -383,6 +408,18 @@ def main():
         check(challenge.get("rqdata") == "rqdata-abc" and challenge.get("rqtoken") == "rqtoken-abc", "the captcha challenge carries its Enterprise request data", str(challenge)[:220])
         check(challenge.get("invisible") is False, "a visible challenge is reported as visible")
         check(challenge.get("errors") == ["captcha-required"], "a fresh challenge carries Discord's reason", str(challenge)[:220])
+
+        # A captcha must win over a ticket in the same reply: the ticket is bound
+        # to the unsolved check, so collapsing it into the MFA step is what made
+        # a valid authenticator code look wrong.
+        status, captcha_mfa = request("POST", "/api/auth/login", {"login": "delta", "password": "captcha-mfa-password"})
+        check(status == 400 and not captcha_mfa.get("status"), "a captcha and ticket together stay a captcha", str(captcha_mfa)[:220])
+        check((captcha_mfa.get("challenge") or {}).get("sitekey") == "site-key-abc", "the captcha is handed to the browser, not skipped", str(captcha_mfa)[:220])
+        check(accounts().get("accounts") == [], "a captcha-and-ticket reply creates no account")
+
+        status, captcha_mfa_2xx = request("POST", "/api/auth/login", {"login": "delta", "password": "captcha-mfa-2xx-password"})
+        check(status == 400 and not captcha_mfa_2xx.get("status"), "a 2xx captcha is still a captcha", str(captcha_mfa_2xx)[:220])
+        check((captcha_mfa_2xx.get("challenge") or {}).get("sitekey") == "site-key-abc", "the 2xx captcha is handed to the browser", str(captcha_mfa_2xx)[:220])
 
         # --- rate limiting ----------------------------------------------------
         status, slow = request("POST", "/api/auth/login", {"login": "delta", "password": "slow-password"})

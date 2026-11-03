@@ -136,6 +136,11 @@ the two-factor field and posts the current code from your authenticator app back
 Discord instead reports that the challenge itself is stale, the sheet returns to the password step and
 says so, rather than blaming a code that was valid; the code is never what was wrong in that case.
 
+Discord can ask for a captcha and a two-factor code in the same sign-in. The captcha is always solved
+first: the two-factor ticket Discord hands back is bound to that unsolved check, so exchanging it
+early makes a current authenticator code look wrong. Kizzey shows the captcha, then the two-factor
+field.
+
 The password is used only for that one login request, is never logged and is never written anywhere;
 only the session token Discord returns is kept, in `data/secret.json`.
 

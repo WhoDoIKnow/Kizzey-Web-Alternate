@@ -6030,14 +6030,20 @@ def discord_password_login(login: str, password: str, captcha: dict | None = Non
             extra_headers=captcha_headers,
         )
     except DiscordError as exc:
-        # Discord can attach the MFA ticket to a non-2xx answer. Upstream Kizzey
-        # reads the body before the status, which is what stops a correct
-        # password that needs two-factor from being reported as a failure.
+        # Discord can attach the MFA ticket to a non-2xx answer. A captcha in
+        # the same reply must still be solved first: the ticket it carries is
+        # bound to that unsolved challenge, so it can never be collapsed into
+        # the MFA step.
         info = exc.data if isinstance(exc.data, dict) else {}
-        challenge = _mfa_challenge(info)
-        if challenge:
-            return challenge
+        if not _has_captcha(info):
+            challenge = _mfa_challenge(info)
+            if challenge:
+                return challenge
         raise
+    # The same ordering applies when Discord answers 2xx for an MFA account that
+    # still owes a captcha: solve the captcha, then exchange the ticket.
+    if _has_captcha(payload):
+        raise DiscordError(400, _login_error_message(400, payload), payload)
     token = clean_discord_token(payload.get("token"))
     if token:
         return {"status": "ok", "token": token}
@@ -6045,6 +6051,13 @@ def discord_password_login(login: str, password: str, captcha: dict | None = Non
     if challenge:
         return challenge
     raise DiscordError(502, "Discord did not return a session for that sign-in.")
+
+
+def _has_captcha(info) -> bool:
+    """Whether a login reply is asking for a captcha to be solved first."""
+    return bool(
+        isinstance(info, dict) and (info.get("captcha_key") or info.get("captcha_sitekey"))
+    )
 
 
 def _mfa_challenge(payload: dict) -> dict | None:

@@ -124,6 +124,34 @@ async function main() {
   const shortInstance = await login.discordPasswordLogin('user@example.com', 'pw');
   check(shortInstance.status === 'mfa' && shortInstance.loginInstanceId === undefined, 'a short login instance from Discord is not forwarded', JSON.stringify(shortInstance));
 
+  // A captcha must win over a ticket in the same reply: the ticket is bound to
+  // the unsolved check, so collapsing it into the MFA step is what made a valid
+  // authenticator code look wrong.
+  installFetch(() => ({
+    status: 400,
+    body: { captcha_key: ['captcha-required'], captcha_sitekey: 'site-key', captcha_service: 'hcaptcha', mfa: ['totp'], ticket: 'ticket-captcha' },
+  }));
+  let both = null;
+  try {
+    await login.discordPasswordLogin('user@example.com', 'pw');
+  } catch (error) {
+    both = error;
+  }
+  check(both instanceof DiscordError && both.data.captcha_sitekey === 'site-key', 'a captcha and ticket together stay a captcha error', String(both));
+
+  // The same reply on a 2xx answer is still a captcha to solve first.
+  installFetch(() => ({
+    status: 200,
+    body: { captcha_key: ['captcha-required'], captcha_sitekey: 'site-key', captcha_service: 'hcaptcha', mfa: ['totp'], ticket: 'ticket-captcha-2' },
+  }));
+  let both2xx = null;
+  try {
+    await login.discordPasswordLogin('user@example.com', 'pw');
+  } catch (error) {
+    both2xx = error;
+  }
+  check(both2xx instanceof DiscordError && both2xx.data.captcha_sitekey === 'site-key', 'a 2xx captcha is still an error so the sheet can solve it', String(both2xx));
+
   console.log(`\n${checks.filter(Boolean).length}/${checks.length} login checks passed`);
   return checks.every(Boolean) ? 0 : 1;
 }
