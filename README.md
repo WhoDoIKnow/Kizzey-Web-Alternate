@@ -132,7 +132,9 @@ instead of discarding them.
 The sign-in sheet works the way `discord.com` does: type the email or username and password for the
 account, and Kizzey performs the same login request the website performs, from the server. Discord
 answers with a session token, or with a two-factor challenge — when it asks for a code, Kizzey shows
-the two-factor field and posts the current code from your authenticator app back to Discord.
+the two-factor field and posts the current code from your authenticator app back to Discord. If
+Discord instead reports that the challenge itself is stale, the sheet returns to the password step and
+says so, rather than blaming a code that was valid; the code is never what was wrong in that case.
 
 The password is used only for that one login request, is never logged and is never written anywhere;
 only the session token Discord returns is kept, in `data/secret.json`.

@@ -113,9 +113,10 @@ vm.runInContext(fs.readFileSync(path.join(root, 'static', 'screens-discord-voice
   // -- static wiring ------------------------------------------------------
   const index = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
   check(index.includes('screens-discord-voice.js'), 'shell loads the discord voice screen');
-  check(index.includes('?b=v15'), 'shell cache key was bumped');
   const sw = fs.readFileSync(path.join(root, 'static', 'sw.js'), 'utf8');
-  check(sw.includes("BUILD = 'v15'"), 'service worker build was bumped');
+  const build = (sw.match(/BUILD = '([^']+)'/) || [])[1] || '';
+  check(build !== '', 'the service worker declares a build');
+  check(index.includes(`?b=${build}`), 'the shell cache key matches the service worker build', build);
   check(sw.includes('screens-discord-voice.js'), 'service worker caches the screen');
   const app = fs.readFileSync(path.join(root, 'static', 'app.js'), 'utf8');
   check(app.includes("route: 'discord-voice'"), 'navigation exposes the screen');

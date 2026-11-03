@@ -6023,29 +6023,85 @@ def discord_password_login(login: str, password: str, captcha: dict | None = Non
     }
     if not captcha_headers:
         body["captcha_key"] = None
-    payload = _login_post(
-        DISCORD_LOGIN_API,
-        body,
-        extra_headers=captcha_headers,
-    )
+    try:
+        payload = _login_post(
+            DISCORD_LOGIN_API,
+            body,
+            extra_headers=captcha_headers,
+        )
+    except DiscordError as exc:
+        # Discord can attach the MFA ticket to a non-2xx answer. Upstream Kizzey
+        # reads the body before the status, which is what stops a correct
+        # password that needs two-factor from being reported as a failure.
+        info = exc.data if isinstance(exc.data, dict) else {}
+        challenge = _mfa_challenge(info)
+        if challenge:
+            return challenge
+        raise
     token = clean_discord_token(payload.get("token"))
     if token:
         return {"status": "ok", "token": token}
-    ticket = str(payload.get("ticket") or "")
-    if ticket:
-        methods = payload.get("mfa") if isinstance(payload.get("mfa"), list) else []
-        result = {"status": "mfa", "ticket": ticket, "methods": [str(m) for m in methods]}
-        instance_id = _login_instance(payload.get("login_instance_id"))
-        if instance_id:
-            result["loginInstanceId"] = instance_id
-        return result
+    challenge = _mfa_challenge(payload)
+    if challenge:
+        return challenge
     raise DiscordError(502, "Discord did not return a session for that sign-in.")
 
 
+def _mfa_challenge(payload: dict) -> dict | None:
+    """The MFA challenge carried by a login reply, or ``None``."""
+    if not isinstance(payload, dict):
+        return None
+    ticket = str(payload.get("ticket") or "")
+    if not ticket:
+        return None
+    methods = payload.get("mfa") if isinstance(payload.get("mfa"), list) else []
+    result = {"status": "mfa", "ticket": ticket, "methods": [str(m) for m in methods]}
+    instance_id = _login_instance(payload.get("login_instance_id"))
+    if instance_id:
+        result["loginInstanceId"] = instance_id
+    return result
+
+
 def _login_instance(value) -> str:
-    """The per-attempt id newer Discord clients send with the MFA ticket."""
+    """The per-attempt id newer Discord clients send with the MFA ticket.
+
+    Discord's ``/auth/mfa/totp`` validates this field to exactly 36 characters
+    and rejects the whole request otherwise, so an unusable value is dropped.
+    The ticket alone is enough to finish the challenge.
+    """
     text = str(value or "").strip()
-    return text[:512] if text else ""
+    return text if len(text) == 36 else ""
+
+
+def _mfa_error(exc: DiscordError) -> DiscordError:
+    """Name the field Discord rejected instead of always blaming the code."""
+    info = exc.data if isinstance(exc.data, dict) else {}
+    if info.get("captcha_key") or info.get("captcha_sitekey"):
+        return exc
+    fields = info.get("errors") if isinstance(info.get("errors"), dict) else {}
+    status = exc.status or 401
+    if fields.get("ticket") or "MFA_INVALID_TICKET" in json.dumps(info):
+        error = DiscordError(
+            status,
+            "That two-factor step expired before Discord checked the code. "
+            "Sign in again to get a fresh one.",
+            info,
+        )
+        error.reason = "mfa-expired"
+        return error
+    if fields.get("login_instance_id"):
+        error = DiscordError(
+            status,
+            "Discord rejected that two-factor request. Sign in again and retry.",
+            info,
+        )
+        error.reason = "mfa-expired"
+        return error
+    return DiscordError(
+        status,
+        "That two-factor code was not accepted. Try the current code from your authenticator app.",
+        info,
+    )
 
 
 def discord_mfa_login(ticket: str, code: str, login_instance_id: str = "") -> str:
@@ -6056,28 +6112,33 @@ def discord_mfa_login(ticket: str, code: str, login_instance_id: str = "") -> st
         raise DiscordError(400, "That two-factor step expired. Sign in again.")
     if not code:
         raise DiscordError(400, "Enter the 6-digit code from your authenticator app.")
-    body = {
-        "code": code,
-        "ticket": ticket,
-        "login_source": None,
-        "gift_code_sku_id": None,
-    }
     instance_id = _login_instance(login_instance_id)
-    if instance_id:
-        body["login_instance_id"] = instance_id
+
+    def send(with_instance: bool) -> dict:
+        body = {
+            "code": code,
+            "ticket": ticket,
+            "login_source": None,
+            "gift_code_sku_id": None,
+        }
+        if with_instance and instance_id:
+            body["login_instance_id"] = instance_id
+        return _login_post(DISCORD_MFA_API, body)
+
     try:
-        payload = _login_post(DISCORD_MFA_API, body)
+        payload = send(True)
     except DiscordError as exc:
         info = exc.data if isinstance(exc.data, dict) else {}
-        if exc.status in (400, 401) and not (
-            info.get("captcha_key") or info.get("captcha_sitekey")
-        ):
-            raise DiscordError(
-                exc.status,
-                "That two-factor code was not accepted. Try the current code from your authenticator app.",
-                info,
-            ) from None
-        raise
+        fields = info.get("errors") if isinstance(info.get("errors"), dict) else {}
+        if instance_id and fields.get("login_instance_id"):
+            # Discord rejected the echoed login instance; retry with just the
+            # ticket, which is what its own validator accepts.
+            try:
+                payload = send(False)
+            except DiscordError as retry_exc:
+                raise _mfa_error(retry_exc) from None
+        else:
+            raise _mfa_error(exc) from None
     token = clean_discord_token(payload.get("token"))
     if not token:
         raise DiscordError(401, "Discord did not accept that two-factor code.")
@@ -7787,6 +7848,9 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 except DiscordError as exc:
                     STORE.log("WARN", "Account", f"Two-factor sign-in failed: {_scrub(exc.message)[:160]}")
+                    reason = getattr(exc, "reason", "")
+                    if reason:
+                        return self.send_error_json(exc.message, exc.status or 401, reason=reason)
                     return self.send_error_json(exc.message, exc.status or 401)
                 return self.send_json({"ok": True, "status": "ok", "user": result["user"], "state": public_state()})
             if path == "/api/auth/token":

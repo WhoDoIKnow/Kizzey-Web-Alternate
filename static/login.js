@@ -625,6 +625,12 @@
       });
       finish(data);
     } catch (error) {
+      if (error.data && error.data.reason === 'mfa-expired') {
+        // The ticket is dead; the code can never be accepted against it.
+        setStep(prefix, 'credentials');
+        showError(prefix, error.message);
+        return;
+      }
       showError(`${prefix}-mfa`, error.message);
       input.select();
       input.focus();
