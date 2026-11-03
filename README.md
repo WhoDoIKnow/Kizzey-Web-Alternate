@@ -99,7 +99,8 @@ node script_pull.js --voice-required # same as --voice, clearer name
 | `--dir PATH` | Checkout to clone or update. Defaults to this script's folder. |
 | `--repo URL` / `--branch NAME` | Remote and branch to track. |
 | `--no-pull` | Start the current checkout without touching git. |
-| `--update-only` | Pull and exit. |
+| `--update-only` | Pull, install packages, then exit (leaves a runnable checkout). |
+| `--no-install` | Skip `npm install` and start with the packages already present. |
 | `--voice` / `--no-voice` | Always or never start the voice companion. |
 | `--voice-required` | Fail the launch when the companion cannot start. |
 | `--voice-install` | Re-run the npm install before starting the companion. |

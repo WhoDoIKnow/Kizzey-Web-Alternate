@@ -7,11 +7,13 @@
  *   node script_pull.js
  *   node script_pull.js --host 0.0.0.0 --port 8420
  *   node script_pull.js --no-pull --no-voice
+ *   node script_pull.js --update-only          # pull + install, then exit
  *   node script_pull.js --voice-install
  *
  * Pulls the checkout, installs the required npm packages (always, so a fresh
- * clone runs), optionally starts the Discord voice companion, then supervises
- * both processes. Runtime data in data/ is never touched.
+ * clone runs, including with --update-only), optionally starts the Discord
+ * voice companion, then supervises both processes. Runtime data in data/ is
+ * never touched. Use --no-install to skip the npm install.
  */
 
 const fs = require('fs');
@@ -136,6 +138,10 @@ function npmInstall(target) {
     stdio: 'inherit',
     env: process.env,
   });
+  if (result.error && result.error.code === 'ENOENT') {
+    note('npm was not found on PATH. Install it, then run the launcher again.');
+    return false;
+  }
   if (result.status !== 0) {
     note('npm install reported a problem. Core dependencies may already be present; continuing.');
     return false;
@@ -278,6 +284,7 @@ function parseArgs(argv) {
     branch: DEFAULT_BRANCH,
     noPull: false,
     updateOnly: false,
+    noInstall: false,
     voice: false,
     noVoice: false,
     voiceRequired: false,
@@ -304,6 +311,7 @@ function parseArgs(argv) {
     }
     if (arg === '--no-pull') opts.noPull = true;
     else if (arg === '--update-only') opts.updateOnly = true;
+    else if (arg === '--no-install') opts.noInstall = true;
     else if (arg === '--voice') opts.voice = true;
     else if (arg === '--no-voice') opts.noVoice = true;
     else if (arg === '--voice-required') opts.voiceRequired = true;
@@ -327,12 +335,16 @@ async function main() {
   }
 
   if (!fs.existsSync(path.join(target, 'server.js'))) fail(`${target}/server.js was not found.`);
+
+  // Install before the --update-only exit so an update job leaves a runnable
+  // checkout: a pull can change package.json, and the Node stack needs its
+  // packages present before server.js can start.
+  if (!opts.noInstall) npmInstall(target);
+
   if (opts.updateOnly) {
     note(`Sources are ready in ${target}`);
     return 0;
   }
-
-  npmInstall(target);
 
   let voiceChild = null;
   const extraEnv = {};

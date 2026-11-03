@@ -4,6 +4,7 @@
 #   ./script_pull.sh                        clone/update, install packages, start
 #   ./script_pull.sh --no-pull              start the current checkout as-is
 #   ./script_pull.sh --update-only          clone/update + install, then exit
+#   ./script_pull.sh --no-install           start with the packages already present
 #   ./script_pull.sh --host 0.0.0.0 --port 8420
 #   ./script_pull.sh --no-voice             start Kizzey without the voice companion
 #
