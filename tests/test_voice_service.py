@@ -11,6 +11,7 @@ The companion module is imported with no Discord packages installed; it is
 designed to degrade to pure helpers in that case.
 """
 import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -190,6 +191,7 @@ server.VOICE_SERVICE_TOKEN = ""
 # voice service helpers (imported without the Discord stack)
 # ---------------------------------------------------------------------------
 spec = importlib.util.spec_from_file_location("kizzey_voice_service", ROOT / "voice_service" / "voice_service.py")
+os.environ.pop("VOICE_USER_TOKEN", None)
 voice = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(voice)
 
@@ -209,6 +211,68 @@ try:
 except ValueError:
     check(True, "recording ids reject dot-dot")
 check(voice.safe_recording_id("abc-123.ogg") == "abc-123.ogg", "recording ids accept normal names")
+
+# -- account-token auth -----------------------------------------------------
+check(
+    voice.user_auth_headers({"Authorization": "Bot abc.def"})["Authorization"] == "abc.def",
+    "account tokens drop the Bot prefix",
+)
+check(
+    voice.user_auth_headers({"authorization": "Bot abc.def"})["authorization"] == "abc.def",
+    "the prefix is dropped regardless of header case",
+)
+check(
+    voice.user_auth_headers({"Authorization": "abc.def"})["Authorization"] == "abc.def",
+    "bare tokens are left alone",
+)
+check(
+    voice.user_auth_headers({"User-Agent": "x"}) == {"User-Agent": "x"},
+    "headers without auth are unchanged",
+)
+check(voice.user_auth_headers(None) is None, "missing headers pass through")
+check(voice.clean_token("  Bearer abc.def  ") == "abc.def", "a pasted Bearer prefix is removed")
+check(voice.clean_token("Bot abc.def") == "abc.def", "a pasted Bot prefix is removed")
+check(voice.clean_token("abc.def") == "abc.def", "plain tokens are unchanged")
+check(voice.VOICE_USER_TOKEN is True, "account tokens are the default token kind")
+voice.set_user_token_mode(True)
+check(voice._USER_TOKEN_ACTIVE is True, "user-token mode can be enabled")
+voice.set_user_token_mode(False)
+check(voice._USER_TOKEN_ACTIVE is False, "bot-token mode can be enabled")
+check(
+    inspect.signature(voice.VoiceManager.join).parameters["user_token"].default is True,
+    "join treats Kizzey tokens as account tokens by default",
+)
+
+# -- aiohttp hook -----------------------------------------------------------
+import types
+
+original_aiohttp = sys.modules.get("aiohttp")
+original_patched = voice._USER_TOKEN_PATCHED
+fake_aiohttp = types.ModuleType("aiohttp")
+
+
+class FakeSession:
+    def request(self, method, url, **kwargs):
+        return kwargs.get("headers")
+
+
+fake_aiohttp.ClientSession = FakeSession
+sys.modules["aiohttp"] = fake_aiohttp
+try:
+    voice._USER_TOKEN_PATCHED = False
+    voice.set_user_token_mode(True)
+    sent = FakeSession().request("GET", "/x", headers={"Authorization": "Bot abc"})
+    check(sent["Authorization"] == "abc", "the aiohttp hook sends account tokens bare")
+    voice.set_user_token_mode(False)
+    sent = FakeSession().request("GET", "/x", headers={"Authorization": "Bot abc"})
+    check(sent["Authorization"] == "Bot abc", "bot mode keeps the Bot prefix")
+finally:
+    voice._USER_TOKEN_PATCHED = original_patched
+    voice.set_user_token_mode(False)
+    if original_aiohttp is not None:
+        sys.modules["aiohttp"] = original_aiohttp
+    else:
+        sys.modules.pop("aiohttp", None)
 
 url, title = voice.resolve_source("https://example.com/song.mp3")
 check(url == "https://example.com/song.mp3", "direct audio URLs pass through")

@@ -7470,6 +7470,7 @@ def voice_join_payload(data: dict | None = None) -> dict:
     payload = {
         "guildId": str(data.get("guildId") or ""),
         "channelId": str(data.get("channelId") or ""),
+        "userToken": True,
     }
     if STORE:
         try:
@@ -7479,6 +7480,98 @@ def voice_join_payload(data: dict | None = None) -> dict:
         if token:
             payload["token"] = token
     return payload
+
+
+# Server/channel listings for the voice picker. The browser only receives names
+# and ids; the account token stays here. A short cache keeps the 6-second voice
+# screen refresh from hitting Discord's guild endpoints over and over.
+VOICE_DIRECTORY_TTL = 10.0
+VOICE_DIRECTORY_CACHE: dict[str, tuple[float, object]] = {}
+
+
+def _voice_directory_cached(key: str, loader):
+    now = time.monotonic()
+    cached = VOICE_DIRECTORY_CACHE.get(key)
+    if cached and now - cached[0] <= VOICE_DIRECTORY_TTL:
+        return cached[1]
+    value = loader()
+    VOICE_DIRECTORY_CACHE[key] = (now, value)
+    return value
+
+
+def _voice_directory_token() -> str:
+    token = STORE.active_token() if STORE else ""
+    token = clean_discord_token(token)
+    if not token:
+        raise DiscordError(401, "Connect Discord before choosing a voice server.")
+    return token
+
+
+def voice_directory_guilds() -> list[dict]:
+    token = _voice_directory_token()
+
+    def load():
+        rows = discord_api("/users/@me/guilds", token, timeout=15)
+        guilds = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or not row.get("id"):
+                continue
+            icon = str(row.get("icon") or "")
+            guilds.append(
+                {
+                    "id": str(row.get("id")),
+                    "name": str(row.get("name") or "Server"),
+                    "icon": icon,
+                    "iconUrl": (
+                        f"https://cdn.discordapp.com/icons/{row.get('id')}/{icon}."
+                        f"{'gif' if icon.startswith('a_') else 'png'}?size=64"
+                        if icon
+                        else ""
+                    ),
+                    "owner": bool(row.get("owner")),
+                }
+            )
+        guilds.sort(key=lambda item: item["name"].casefold())
+        return guilds
+
+    return _voice_directory_cached("guilds:" + token[-12:], load)
+
+
+def voice_directory_channels(guild_id: str) -> list[dict]:
+    guild_id = str(guild_id or "").strip()
+    if not re.fullmatch(r"\d{16,20}", guild_id):
+        raise ValueError("Choose a server first.")
+    token = _voice_directory_token()
+
+    def load():
+        rows = discord_api(f"/guilds/{guild_id}/channels", token, timeout=15)
+        parents = {
+            str(row.get("id")): str(row.get("name") or "")
+            for row in (rows if isinstance(rows, list) else [])
+            if isinstance(row, dict) and int(row.get("type") or 0) == 4
+        }
+        channels = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or int(row.get("type") or 0) not in (2, 13):
+                continue
+            parent_id = str(row.get("parent_id") or "")
+            channels.append(
+                {
+                    "id": str(row.get("id")),
+                    "name": str(row.get("name") or "Voice"),
+                    "type": int(row.get("type") or 2),
+                    "position": int(row.get("position") or 0),
+                    "parentId": parent_id,
+                    "parentName": parents.get(parent_id, ""),
+                    "userLimit": int(row.get("user_limit") or 0),
+                }
+            )
+        channels.sort(
+            key=lambda item: (item["parentName"].casefold(), item["position"], item["name"].casefold())
+        )
+        return channels
+
+    return _voice_directory_cached("channels:" + token[-12:] + ":" + guild_id, load)
 
 
 # ---------------------------------------------------------------------------
@@ -7607,6 +7700,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/voice":
             return self.send_json(
                 {"ok": True, "voice": STORE.state.get("chat", {}).get("voice", {}) if STORE else {}}
+            )
+        if path == "/api/voice/discord/guilds":
+            return self.send_json({"ok": True, "guilds": voice_directory_guilds()})
+        if path == "/api/voice/discord/channels":
+            return self.send_json(
+                {"ok": True, "channels": voice_directory_channels(self.query().get("guildId", ""))}
             )
         if path in ("/api/voice/discord", "/api/voice/discord/state"):
             return self.send_json(voice_service_state())

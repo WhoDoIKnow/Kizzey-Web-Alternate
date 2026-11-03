@@ -1,31 +1,31 @@
 # Kizzey voice service — Discord voice join, music playback and Opus recording.
 #
 # This image is separate from the Kizzey web image because it needs ffmpeg and
-# the Discord voice stack.  Kizzey itself stays standard-library only and talks
-# to this service over HTTP.
-FROM python:3.12-slim
+# the Discord voice stack. @discordjs/voice 0.19 negotiates DAVE end-to-end
+# encryption; discord.js-selfbot-v13 supplies the account-token gateway.
+FROM node:22-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
+ENV NODE_ENV=production \
     VOICE_HOST=0.0.0.0 \
     VOICE_PORT=8421 \
     VOICE_RECORDINGS_DIR=/data/voice_recordings
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates git libopus0 \
+    && apt-get install -y --no-install-recommends ffmpeg yt-dlp ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY voice_service/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+COPY package.json package-lock.json ./
+COPY scripts ./scripts
+RUN npm ci --no-audit --no-fund
 
-COPY voice_service/voice_service.py ./
+COPY voice_service/index.js ./voice_service/index.js
 
 RUN mkdir -p /data/voice_recordings
 VOLUME ["/data/voice_recordings"]
 EXPOSE 8421
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD python3 -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('VOICE_PORT','8421')+'/health', timeout=3).read()"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD node -e "fetch('http://127.0.0.1:'+(process.env.VOICE_PORT||'8421')+'/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 
-CMD ["python3", "voice_service.py"]
+CMD ["node", "voice_service/index.js"]

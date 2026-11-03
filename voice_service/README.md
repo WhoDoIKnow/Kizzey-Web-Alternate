@@ -1,38 +1,44 @@
 # Kizzey voice service
 
-A small HTTP service that gives Kizzey Web real Discord voice features:
+A small Node HTTP service that gives Kizzey Web real Discord voice features:
 
-- **Join** a Discord voice channel with a bot (or user) account.
-- **Play music** into that channel from a URL or a search query.
+- **Join** a Discord voice channel with an account token (or a bot token).
+- **Play music** into that channel from a URL, a local file or a search query.
 - **Record** the channel, one compressed Opus/OGG file per speaker plus an
-  optional mixed-down track. The bot's own music playback is recorded too.
+  optional mixed-down track. The account's own music playback is recorded too.
 - **Compress** existing recordings further with ffmpeg.
 
-Kizzey itself never changes: the web app calls the Kizzey server, which proxies
-to this service over a token-protected JSON API. The Discord token and the
-service token stay on the server.
+Kizzey itself proxies to this service over a token-protected JSON API. The
+Discord token and the service token stay on the server and never reach the
+browser.
 
 ---
 
 ## Requirements
 
-- Python 3.12 (3.13+ needs the `audioop-lts` package, already listed).
-- The `ffmpeg` binary on `PATH`.
-- The `libopus` shared library (installed with `ffmpeg` on Debian/Ubuntu, or
-  `libopus0`; py-cord/discord.py load it for voice).
-- A Discord **bot token** (recommended) or a user token, and for the bot:
-  - the **Server Members Intent** is optional: enable it *and* set
-    `VOICE_MEMBERS_INTENT=1` to label recordings with names instead of ids,
-  - the bot must be in the guild and have **Connect** permission on the channel,
-  - enable the **Voice States** and **Guilds** gateway intents in the Developer
-    Portal if your library asks for them (they are non-privileged).
+- Node.js 20.18 or newer (Node 22 LTS recommended).
+- The repository's npm packages (`npm install` from the checkout root).
+- The `ffmpeg` binary on `PATH`, or `ffmpeg-static` installed, or `VOICE_FFMPEG`
+  pointing at a binary.
+- Optional: `yt-dlp` for searching music by name. Direct URLs and local files
+  work without it.
+- A Discord **account token** (the one Kizzey uses for RPC) or a bot token.
+  Account tokens are the default; set `VOICE_USER_TOKEN=0` (or pass
+  `--bot-token`) when using a bot token.
 
-Install:
+Install from the checkout root:
 
 ```bash
-cd voice_service
-pip install -r requirements.txt
+npm install
 ```
+
+On Android shared storage npm may be unable to create `node_modules/.bin`
+symlinks; use `npm install --no-bin-links`. `scripts/postinstall.js` (run
+automatically by `npm install`/`npm ci`) copies the prebuilt
+`@snazzah/davey` binding into app-private storage and patches the loader so
+`NAPI_RS_NATIVE_LIBRARY_PATH` is honoured; the companion repeats the copy at
+startup if the install script did not run. Both steps are no-ops on ordinary
+Linux and in containers.
 
 ## Run
 
@@ -44,10 +50,10 @@ pass `DISCORD_TOKEN` if you want the companion to connect at startup.
 
 ```bash
 # loopback only: no shared secret needed
-python3 voice_service.py --host 127.0.0.1 --port 8421
+node voice_service/index.js --host 127.0.0.1 --port 8421
 
-# Kizzey (the launcher starts both for you: python3 script_pull.py)
-KIZZEY_VOICE_URL=http://127.0.0.1:8421 python3 server.py --host 0.0.0.0 --port 8420
+# Kizzey (the launcher starts both for you: node script_pull.js)
+KIZZEY_VOICE_URL=http://127.0.0.1:8421 node server.js --host 0.0.0.0 --port 8420
 ```
 
 `VOICE_TOKEN` is required whenever the service is bound to anything other than
@@ -62,12 +68,12 @@ exposes it to the browser.
 | `VOICE_HOST` | `127.0.0.1` | Bind address. |
 | `VOICE_PORT` | `8421` | Port. |
 | `VOICE_TOKEN` | *(empty)* | Shared secret. Required off loopback. |
+| `VOICE_USER_TOKEN` | `1` | `1` treats the token as an account token; `0` keeps the `Bot ` prefix for a bot token. |
 | `DISCORD_TOKEN` | *(empty)* | Optional default token. Kizzey normally sends the saved RPC token per `/join`. |
-| `VOICE_RECORDINGS_DIR` | `data/voice_recordings` | Where OGG recordings are stored. |
-| `VOICE_FFMPEG` | `ffmpeg` | ffmpeg binary. |
-| `VOICE_YTDLP` | `yt-dlp` | yt-dlp binary used when the Python module is missing. |
-| `VOICE_MEMBERS_INTENT` | *(off)* | Opt in to the privileged Server Members intent for named speakers. |
-| `VOICE_LOG_LEVEL` | `INFO` | Log level. |
+| `VOICE_RECORDINGS_DIR` | `data/voice_recordings` | Where OGG recordings and `recordings.json` live. |
+| `VOICE_FFMPEG` | `ffmpeg` | ffmpeg binary. `ffmpeg-static` is used when installed and this is unset. |
+| `VOICE_YTDLP` | `yt-dlp` | yt-dlp binary for search queries. |
+| `NAPI_RS_NATIVE_LIBRARY_PATH` | *(auto)* | Path to the DAVE native binding when the default lookup cannot load it. |
 
 ## Docker
 
@@ -88,29 +94,29 @@ Since 2026 Discord encrypts voice channels end to end with the **DAVE** protocol
 *Sending* audio (music playback) is unaffected. *Receiving* audio — which
 recording needs — only works when the voice library decrypts DAVE.
 
-The default `requirements.txt` pins **py-cord** to a commit on the
-`fix/voice-rec-2` branch, whose receive path decrypts DAVE through
-`discord.opus.PacketDecoder`. Stock releases of every library still silently drop
-encrypted receive audio. The service auto-detects either stack:
+This service uses **`@discordjs/voice` 0.19**, which negotiates DAVE through
+`@snazzah/davey`, for both playback and receive. `discord.js-selfbot-v13`
+provides the account-token gateway and the voice-server/state adapter; no bot
+token and no Lavalink are involved.
 
-| Backend | Detection | Receive call |
-| --- | --- | --- |
-| `pycord` | `discord.sinks.Sink` exists | `voice.start_recording(sink)` |
-| `voice_recv` | `discord.ext.voice_recv` imports | `voice.listen(sink)` |
+`GET /health` and `GET /state` report `backend: "discordjs-voice"` when the
+stack loaded. If the native binding cannot load, `/health` returns
+`backend: null` and the load error, and the service still answers the control
+plane so the screen can explain the failure.
 
-`GET /health` and `GET /state` report the active `backend`. If a recording comes
-back silent or sounds like noise:
+If a recording comes back silent or sounds like noise:
 
 1. Check the **encryption** badge on the Discord voice panel in Kizzey. `n/a`
-   means the connected library does not report DAVE support.
-2. Confirm the service logged `receive backend: pycord`. If it says `none`, the
-   voice stack did not import.
-3. Make sure the service is not joining deaf — it connects with `self_deaf=False`
+   means the connected stack could not report DAVE support.
+2. Check `/health` for `backend` and `error`.
+3. Make sure the service is not joining deaf — it connects with `selfDeaf: false`
    deliberately, because Discord sends no audio to a deafened client.
 
 ## HTTP API
 
-All endpoints except `GET /health` require `Authorization: Bearer <VOICE_TOKEN>`.
+`GET /` and `GET /health` are unauthenticated liveness probes. Other endpoints
+require `Authorization: Bearer <VOICE_TOKEN>` or `X-Voice-Token`; when
+`VOICE_TOKEN` is empty, only loopback requests are accepted.
 
 | Method | Path | Body | Result |
 | --- | --- | --- | --- |
@@ -126,3 +132,18 @@ All endpoints except `GET /health` require `Authorization: Bearer <VOICE_TOKEN>`
 | `GET` | `/recordings/<id>` | — | Download an OGG/Opus recording. |
 | `POST` | `/recordings/compress` | `{id, bitrate}` | Re-encode smaller. |
 | `POST` | `/recordings/delete` | `{id}` | Delete a recording. |
+
+Successful responses are `{ "ok": true, ... }`; errors are
+`{ "ok": false, "error": "..." }` with a 4xx/5xx status. The companion sends
+`Cache-Control: no-store` and `X-Content-Type-Options: nosniff` on every JSON
+response. Recordings are served as `audio/ogg` only through an authenticated
+request, and Kizzey proxies them so the voice port can stay private.
+
+## Files
+
+```text
+voice_service/index.js        Node companion (primary)
+voice_service/voice_service.py Python reference implementation
+voice_service/requirements.txt Python reference dependencies
+voice_service/Dockerfile      Node voice image
+```

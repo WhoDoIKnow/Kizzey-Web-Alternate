@@ -15,6 +15,13 @@
     state: null,
     recordings: [],
     timer: 0,
+    guilds: [],
+    channels: [],
+    guildsLoaded: false,
+    guildsLoading: false,
+    channelsFor: '',
+    channelsLoading: false,
+    directoryError: '',
     form: { guildId: '', channelId: '', query: '', mode: 'mix', bitrate: '32', mix: true },
   };
 
@@ -34,6 +41,96 @@
 
   function tone(active) { return active ? 'good' : ''; }
 
+  function guildOptions() {
+    const f = D().form;
+    const rows = D().guilds || [];
+    const head = D().guildsLoading
+      ? '<option value="">Loading servers…</option>'
+      : rows.length
+        ? '<option value="">Choose a server…</option>'
+        : '<option value="">No servers found</option>';
+    return head + rows.map(g => `<option value="${h(g.id)}" ${f.guildId === g.id ? 'selected' : ''}>${h(g.name)}</option>`).join('');
+  }
+
+  function channelOptions() {
+    const f = D().form;
+    if (!f.guildId) return '<option value="">Choose a server first</option>';
+    if (D().channelsLoading) return '<option value="">Loading channels…</option>';
+    const rows = D().channels || [];
+    if (!rows.length) return '<option value="">No voice channels in this server</option>';
+    const head = '<option value="">Choose a voice channel…</option>';
+    return head + rows.map(c => `<option value="${h(c.id)}" ${f.channelId === c.id ? 'selected' : ''}>${c.parentName ? h(c.parentName) + ' / ' : ''}${h(c.name)}${c.type === 13 ? ' (stage)' : ''}</option>`).join('');
+  }
+
+  function directoryHint() {
+    if (D().directoryError) return `<div class="field-hint" style="color:#ffb4ab">${h(D().directoryError)}</div>`;
+    if (!D().guilds.length && !D().guildsLoading) return '<div class="field-hint">Connect Discord (or add a token) to list your servers and voice channels.</div>';
+    return '<div class="field-hint">Pick the server first. The channel list only shows voice and stage channels you can join.</div>';
+  }
+
+  function paintDirectory() {
+    const guild = document.querySelector('[data-dv="guildId"]');
+    if (guild) guild.innerHTML = guildOptions();
+    const channel = document.querySelector('[data-dv="channelId"]');
+    if (channel) channel.innerHTML = channelOptions();
+    const hint = document.getElementById('dv-directory-hint');
+    if (hint) hint.innerHTML = directoryHint();
+    paintDirectory.ready = true;
+  }
+
+  async function loadChannels(guildId, force = false) {
+    if (!guildId) {
+      D().channels = [];
+      D().channelsFor = '';
+      D().directoryError = '';
+      paintDirectory();
+      return;
+    }
+    if (D().channelsFor === guildId && !force) return;
+    D().channelsLoading = true;
+    D().directoryError = '';
+    paintDirectory();
+    try {
+      const data = await K.api('/api/voice/discord/channels?guildId=' + encodeURIComponent(guildId));
+      D().channels = data.channels || [];
+      D().channelsFor = guildId;
+    } catch (error) {
+      D().channels = [];
+      D().channelsFor = '';
+      D().directoryError = error.message || 'Could not load voice channels.';
+    } finally {
+      D().channelsLoading = false;
+      paintDirectory();
+    }
+  }
+
+  async function loadGuilds(force = false) {
+    if (D().guildsLoaded && !force) return;
+    D().guildsLoading = true;
+    D().directoryError = '';
+    paintDirectory();
+    try {
+      const data = await K.api('/api/voice/discord/guilds');
+      D().guilds = data.guilds || [];
+      D().guildsLoaded = true;
+      const f = D().form;
+      if (f.guildId && !D().guilds.some(g => g.id === f.guildId)) {
+        f.guildId = '';
+        f.channelId = '';
+        D().channels = [];
+        D().channelsFor = '';
+      }
+      if (!f.guildId && D().guilds.length === 1) f.guildId = D().guilds[0].id;
+    } catch (error) {
+      D().guilds = [];
+      D().directoryError = error.message || 'Could not load Discord servers.';
+    } finally {
+      D().guildsLoading = false;
+      paintDirectory();
+    }
+    if (D().form.guildId) await loadChannels(D().form.guildId);
+  }
+
   async function refresh() {
     let data = null;
     try {
@@ -49,6 +146,7 @@
     D().loaded = true;
     D().configured = !!data.configured;
     D().reachable = !!data.reachable;
+    D().url = data.url || '';
     D().error = data.error || '';
     D().health = data.health || null;
     D().state = data.state || null;
@@ -169,12 +267,13 @@
         <div id="dv-status" style="margin-bottom:14px">${statusMarkup(D().state || {})}</div>
 
         <div class="card" style="margin-bottom:14px">
-          <div class="card-row" style="margin-bottom:10px"><div class="feature-icon" style="width:40px;height:40px;background:var(--surface-2);color:var(--primary)">${K.icon('phone')}</div><div><div class="card-title" style="font-size:0.875rem">Voice channel</div><div class="card-sub">A bot (or user) account joins the channel. Guild is optional — the channel id is enough.</div></div></div>
+          <div class="card-row" style="margin-bottom:10px"><div class="feature-icon" style="width:40px;height:40px;background:var(--surface-2);color:var(--primary)">${K.icon('phone')}</div><div><div class="card-title" style="font-size:0.875rem">Voice channel</div><div class="card-sub">Pick the Discord server, then the voice channel. Only channels your account can see are listed.</div></div></div>
           <div id="dv-conn" style="margin-bottom:10px">${connectionMarkup(D().state || {})}</div>
           <div class="field-row" style="display:flex;gap:10px;flex-wrap:wrap">
-            <div class="field" style="flex:1;min-width:150px"><label><span>Channel ID</span></label><div class="input-wrap"><input class="input" data-dv="channelId" value="${h(f.channelId)}" placeholder="123456789012345678" autocomplete="off"></div></div>
-            <div class="field" style="flex:1;min-width:150px"><label><span>Guild ID (optional)</span></label><div class="input-wrap"><input class="input" data-dv="guildId" value="${h(f.guildId)}" placeholder="Optional" autocomplete="off"></div></div>
+            <div class="field" style="flex:1;min-width:170px"><label><span>Server</span></label><select class="select" data-dv="guildId">${guildOptions()}</select></div>
+            <div class="field" style="flex:1;min-width:170px"><label><span>Voice channel</span></label><select class="select" data-dv="channelId">${channelOptions()}</select></div>
           </div>
+          <div id="dv-directory-hint">${directoryHint()}</div>
         </div>
 
         <div class="card" style="margin-bottom:14px">
@@ -211,7 +310,14 @@
           D().form[el.dataset.dv] = el.type === 'checkbox' ? el.checked : el.value;
         });
         el.addEventListener('change', () => {
-          D().form[el.dataset.dv] = el.type === 'checkbox' ? el.checked : el.value;
+          const key = el.dataset.dv;
+          D().form[key] = el.type === 'checkbox' ? el.checked : el.value;
+          if (key === 'guildId') {
+            D().form.channelId = '';
+            D().channels = [];
+            D().channelsFor = '';
+            loadChannels(el.value).catch(() => {});
+          }
         });
       });
       if (!root.dataset.dvVolumeBound) {
@@ -225,6 +331,7 @@
         });
       }
       paint();
+      loadGuilds().catch(() => {});
       refresh().catch(() => {});
       if (!D().timer) {
         D().timer = setInterval(() => {
@@ -239,7 +346,8 @@
 
   K.actions['dv-join'] = () => act(async () => {
     const f = D().form;
-    if (!f.channelId) { K.toast('Channel ID needed', 'Paste a voice channel id first.', 'error'); return; }
+    if (!f.guildId) { K.toast('Choose a server', 'Pick the Discord server that owns the voice channel.', 'error'); return; }
+    if (!f.channelId) { K.toast('Choose a voice channel', 'Pick a voice channel from the list.', 'error'); return; }
     await K.api('/api/voice/discord/join', { method: 'POST', body: { channelId: String(f.channelId).trim(), guildId: String(f.guildId || '').trim() } });
     K.toast('Joined Discord voice', '', 'ok');
   });

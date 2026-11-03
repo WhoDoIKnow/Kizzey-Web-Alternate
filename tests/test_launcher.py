@@ -131,7 +131,7 @@ def main():
             launcher.run_git = real_run_git
 
         readme = (ROOT / "README.md").read_text()
-        check("script_pull.py" in readme, "README documents the launcher")
+        check("script_pull.js" in readme, "README documents the launcher")
 
         # -- voice companion selection -----------------------------------------
         class VoiceArgs:
@@ -184,8 +184,8 @@ def main():
             launcher.check_voice_dependencies = lambda python, target: (True, "")
             started = {}
 
-            def fake_start(python, target, host, port, token, discord_token):
-                started.update(host=host, port=port, token=token, discord_token=discord_token)
+            def fake_start(python, target, host, port, token, discord_token, user_token=None):
+                started.update(host=host, port=port, token=token, discord_token=discord_token, user_token=user_token)
                 return FakeProc()
 
             launcher.start_voice_service = fake_start
@@ -203,6 +203,7 @@ def main():
             check(env.get("KIZZEY_VOICE_TOKEN") == "s3cret", "the voice token reaches Kizzey through the environment")
             check(started.get("token") == "s3cret", "the voice token reaches the companion")
             check(started.get("discord_token") == "bot-token", "the Discord token reaches the companion")
+            check(started.get("user_token") is None, "an explicit Discord token keeps its configured kind")
 
             # With nothing configured, both tokens fall back to the saved RPC token.
             (voice_dir / "data").mkdir(exist_ok=True)
@@ -217,12 +218,15 @@ def main():
                 "the saved RPC token is the companion Discord login",
                 str(started),
             )
+            check(started.get("user_token") is True, "the RPC token is marked as an account token", str(started))
             check(
                 env.get("KIZZEY_VOICE_TOKEN") == "rpc-token-123",
                 "the RPC token is handed to Kizzey",
                 str(env),
             )
             check(launcher.rpc_token(voice_dir) == "rpc-token-123", "rpc_token reads the active account")
+            (voice_dir / "data" / "secret.json").write_text(json.dumps({"token": "Bearer padded-token"}))
+            check(launcher.rpc_token(voice_dir) == "padded-token", "rpc_token strips a Bearer prefix")
 
             (voice_dir / "data" / "secret.json").write_text(json.dumps({"token": "", "accounts": [{"token": "acct"}]}))
             check(launcher.rpc_token(voice_dir) == "acct", "rpc_token falls back to the first account")

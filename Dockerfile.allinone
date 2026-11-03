@@ -4,16 +4,13 @@
 # that only allow one service. For a normal deployment use docker-compose.yml.
 #
 #   docker build -f Dockerfile.allinone -t kizzey-voice .
-#   docker run -p 8420:8420 \
-#     -v kizzey-data:/app/data \
-#     kizzey-voice
+#   docker run -p 8420:8420 -v kizzey-data:/app/data kizzey-voice
 #
-# Both processes sit on loopback, so no shared secret is needed. Voice joins
+# Both processes sit on loopback, so no shared secret is required. Voice joins
 # with the Discord account token Kizzey already stores for RPC.
-FROM python:3.12-slim
+FROM node:22-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
+ENV NODE_ENV=production \
     KIZZEY_HOST=0.0.0.0 \
     KIZZEY_PORT=8420 \
     KIZZEY_VOICE_URL=http://127.0.0.1:8421 \
@@ -22,25 +19,25 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     VOICE_RECORDINGS_DIR=/app/data/voice_recordings
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates git libopus0 \
+    && apt-get install -y --no-install-recommends ffmpeg yt-dlp ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY voice_service/requirements.txt ./voice_service/requirements.txt
-RUN pip install --no-cache-dir -r voice_service/requirements.txt
+COPY package.json package-lock.json ./
+COPY scripts ./scripts
+RUN npm ci --no-audit --no-fund
 
-COPY server.py script_pull.py ./
+COPY server.js script_pull.js ./
+COPY lib ./lib
 COPY static ./static
-COPY voice_service/voice_service.py ./voice_service/voice_service.py
+COPY voice_service/index.js ./voice_service/index.js
 
 RUN mkdir -p /app/data/voice_recordings
 VOLUME ["/app/data"]
 EXPOSE 8420
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python3 -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('KIZZEY_PORT','8420')+'/api/health', timeout=3).read()"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
+    CMD node -e "fetch('http://127.0.0.1:'+(process.env.KIZZEY_PORT||'8420')+'/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 
-# The voice service owns the Discord UDP/RTP session; Kizzey owns the UI and
-# the proxy. The shell forwards SIGTERM so both children finalise recordings and
-# save state instead of being killed abruptly.
-CMD ["sh", "-c", "python3 /app/voice_service/voice_service.py --host 127.0.0.1 --port 8421 & v=$!; python3 /app/server.py --host 0.0.0.0 --port 8420 & s=$!; trap 'kill -TERM $v $s 2>/dev/null' TERM INT; wait $s; code=$?; kill -TERM $v 2>/dev/null; wait $v; exit $code"]
+# script_pull supervises both children and forwards SIGTERM.
+CMD ["node", "script_pull.js", "--no-pull"]

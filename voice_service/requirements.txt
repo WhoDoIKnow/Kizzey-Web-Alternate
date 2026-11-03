@@ -1,14 +1,19 @@
-# Runtime dependencies for the Kizzey voice service.
+# Python reference dependencies for the Kizzey voice service.
+#
+# The active voice companion is voice_service/index.js (Node + @discordjs/voice
+# 0.19, which negotiates DAVE encryption). This file is kept so the Python
+# reference implementation in voice_service.py still runs and so its regression
+# suite has a documented environment.
 #
 # Playback (music into a voice channel) only needs a Discord library with voice
-# support.  Recording other people additionally needs Discord's DAVE end-to-end
+# support. Recording other people additionally needs Discord's DAVE end-to-end
 # encryption to be decrypted, because Discord encrypts every voice channel.
 #
-# py-cord is pinned to a commit on the fix/voice-rec-2 branch.  Stock releases of
+# py-cord is pinned to a commit on the fix/voice-rec-2 branch. Stock releases of
 # every library still silently drop DAVE-encrypted receive audio; this branch
 # decrypts through discord.opus.PacketDecoder and is the stack verified against a
-# live encrypted channel.  Switch back to a normal PyPI pin once that branch
-# ships.  py-cord's [voice] extra brings PyNaCl and davey.
+# live encrypted channel. Switch back to a normal PyPI pin once that branch
+# ships. py-cord's [voice] extra brings PyNaCl and davey.
 #
 # The service auto-detects either backend, so the alternative below also works if
 # you prefer it (pip install -r this file after replacing the py-cord line):

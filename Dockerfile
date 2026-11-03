@@ -1,24 +1,27 @@
-# Kizzey Web — standard library only, no browser in the image.
+# Kizzey Web — Node.js server, no browser in the image.
 #
-# Browser sign-in runs against KIZZEY_BROWSER_CDP when it is set, so this
-# container never needs Chromium. Without an endpoint, use the password or
-# token sign-in in the web UI.
-FROM python:3.12-slim
+# Browser sign-in is not available here; use the Discord sign-in sheet (password
+# or MFA) or add an account token in the web UI. No Chromium is installed.
+FROM node:22-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
+ENV NODE_ENV=production \
     KIZZEY_HOST=0.0.0.0 \
     KIZZEY_PORT=8420
 
 WORKDIR /app
-COPY server.py script_pull.py ./
+COPY package.json package-lock.json ./
+COPY scripts ./scripts
+RUN npm ci --no-audit --no-fund
+
+COPY server.js script_pull.js ./
+COPY lib ./lib
 COPY static ./static
 
 RUN mkdir -p /app/data
 VOLUME ["/app/data"]
 EXPOSE 8420
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python3 -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('KIZZEY_PORT','8420')+'/api/health', timeout=3).read()"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD node -e "fetch('http://127.0.0.1:'+(process.env.KIZZEY_PORT||'8420')+'/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 
-CMD ["python3", "server.py"]
+CMD ["node", "server.js"]

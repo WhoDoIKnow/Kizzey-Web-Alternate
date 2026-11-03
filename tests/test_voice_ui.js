@@ -57,7 +57,8 @@ vm.runInContext(fs.readFileSync(path.join(root, 'static', 'screens-discord-voice
   const html = K.screens['discord-voice'].render();
   check(html.includes('Discord voice'), 'screen title present');
   check(html.includes('Voice channel'), 'channel card present');
-  check(html.includes('Channel ID'), 'channel id field present');
+  check(html.includes('data-dv="guildId"') && html.includes('data-dv="channelId"'), 'server and channel pickers present');
+  check(html.includes('Voice channel'), 'voice channel picker labelled');
   check(html.includes('Music from the web'), 'music card present');
   check(html.includes('Record the call'), 'recording card present');
   check(html.includes('Opus bitrate'), 'bitrate selector present');
@@ -112,9 +113,9 @@ vm.runInContext(fs.readFileSync(path.join(root, 'static', 'screens-discord-voice
   // -- static wiring ------------------------------------------------------
   const index = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
   check(index.includes('screens-discord-voice.js'), 'shell loads the discord voice screen');
-  check(index.includes('?b=v13'), 'shell cache key was bumped');
+  check(index.includes('?b=v15'), 'shell cache key was bumped');
   const sw = fs.readFileSync(path.join(root, 'static', 'sw.js'), 'utf8');
-  check(sw.includes("BUILD = 'v13'"), 'service worker build was bumped');
+  check(sw.includes("BUILD = 'v15'"), 'service worker build was bumped');
   check(sw.includes('screens-discord-voice.js'), 'service worker caches the screen');
   const app = fs.readFileSync(path.join(root, 'static', 'app.js'), 'utf8');
   check(app.includes("route: 'discord-voice'"), 'navigation exposes the screen');
@@ -122,12 +123,17 @@ vm.runInContext(fs.readFileSync(path.join(root, 'static', 'screens-discord-voice
   check(social.includes('data-route="discord-voice"'), 'voice room links to the screen');
 
   const server = fs.readFileSync(path.join(root, 'server.py'), 'utf8');
+  check(server.includes('/api/voice/discord/guilds'), 'server lists voice servers');
+  check(server.includes('/api/voice/discord/channels'), 'server lists voice channels');
   check(server.includes('/api/voice/discord/join'), 'server proxies join');
   check(server.includes('/api/voice/discord/play'), 'server proxies play');
   check(server.includes('/api/voice/discord/record'), 'server proxies recording');
   check(server.includes('/api/voice/discord/recordings/compress'), 'server proxies compression');
   check(server.includes('KIZZEY_VOICE_URL'), 'server reads the voice service url');
   check(server.includes('KIZZEY_VOICE_TOKEN'), 'server reads the voice service token');
+  const nodeServer = fs.readFileSync(path.join(root, 'lib', 'api.js'), 'utf8');
+  check(nodeServer.includes('/api/voice/discord/guilds'), 'Node server lists voice servers');
+  check(nodeServer.includes('/api/voice/discord/channels'), 'Node server lists voice channels');
   check(server.includes('def voice_service_state'), 'server builds voice state');
   check(!server.includes('VOICE_SERVICE_TOKEN = "'), 'voice token is never hard-coded');
 

@@ -90,8 +90,20 @@
 
   function paintBrowserHint(info) {
     const copy = browserCopy(info || { mode: 'none' });
+    const unavailable = !info || info.mode === 'none' || info.available === false;
     document.querySelectorAll('[data-browser-title]').forEach(node => { node.textContent = copy.title; });
     document.querySelectorAll('[data-browser-copy]').forEach(node => { node.textContent = copy.body; });
+    // Without a browser the primary button cannot do anything, so get it out of
+    // the way and open the password sheet, which is the working sign-in path.
+    document.querySelectorAll('[data-login-panel]').forEach(panel => {
+      const button = panel.querySelector('[data-action="login-browser"]');
+      if (button) button.classList.toggle('hidden', unavailable);
+      const prefix = panel.dataset.loginPanel;
+      if (prefix && unavailable) revealPasswordBlock(prefix, true);
+    });
+    document.querySelectorAll('[data-login-panel] [data-action="login-password-toggle"]').forEach(toggle => {
+      toggle.classList.toggle('hidden', unavailable);
+    });
   }
 
   function refreshBrowserHint() {
@@ -497,7 +509,7 @@
       finish(data);
     } catch (error) {
       showError(`${prefix}-browser`, error.message);
-      if (/no chrome|no browser|KIZZEY_BROWSER_CDP|devtools/i.test(error.message || '')) {
+      if (/no chrome|no browser|browser sign-in is not available|KIZZEY_BROWSER_CDP|devtools/i.test(error.message || '')) {
         revealPasswordBlock(prefix, true);
         refreshBrowserHint();
       }

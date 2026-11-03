@@ -2,25 +2,20 @@
 
 A self-hosted browser recreation of the Kizzey Android app (`xyz.Kizzey` 8.4.4). It keeps the
 Material 3 phone interface, the full presence editor set, and the community/tool screens while
-using a Python standard-library server as the browser equivalent of the Android service.
+using a Node.js server as the browser equivalent of the Android service.
 
 The Discord token lives on the server. The browser never receives it, not even a hint.
 
 > **It runs on your machine, and only on your machine.** There is no hosted Kizzey service and no
 > telemetry of any kind. The server, the Discord traffic and the session token all stay on the
-> computer you start `server.py` on. As long as the code came from this repository, it does nothing
+> computer you start `server.js` on. As long as the code came from this repository, it does nothing
 > outside that machine: the only outbound requests are the Discord calls you ask for, and the token
 > is written only to your own `data/secret.json`. Nothing phones home, and nothing here can reach
-> into another install or take over an account. Reading every line you would run takes a few minutes
-> — there is no third-party dependency, no obfuscation, no bundled binary, and nothing that can take
-> a token off this disk and send it elsewhere.
+> into another install or take over an account.
 
-Sign in the way you would on `discord.com`: click **Sign in with Discord** and a real Discord web
-sign-in opens in a browser window on this computer. Sign in there exactly as you normally would —
-password, two-factor, captcha, passkey, whatever Discord asks for — and Kizzey reads the session
-Discord just created, saves the token in `data/secret.json`, and closes the window. Nothing is typed
-into Kizzey and nothing is sent anywhere except to Discord itself. Email/password and token entry
-remain available as fallbacks.
+Sign in with the Discord account's email/username and password, or paste an existing account token.
+Discord may answer a password login with a captcha or a two-factor challenge; both are handled on
+the sign-in sheet, and only the session token Discord returns is kept, in `data/secret.json`.
 
 Accounts are not switched one at a time. Every saved account that has something switched on — a live
 Rich Presence or a role in a message mirror rule — keeps its own gateway open alongside the others,
@@ -31,15 +26,16 @@ socket.
 
 Requirements:
 
-- Python 3.10 or newer
-- A modern browser
+- Node.js 20 or newer (Node 22 LTS recommended; the voice stack needs 20.18+)
+- npm (bundled with Node)
+- Optional: `ffmpeg` for Discord voice playback, recording and compression
+- Optional: `yt-dlp` for searching music by name instead of using a direct URL
 - Optional: `tesseract` on the server for Screen Read OCR
-
-No pip or npm packages are needed.
 
 ```bash
 cd /storage/emulated/0/Download/Illegal/kizzey_web
-python3 server.py --host 0.0.0.0 --port 8420
+npm install
+npm start
 ```
 
 Then open **http://127.0.0.1:8420** on the device running the server, or the printed LAN address
@@ -50,35 +46,43 @@ location and browser screen capture are available there. On a plain-HTTP LAN add
 features may be blocked by the browser; put a TLS reverse proxy in front of Kizzey if you need
 them from another device.
 
-### Pull and run
-
-`script_pull.py` clones or updates the checkout and then starts the server, so a fresh machine
-needs one command:
+On Android/Termux, install npm packages with `--no-bin-links` if npm cannot create
+`node_modules/.bin` symlinks on shared storage:
 
 ```bash
-python3 script_pull.py --host 0.0.0.0 --port 8420
+npm install --no-bin-links
+```
+
+### Pull and run
+
+`script_pull.js` clones or updates the checkout, installs the packages the current architecture
+needs, and then starts the server, so a fresh machine needs one command:
+
+```bash
+node script_pull.js --host 0.0.0.0 --port 8420
 ```
 
 It clones into `./kizzey-web` when the script is not already inside a checkout, and forwards every
-other flag to `server.py`. When the script is already inside a checkout it compares the local commit
+other flag to `server.js`. When the script is already inside a checkout it compares the local commit
 with the tracked branch tip first: if they match it says so and starts straight away without a
 fetch, otherwise it fetches and runs `git pull --ff-only`. Runtime data in `data/` is git-ignored,
-so updates never delete accounts, settings or history.
+so updates never delete accounts, settings or history. `npm install` always runs, so a freshly
+pulled checkout has the packages its modules require.
 
-It also starts the optional Discord voice companion. By default it looks for
-`voice_service/voice_service.py`, the `discord` package and `ffmpeg`; when they are all present it
-runs the companion, sets `KIZZEY_VOICE_URL` for Kizzey, and supervises both processes so stopping
-one stops the other and recordings finish cleanly. There is no second secret to create: voice logs
-in with the same Discord account token that already runs RPC (read from `data/secret.json`), and the
-same token is used as the loopback bearer. An explicit `KIZZEY_VOICE_TOKEN`, `VOICE_TOKEN` or
-`DISCORD_TOKEN` still overrides it. If the companion was configured for another host with
-`KIZZEY_VOICE_URL`, that is left alone. Otherwise Kizzey starts alone; the voice screen simply
-reports the service as unreachable.
+It also starts the Node Discord voice companion when it can. It looks for
+`voice_service/index.js`, the voice npm packages, `ffmpeg` and (optionally) `yt-dlp`; when they are
+present it runs the companion, sets `KIZZEY_VOICE_URL` for Kizzey, and supervises both processes so
+stopping one stops the other and recordings finish cleanly. There is no second secret to create:
+voice logs in with the same Discord account token that already runs RPC (read from
+`data/secret.json`), and the same token is used as the loopback bearer. An explicit
+`KIZZEY_VOICE_TOKEN`, `VOICE_TOKEN` or `DISCORD_TOKEN` still overrides it. If the companion was
+configured for another host with `KIZZEY_VOICE_URL`, that is left alone. Otherwise Kizzey starts
+alone; the voice screen simply reports the service as unreachable.
 
 ```bash
-python3 script_pull.py --voice          # require the companion, fail if it cannot start
-python3 script_pull.py --no-voice       # skip it even when the packages are installed
-python3 script_pull.py --voice-install  # pip install voice_service/requirements.txt first
+node script_pull.js --voice          # require the companion, fail if it cannot start
+node script_pull.js --no-voice       # skip it even when the packages are installed
+node script_pull.js --voice-required # same as --voice, clearer name
 ```
 
 | Launcher option | Purpose |
@@ -89,7 +93,7 @@ python3 script_pull.py --voice-install  # pip install voice_service/requirements
 | `--update-only` | Pull and exit. |
 | `--voice` / `--no-voice` | Always or never start the voice companion. |
 | `--voice-required` | Fail the launch when the companion cannot start. |
-| `--voice-install` | Install `voice_service/requirements.txt`, then start it. |
+| `--voice-install` | Re-run the npm install before starting the companion. |
 | `--voice-host` / `--voice-port` | Companion bind address and port (default `127.0.0.1:8421`). |
 | `--voice-token` / `--discord-token` | Optional overrides; both default to the saved RPC token. |
 
@@ -107,83 +111,18 @@ instead of discarding them.
 | `--host 0.0.0.0` | Listen on every interface. Default. |
 | `--port 8420` | HTTP port. Default `8420`. |
 | `--no-gateway` | Restore saved accounts without resuming live presences or opening any gateway socket at startup. |
-| `--browser-cdp URL` | Drive a Chrome/Chromium DevTools endpoint on another machine instead of a local browser. |
 | `KIZZEY_HOST` / `KIZZEY_PORT` | Environment equivalents for host and port. |
-| `KIZZEY_BROWSER_CDP` | Environment equivalent for `--browser-cdp`, for example `http://127.0.0.1:9222` or `ws://browser:3000?token=…`. |
-| `KIZZEY_BROWSER` | Path to a browser binary, or a DevTools URL (then it behaves like `KIZZEY_BROWSER_CDP`). |
+| `KIZZEY_VOICE_URL` | Base URL of the voice companion. Default `http://127.0.0.1:8421`. |
+| `KIZZEY_VOICE_TOKEN` | Bearer token for the companion when it is reachable off loopback. |
 
 ## Signing in
 
-### Sign in with Discord
-
-This is the normal Discord web sign-in, not a lookalike form. The button starts a browser on this
-machine — Chrome, Edge, Brave or Chromium, whichever is already installed — on
-`https://discord.com/login`, using a throwaway profile in `data/tmp/`. That window is Discord's own
-page: password, two-factor, captcha, "verify it's you" and passkeys all work, because Discord is
-handling them.
-
-When the sign-in lands and Discord stores its session token in that profile, Kizzey reads the token
-over the browser's local debugging channel, verifies it against Discord, saves it to
-`data/secret.json`, closes the window and deletes the temporary profile. The window is separate from
-your everyday browser: it carries no cookies from it, writes nothing to it, and signing out there
-does not affect it.
-
-The token never leaves this machine and is never sent to the page. If the window cannot open (no
-Chromium-family browser installed), or you would rather not use it, the fallbacks below still work.
-
-### Headless server or container
-
-Kizzey's own container needs no browser. Browser sign-in only needs a Chromium-family browser
-*somewhere reachable over the network*, driven through its DevTools endpoint. Point
-`KIZZEY_BROWSER_CDP` at it (or pass `--browser-cdp`):
-
-```bash
-# A Chrome on your desktop, started with a debugging port. You sign in on that
-# screen, so no virtual display or VNC is needed.
-google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/kizzey-signin
-
-python3 server.py --browser-cdp http://192.168.1.20:9222
-```
-
-The included `Dockerfile` is Python-only, with no Chromium in the image:
-
-```bash
-docker build -t kizzey-web .
-docker run --rm -p 8420:8420 -v kizzey-data:/app/data \
-  -e KIZZEY_BROWSER_CDP=http://192.168.1.20:9222 \
-  kizzey-web
-```
-
-Kizzey asks the endpoint for its tabs, opens `discord.com/login` in a new tab, waits while you sign
-in on that machine, reads the session token over the same debugging channel, and closes that tab.
-Chrome binds the debugging port to `127.0.0.1` by default. Reach it with an SSH tunnel
-(`ssh -L 9222:127.0.0.1:9222 user@desktop`) and use `http://127.0.0.1:9222`, run Kizzey with host
-networking on that machine, or use a Chromium container on the same Docker network.
-
-For a hosted browser service, the `ws://` or `wss://` form keeps its query string:
-
-```bash
-KIZZEY_BROWSER_CDP='wss://browser.example.com?token=SECRET' python3 server.py
-```
-
-A headless Chromium (for example a browserless container) can open the tab but gives you no screen to
-sign in on; use it only if you can view that browser (VNC, a live-view URL) or if the profile is
-already signed in and the token can be read straight away. Otherwise the password and token
-fallbacks below work with no browser at all.
-
-The DevTools endpoint is remote control of a real browser: keep it on localhost, a private Docker
-network or an SSH tunnel, and never publish it to the internet. Set `KIZZEY_BROWSER_CDP_TOKEN` if
-your endpoint expects `Authorization: Bearer …`. A local browser on a display-less host stays
-invisible and unusable, so headless mode there is opt-in with `KIZZEY_BROWSER_HEADLESS=1`; containers
-automatically get `--no-sandbox` because a throwaway profile cannot start as root otherwise.
-
 ### Email or username and password
 
-The fallback sign-in screen works the way `discord.com` does: type the email or username and password
-for the account, and Kizzey performs the same login request the website performs, from the server.
-Discord answers with a session token, or with a two-factor challenge — when it asks for a code,
-Kizzey shows the two-factor field and posts the current code from your authenticator app back to
-Discord.
+The sign-in sheet works the way `discord.com` does: type the email or username and password for the
+account, and Kizzey performs the same login request the website performs, from the server. Discord
+answers with a session token, or with a two-factor challenge — when it asks for a code, Kizzey shows
+the two-factor field and posts the current code from your authenticator app back to Discord.
 
 The password is used only for that one login request, is never logged and is never written anywhere;
 only the session token Discord returns is kept, in `data/secret.json`.
@@ -197,13 +136,17 @@ sends it to a third-party solver, and the challenge data is never written to dis
 only external script the app loads; hCaptcha sees the browser's IP address and the Kizzey address,
 never the password. If the widget cannot load on that device, the sheet falls back to the token box.
 
+There is no Chromium or browser-automation dependency in this build. Sign-in is the password/MFA
+request plus the in-browser captcha relay, or the token fallback below; a headless container has no
+browser window to sign in on and does not need one.
+
 ### Use a token instead
 
 Rich Presence is sent through the user gateway, not a bot account, so the presence and message
 features need a Discord user token. The sign-in sheet keeps that path behind **Use a token instead**:
 open Discord in a desktop browser, copy the `token` value from Local Storage, and paste it once.
-This is the web equivalent of the Android app's WebView session, and it is also the fallback when the
-captcha widget cannot load or a two-factor method cannot be driven.
+This is the web equivalent of the Android app's WebView session, and it is also the fallback when
+the captcha widget cannot load or a two-factor method cannot be driven.
 
 The token is validated against Discord, stored in `data/secret.json`, and used server-side. Public
 state, logs, API responses and state exports never include it. A token is a live credential to the
@@ -265,12 +208,11 @@ Two post formats are available per rule:
 The server is a poller, not a gateway listener: messages are read over the REST API on an interval,
 so an enabled rule keeps the gateways of the accounts it names open but never takes its messages
 from them. A new rule records the newest source message as its starting cursor, so existing history
-is never backfilled. Only messages after that cursor
-are copied. The cursor and delivery counters persist across restarts. At most 30 messages are
-processed per rule per check, posts are paced at roughly one per second, and Discord 429
-responses set a retry cooldown. Background checks need both the global auto-mirror switch and the
-individual rule enabled. **Run now** bypasses both pause switches and the retry cooldown so an
-operator can test a rule deliberately.
+is never backfilled. Only messages after that cursor are copied. The cursor and delivery counters
+persist across restarts. At most 30 messages are processed per rule per check, posts are paced at
+roughly one per second, and Discord 429 responses set a retry cooldown. Background checks need both
+the global auto-mirror switch and the individual rule enabled. **Run now** bypasses both pause
+switches and the retry cooldown so an operator can test a rule deliberately.
 
 Forwarded posts include message text, attachment URLs, embed URLs and sticker names, use
 `allowed_mentions: {parse: []}` so text cannot ping anyone, and end with an invisible `U+2063`
@@ -290,8 +232,8 @@ Discord's terms; use relays only in channels you control.
 
 The **Tools → Discord voice** screen joins a real Discord voice channel, plays music from a URL or
 search query, and records the call. Discord voice is an always-on voice gateway plus UDP/RTP and
-Opus, so it runs in a small companion process instead of the standard-library-only Kizzey server.
-Kizzey proxies commands to it and never sends the Discord token or the service token to the browser.
+Opus, so it runs in a small Node companion process instead of the web server. Kizzey proxies
+commands to it and never sends the Discord token or the service token to the browser.
 
 Voice uses the **same Discord account token that already runs RPC**, so there is no separate bot
 token or voice secret to paste. When you join from the screen, Kizzey reads the active account token
@@ -300,41 +242,51 @@ flow first; the launcher also passes the saved token at startup so the companion
 
 ```bash
 # simplest: one command, starts Kizzey and the companion together
-python3 script_pull.py
+node script_pull.js
 
 # or run them by hand (companion on loopback, no shared secret needed)
-cd voice_service && pip install -r requirements.txt
-python3 voice_service.py --host 127.0.0.1 --port 8421
+node voice_service/index.js --host 127.0.0.1 --port 8421
 
-KIZZEY_VOICE_URL=http://127.0.0.1:8421 python3 server.py
+KIZZEY_VOICE_URL=http://127.0.0.1:8421 node server.js
 ```
+
+The **server** and **voice channel** pickers are populated from the joined account's own guild and
+channel lists (server-side, cached for ten seconds). Choose a server, then a voice channel, then
+**Join**; there is no raw channel-ID field.
 
 Set `VOICE_TOKEN` on the companion and the matching `KIZZEY_VOICE_TOKEN` on Kizzey only when the
 companion is reachable off loopback. In that case the shared secret is a bearer token between the two
 processes, not the Discord token.
 
-The bot needs **Connect** permission in the channel. Guild and channel IDs are enough; the guild is
-resolved from the channel. The service asks only for the non-privileged Guilds and Voice States
-intents; enable the privileged **Server Members** intent in the Developer Portal and set
-`VOICE_MEMBERS_INTENT=1` if you want speakers labelled by name instead of id. Music can be a direct
-audio/video URL, a local path, or a search that `yt-dlp` resolves. Playback supports pause, resume,
-skip, stop and volume, with a small queue.
+Discord account tokens are sent bare. `discord.js-selfbot-v13` supplies the account-token gateway;
+`@discordjs/voice` 0.19 supplies the voice connection, UDP/RTP, playback and receiver, and negotiates
+**DAVE** end-to-end encryption. No Lavalink, Java or bot token is involved. If you deliberately run
+the companion with a bot token instead, set `VOICE_USER_TOKEN=0`; the service keeps the `Bot `
+prefix in that mode.
 
-Recording asks the voice client for decoded 48 kHz PCM and pipes each speaker into its own ffmpeg
-process, which encodes **mono Opus in an OGG container** live. The bot's own playback is tapped into
-the same recorder, so music is part of the recording. At the default 32 kbps that is about
-240 KB per minute per speaker; the bitrate selector also offers 16, 24, 48 and 64 kbps. With mixing
-enabled, stopping also writes a separate mixed track. Existing recordings can be re-encoded smaller
-from the same screen. Files live in the companion's `VOICE_RECORDINGS_DIR` and are downloaded through
-Kizzey, so the voice port itself can stay on a private network.
+The account needs permission to join the channel. Pick the server and channel in the screen; the
+service resolves the guild from the channel ID it receives. Music can be a direct audio/video URL, a
+local path, or a search that `yt-dlp` resolves. Playback supports pause, resume, skip, stop and
+volume, with a small queue.
 
-Discord encrypts voice channels end to end with **DAVE**. Sending audio (music) is unaffected, but
-receiving voices only works when the installed Discord voice stack decrypts DAVE. The screen shows an
-encryption chip: `DAVE encrypted` means the connection reports an active DAVE session, `no DAVE`
-means recordings will be silent, and `DAVE n/a` means the library does not report it. The pinned
-stack in `voice_service/requirements.txt` is **py-cord** on its `fix/voice-rec-2` branch, which is the
-verified path; the service also accepts discord.py plus `discord-ext-voice-recv` and reports which
-backend it loaded.
+Recording subscribes to each speaker's Opus stream, decodes it to 48 kHz stereo PCM, and pipes each
+speaker into its own ffmpeg process, which encodes **mono Opus in an OGG container** live. The
+account's own playback is tapped into the same recorder, so music is part of the recording. At the
+default 32 kbps that is about 240 KB per minute per speaker; the bitrate selector also offers 16,
+24, 48 and 64 kbps. With mixing enabled, stopping also writes a separate mixed track. Existing
+recordings can be re-encoded smaller from the same screen. Files live in the companion's
+`VOICE_RECORDINGS_DIR` and are downloaded through Kizzey, so the voice port itself can stay on a
+private network.
+
+Discord encrypts voice channels end to end with **DAVE**. `@discordjs/voice` 0.19 handles the
+session through `@snazzah/davey` (a native prebuilt module) for both sending and receiving. The
+screen shows an encryption chip: `DAVE encrypted` means the connection reports an active session,
+`no DAVE` means recordings will be silent, and `DAVE n/a` means the stack could not report it. On
+platforms where the native binding cannot load (for example Android shared storage), `npm install`
+runs `scripts/postinstall.js`, which copies the prebuilt binding into app-private storage and
+patches the loader so `NAPI_RS_NATIVE_LIBRARY_PATH` is honoured. The launcher and the companion
+repeat that copy on Android, so the voice stack loads there too. If the binding still cannot load,
+the companion starts anyway and reports the problem through `/health`.
 
 Two deployment shapes are included:
 
@@ -406,12 +358,16 @@ what the shelf looks like.
 
 ## Checks
 
-The runtime has no dependencies, but the repository includes regression checks for the native
-import path. Node is optional and only used to exercise the browser-side actions with stubs.
+The Node runtime is the primary implementation. `server.py` and
+`voice_service/voice_service.py` are kept as the Python reference, and their regression suites
+still run against that reference.
 
 ```bash
+npm test                             # browser-side Node checks
+for file in server.js script_pull.js lib/*.js voice_service/index.js static/*.js; do node --check "$file"; done
+
+# Python reference and integration checks
 python3 -m py_compile server.py
-for file in static/*.js; do node --check "$file"; done
 python3 tests/test_kizzey_import.py
 python3 tests/test_accounts_mirror.py
 python3 tests/test_resume.py
@@ -420,14 +376,10 @@ python3 tests/test_browser_remote.py
 python3 tests/test_launcher.py
 python3 tests/test_gateway.py
 python3 tests/test_voice_service.py
-node tests/test_import_ui.js
-node tests/test_gallery_apply.js
-node tests/test_accounts_ui.js
-node tests/test_voice_ui.js
 ```
 
 The Python integration tests boot temporary server state and replace Discord with deterministic
-fakes, so they do not touch `data/` or use a real token. The browser tests run the screen code
+fakes, so they do not touch `data/` or use a real token. The Node browser tests run the screen code
 against a stubbed Material runtime.
 
 ## What is included
@@ -444,7 +396,7 @@ against a stubbed Material runtime.
 - Persistent history, server logs and usage counters
 - Saved presets, a gallery with local submissions, and automation schedules
 - Up to eight saved Discord accounts, each with its own Custom RPC card and live presence
-- Discord web sign-in in a local browser or a remote Chrome DevTools endpoint, plus email/password with an in-browser captcha relay, two-factor and a user-token fallback
+- Email/password + MFA sign-in with an in-browser captcha relay, and a user-token fallback
 - A real, rate-limited message mirror with normal and managed-webhook identity formats
 - Optional album-art backdrop and artwork-sampled accent colour in Display settings
 - Custom CSS variables, text scaling, themes, AMOLED mode and Material You-style accents
@@ -453,7 +405,7 @@ against a stubbed Material runtime.
 
 - Kizzey Chat with rooms, replies, reactions, attachments, local notifications and SSE updates
 - Voice-room roster, mute/deafen/speaking state, heartbeat and local microphone level test
-- Discord voice via the optional companion: join a channel, play music from the web, record speakers to small Opus/OGG files
+- Discord voice via the Node companion: server/channel pickers, music from the web, per-speaker Opus/OGG recording
 - Moments, leaderboard, Discord friends list, presence browser, profile and usage/history screens
 - KCoin wallet, shop, cosmetic equip actions and a no-payment Kizzey+ demo
 - Weather/geocoding via Open-Meteo, driving routes via OSRM
@@ -470,9 +422,9 @@ are deliberate and shown honestly in the interface:
 | Foreground-app detection | Manual app catalogue/selection |
 | Notification-listener media detection | Manual media fields and local artwork upload |
 | Health Connect | Manual readings, JSON import and approximate device-motion steps |
-| Shizuku shell | Host statistics from the Python server |
+| Shizuku shell | Host statistics from the Node server |
 | System screen capture + OCR | Browser tab/window capture or image upload, OCR'd server-side |
-| Native chat/voice backend | Local persisted rooms and voice state; live Discord voice (join, music, recording) runs in the optional `voice_service` companion |
+| Native chat/voice backend | Local persisted rooms and voice state; live Discord voice (join, music, recording) runs in `voice_service/` |
 | Android overlays, tiles, Android Auto | UI controls and honest preview/state analogues |
 | APK/system installer | PWA "Add to Home screen" |
 | Simultaneous multi-account RPC | Each account with a running presence holds its own gateway; several run at once |
@@ -484,21 +436,29 @@ and foreground-app detection cannot be reproduced from a regular web page.
 
 ## How it works
 
-- `server.py` owns persistence, Discord REST/gateway, SSE, OCR, uploads and all browser APIs.
+- `server.js` owns startup, account restore, live-presence resume, the gateway reconciler,
+  the mirror poller and graceful shutdown.
+- `lib/` holds the stack: `store.js` persistence, `gateway.js` Discord gateway, `discord.js` REST,
+  `presence.js`/`activities.js` Rich Presence, `mirror.js` forwarding, `login.js` sign-in,
+  `importer.js` Kizzey import, `voice.js`/`voice-directory.js` voice proxy, and `api*.js` routes.
 - `static/core.js` is the shared runtime: state, API/patch queue, icon set, fields, sheets, themes.
 - `static/app.js` is the router/shell, onboarding, Home and drawer.
 - `static/screens-*.js` register screens into `K.screens` and actions into `K.actions`.
 - `static/styles.css` contains the Material 3 visual system and responsive phone shell.
 - `static/sw.js` provides the installable shell cache; the server is still required for live data.
+- `voice_service/index.js` is the Discord voice companion: selfbot gateway, DAVE voice connection,
+  playback queue, receiver and ffmpeg recording.
+- `server.py` and `voice_service/voice_service.py` remain as the Python reference implementation.
 
 State is JSON under `data/`:
 
 ```text
-data/state.json     settings, presets, mirror rules, chat, history, wallet, active presences, UI state
-data/secret.json    private Discord tokens, active-account ID and managed webhook URLs
-data/history.json   presence-history mirror
-data/kizzey.log     server event log
-data/uploads/       local chat images, avatars and screen captures
+data/state.json             settings, presets, mirror rules, chat, history, wallet, active presences, UI state
+data/secret.json            private Discord tokens, active-account ID and managed webhook URLs
+data/history.json           presence-history mirror
+data/kizzey.log             server event log
+data/uploads/               local chat images, avatars and screen captures
+data/voice_recordings/      OGG/Opus recordings and recordings.json
 ```
 
 Screen captures, avatars and chat attachments stay on this server. Only artwork explicitly used
@@ -508,8 +468,9 @@ artwork URLs are resolved the same way.
 ### Reset
 
 Stop the server, remove `data/state.json`, `data/history.json`, `data/secret.json`,
-`data/kizzey.log` and the files in `data/uploads/`, then start it again. A fresh neutral state is
-created automatically. Removing `secret.json` signs the server out of Discord.
+`data/kizzey.log`, the files in `data/uploads/` and `data/voice_recordings/`, then start it again.
+A fresh neutral state is created automatically. Removing `secret.json` signs the server out of
+Discord.
 
 ## API sketch
 
@@ -524,10 +485,15 @@ The frontend uses JSON endpoints and an SSE stream. The main groups are:
 - `POST /api/presets/{save,delete}`; `GET /api/presets/export` (`?id=`, `?current=1`, `?pack=1`)
 - `GET /api/weather`, `/api/geocode`, `/api/route`, `/api/friends`, `/api/hoststats`, `/api/update`
 - `POST /api/upload`, `/api/image`, `/api/ocr`, `/api/chat/*`, `/api/voice/*`, `/api/moments/*`
-- `GET /api/voice/discord`; `POST /api/voice/discord/{join,leave,play,control,record}`
+- `GET /api/voice/discord`, `/api/voice/discord/{guilds,channels}`
+- `POST /api/voice/discord/{join,leave,play,control,record}`
 - `POST /api/voice/discord/recordings/{compress,delete}`; `GET /api/voice/discord/recordings/{id}`
 - `POST /api/wallet/daily`, `/api/shop/buy`, `/api/premium/{unlock,reset}`
 - `GET /api/export`, `/api/logs`, `/api/history`; `POST /api/import`, `/api/logs/clear`, `/api/history/clear`
+
+`/api/voice/discord/channels` takes `?guildId=…` and returns only voice and stage channels for that
+server. Both directory endpoints are cached server-side for ten seconds so the screen's refresh
+does not hammer Discord.
 
 Unknown `/api/*` paths return JSON 404s. SSE recovers in the browser. Gateways are opened on demand:
 one starts for an account as soon as its presence runs or an enabled mirror rule needs it, and closes
@@ -545,7 +511,9 @@ publicly available Kizzey source and the installed 8.4.4 APK resources.
 The app icon comes from the Kizzey APK. Weather/geocoding data is provided by Open-Meteo, routing
 by OSRM, icons follow the Lucide language, and Discord Rich Presence is a Discord platform feature.
 Discord and its logo belong to Discord Inc. This project is not affiliated with Discord, Kizzy or
-Kizzey.
+Kizzey. Node voice uses `discord.js-selfbot-v13`, `@discordjs/voice`, `@snazzah/davey`,
+`prism-media`, `libsodium-wrappers`, `ws`, and optionally `opusscript`, `@discordjs/opus` and
+`ffmpeg-static`; their licences remain with their authors.
 
 The original source in this repository is released under the **MIT License**. See [LICENSE](LICENSE).
 Kizzey, Kizzy, their names, icons and upstream code remain under their original

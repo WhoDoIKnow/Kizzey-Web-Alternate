@@ -26,8 +26,10 @@ Then point Kizzey at it (``script_pull.py`` starts both and sets this for you):
     KIZZEY_VOICE_URL=http://127.0.0.1:8421 python3 server.py
 
 Kizzey reads the active account token from ``data/secret.json`` and includes it
-in each ``/join`` request. ``VOICE_TOKEN`` is only needed when the service is
-reachable off loopback; it is a bearer token between the two processes, and it
+in each ``/join`` request. Account tokens are sent bare; py-cord normally adds a
+``Bot `` prefix, which the service removes (set ``VOICE_USER_TOKEN=0`` to keep
+the prefix for a real bot token). ``VOICE_TOKEN`` is only needed when the service
+is reachable off loopback; it is a bearer token between the two processes, and it
 must match ``KIZZEY_VOICE_TOKEN`` on the server.
 
 Requires the packages in ``requirements.txt`` plus the ``ffmpeg`` binary.  Audio
@@ -68,6 +70,17 @@ VOICE_MEMBERS_INTENT = str(os.environ.get("VOICE_MEMBERS_INTENT") or "").strip()
     "true",
     "yes",
     "on",
+)
+
+# Kizzey authenticates with a Discord *account* token (the one that runs RPC),
+# not a bot token. py-cord always sends ``Authorization: Bot <token>``, which
+# Discord rejects for account tokens with "Improper token has been passed".
+# Account tokens must be sent bare; bot-token users set VOICE_USER_TOKEN=0.
+VOICE_USER_TOKEN = str(os.environ.get("VOICE_USER_TOKEN") or "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
 )
 
 MAX_BODY = 1 * 1024 * 1024
@@ -119,6 +132,71 @@ else:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+# py-cord writes ``Authorization: Bot <token>`` in HTTPClient.request. Account
+# tokens are sent without that prefix, so a small aiohttp hook rewrites the
+# header when Kizzey is using its RPC token. The rewrite is pure and tested.
+_USER_TOKEN_ACTIVE = False
+_USER_TOKEN_PATCHED = False
+
+
+def user_auth_headers(headers: dict | None) -> dict | None:
+    """Drop the ``Bot `` prefix from an Authorization header, if present."""
+    if not headers:
+        return headers
+    for key in list(headers):
+        if str(key).lower() != "authorization":
+            continue
+        value = headers.get(key)
+        if isinstance(value, str) and value.startswith("Bot "):
+            updated = dict(headers)
+            updated[key] = value[4:]
+            return updated
+        return headers
+    return headers
+
+
+def clean_token(value) -> str:
+    """Normalise a pasted token: no surrounding space, no Bearer/Bot prefix."""
+    token = str(value or "").strip()
+    lowered = token.lower()
+    for prefix in ("bearer ", "bot "):
+        if lowered.startswith(prefix):
+            token = token[len(prefix):].strip()
+            break
+    return token
+
+
+def _install_user_token_patch() -> None:
+    """Teach py-cord's aiohttp session to send account tokens bare."""
+    global _USER_TOKEN_PATCHED
+    if _USER_TOKEN_PATCHED:
+        return
+    try:
+        import aiohttp
+    except Exception:  # pragma: no cover - aiohttp ships with py-cord
+        return
+    original = aiohttp.ClientSession.request
+
+    def request(self, method, url, **kwargs):
+        if _USER_TOKEN_ACTIVE:
+            headers = kwargs.get("headers")
+            rewritten = user_auth_headers(headers)
+            if rewritten is not headers:
+                kwargs["headers"] = rewritten
+        return original(self, method, url, **kwargs)
+
+    aiohttp.ClientSession.request = request
+    _USER_TOKEN_PATCHED = True
+
+
+def set_user_token_mode(active: bool) -> None:
+    """Choose whether Discord tokens are account tokens (bare) or bot tokens."""
+    global _USER_TOKEN_ACTIVE
+    _USER_TOKEN_ACTIVE = bool(active)
+    if _USER_TOKEN_ACTIVE:
+        _install_user_token_patch()
 
 
 def clamp_bitrate(value) -> int:
@@ -583,11 +661,13 @@ class VoiceManager:
         ffmpeg_bin: str = "ffmpeg",
         ytdlp_bin: str = "yt-dlp",
         recordings: Path | None = None,
+        user_token: bool | None = None,
     ):
         self.default_token = default_token
         self.ffmpeg_bin = ffmpeg_bin
         self.ytdlp_bin = ytdlp_bin
         self.recordings = recordings or recordings_dir()
+        self.user_token = VOICE_USER_TOKEN if user_token is None else bool(user_token)
         self.loop = asyncio.new_event_loop()
         self.thread: threading.Thread | None = None
         self.client = None
@@ -644,20 +724,20 @@ class VoiceManager:
             self.client = None
 
     # -- client -----------------------------------------------------------
-    def ensure_client(self, token: str | None = None) -> None:
+    def ensure_client(self, token: str | None = None, user_token: bool | None = None) -> None:
         if discord is None or VOICE_BACKEND is None:
             raise RuntimeError(f"Voice dependencies are missing: {VOICE_IMPORT_ERROR}")
-        chosen = (token or self.default_token or "").strip()
+        chosen = clean_token(token or self.default_token or "")
         if not chosen:
             raise ValueError("No Discord token is configured for the voice service.")
+        use_user_token = self.user_token if user_token is None else bool(user_token)
         with self._client_lock:
-            if self.client is not None and self.token == chosen and self.client.is_ready():
-                return
             if self.client is not None:
                 try:
                     self._run(self._close_client_async(), timeout=20)
                 except Exception:
                     pass
+            set_user_token_mode(use_user_token)
             self.token = chosen
             self.ready.clear()
             self.error = None
@@ -983,8 +1063,10 @@ class VoiceManager:
         return self.state()
 
     # -- public sync API --------------------------------------------------
-    def join(self, guild_id: str | None, channel_id: str, token: str | None = None) -> dict:
-        self.ensure_client(token)
+    def join(self, guild_id: str | None, channel_id: str, token: str | None = None, user_token: bool = True) -> dict:
+        # Kizzey sends the account token that already drives RPC, so treat it
+        # as an account token unless a caller explicitly says otherwise.
+        self.ensure_client(token, user_token=user_token)
         return self._run(self._join_async(guild_id, channel_id), timeout=60)
 
     def leave(self) -> dict:
@@ -1218,7 +1300,12 @@ class VoiceHTTPHandler(BaseHTTPRequestHandler):
         try:
             data = self._read_json()
             if route == "/join":
-                state = self.manager.join(data.get("guildId"), str(data.get("channelId") or ""), data.get("token"))
+                state = self.manager.join(
+                    data.get("guildId"),
+                    str(data.get("channelId") or ""),
+                    data.get("token"),
+                    user_token=bool(data.get("userToken", True)),
+                )
                 return self._send_json({"ok": True, "state": state})
             if route == "/leave":
                 return self._send_json({"ok": True, "state": self.manager.leave()})
@@ -1272,6 +1359,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=int(os.environ.get("VOICE_PORT", str(DEFAULT_PORT))))
     parser.add_argument("--token", default=os.environ.get("VOICE_TOKEN", ""))
     parser.add_argument("--discord-token", default=os.environ.get("DISCORD_TOKEN", ""))
+    parser.add_argument(
+        "--user-token",
+        dest="user_token",
+        action="store_true",
+        default=None,
+        help="Send the Discord token bare (account token; default).",
+    )
+    parser.add_argument(
+        "--bot-token",
+        dest="user_token",
+        action="store_false",
+        help="Send the Discord token as a bot token (Authorization: Bot ...).",
+    )
     parser.add_argument("--ffmpeg", default=os.environ.get("VOICE_FFMPEG", "ffmpeg"))
     parser.add_argument("--ytdlp", default=os.environ.get("VOICE_YTDLP", "yt-dlp"))
     parser.add_argument("--recordings", default=os.environ.get("VOICE_RECORDINGS_DIR", "data/voice_recordings"))
@@ -1295,6 +1395,7 @@ def main(argv: list[str] | None = None) -> int:
         ffmpeg_bin=args.ffmpeg,
         ytdlp_bin=args.ytdlp,
         recordings=directory,
+        user_token=args.user_token,
     )
     manager.start()
 

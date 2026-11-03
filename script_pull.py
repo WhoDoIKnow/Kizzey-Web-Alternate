@@ -174,13 +174,22 @@ def rpc_token(target: Path) -> str:
         return ""
     if not isinstance(data, dict):
         return ""
-    token = str(data.get("token") or "").strip()
+
+    def clean(value) -> str:
+        token = str(value or "").strip()
+        lowered = token.lower()
+        for prefix in ("bearer ", "bot "):
+            if lowered.startswith(prefix):
+                return token[len(prefix):].strip()
+        return token
+
+    token = clean(data.get("token"))
     if token:
         return token
     for account in data.get("accounts") or []:
         if not isinstance(account, dict):
             continue
-        candidate = str(account.get("token") or "").strip()
+        candidate = clean(account.get("token"))
         if candidate:
             return candidate
     return ""
@@ -237,6 +246,7 @@ def start_voice_service(
     port: int,
     token: str,
     discord_token: str,
+    user_token: bool | None = None,
 ) -> subprocess.Popen:
     """Launch the companion with secrets passed only through the environment."""
     env = dict(os.environ)
@@ -247,6 +257,8 @@ def start_voice_service(
         env["VOICE_TOKEN"] = token
     if discord_token:
         env["DISCORD_TOKEN"] = discord_token
+    if user_token is not None:
+        env["VOICE_USER_TOKEN"] = "1" if user_token else "0"
     script = voice_service_script(target)
     note(f"Starting voice service: {python} {script} --host {host} --port {port}")
     return subprocess.Popen(
@@ -334,7 +346,8 @@ def start_voice_companion(known, target: Path) -> tuple[subprocess.Popen | None,
     account_token = rpc_token(target)
     voice_token = known.voice_token or account_token
     discord_token = known.discord_token or account_token
-    if account_token and not known.discord_token:
+    using_rpc_token = bool(account_token) and not known.discord_token
+    if using_rpc_token:
         note("Using the Discord account token already saved for RPC.")
 
     process = start_voice_service(
@@ -344,6 +357,7 @@ def start_voice_companion(known, target: Path) -> tuple[subprocess.Popen | None,
         known.voice_port,
         voice_token,
         discord_token,
+        user_token=True if using_rpc_token else None,
     )
     if not probe_voice_health(known.voice_host, known.voice_port, process=process):
         if process.poll() is not None:
