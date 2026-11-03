@@ -26,7 +26,7 @@ function installFetch(reply) {
   calls.length = 0;
   global.fetch = async (url, options = {}) => {
     const body = options && options.body ? JSON.parse(options.body) : null;
-    calls.push({ url, body });
+    calls.push({ url, body, headers: options.headers || {} });
     const result = typeof reply === 'function' ? reply(url, body) : reply;
     const status = result.status || 200;
     return {
@@ -151,6 +151,46 @@ async function main() {
     both2xx = error;
   }
   check(both2xx instanceof DiscordError && both2xx.data.captcha_sitekey === 'site-key', 'a 2xx captcha is still an error so the sheet can solve it', String(both2xx));
+
+  // Discord can put the captcha on the two-factor step instead of the password
+  // step. It has to survive mfaError and carry the refreshed ticket so the
+  // solved token can finish the same challenge.
+  installFetch((url) =>
+    url === MFA_URL
+      ? {
+          status: 400,
+          body: {
+            captcha_key: ['captcha-required'],
+            captcha_sitekey: 'site-key',
+            captcha_service: 'hcaptcha',
+            captcha_session_id: 'session-mfa',
+            captcha_rqdata: 'rqdata-mfa',
+            captcha_rqtoken: 'rqtoken-mfa',
+            mfa: ['totp'],
+            ticket: 'ticket-mfa-new',
+          },
+        }
+      : { status: 500 }
+  );
+  let mfaCaptcha = null;
+  try {
+    await login.discordMfaLogin('ticket-mfa', '123456');
+  } catch (error) {
+    mfaCaptcha = error;
+  }
+  check(mfaCaptcha instanceof DiscordError && mfaCaptcha.data.captcha_sitekey === 'site-key', 'a two-factor captcha stays a captcha error', String(mfaCaptcha));
+  check(mfaCaptcha && mfaCaptcha.data.ticket === 'ticket-mfa-new', 'the refreshed ticket rides along with the captcha', String(mfaCaptcha));
+
+  // The solved token is sent back as captcha headers, not in the body.
+  installFetch((url) => (url === MFA_URL ? { status: 200, body: { token: 'tok-captcha-mfa' } } : { status: 500 }));
+  const captchaToken = await login.discordMfaLogin('ticket-mfa-new', '123456', '', {
+    key: 'solved-mfa',
+    sessionId: 'session-mfa',
+    rqtoken: 'rqtoken-mfa',
+  });
+  check(captchaToken === 'tok-captcha-mfa', 'the two-factor check finishes after the captcha', String(captchaToken));
+  check(calls[0].headers['X-Captcha-Key'] === 'solved-mfa', 'the solved token is sent in the captcha header', JSON.stringify(calls[0].headers));
+  check(calls[0].body.captcha_key === undefined, 'the solved token is not put in the JSON body');
 
   console.log(`\n${checks.filter(Boolean).length}/${checks.length} login checks passed`);
   return checks.every(Boolean) ? 0 : 1;

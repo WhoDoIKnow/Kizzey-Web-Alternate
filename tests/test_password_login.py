@@ -177,6 +177,23 @@ def fake_login_post(url, body, timeout=25, extra_headers=None):
         MFA_BODIES.append(dict(body or {}))
         code = str((body or {}).get("code") or "")
         ticket = str((body or {}).get("ticket") or "")
+        if ticket == "ticket-mfa-captcha":
+            headers = extra_headers or {}
+            if headers.get("X-Captcha-Key") == "solved-mfa-captcha":
+                return {"token": "tok-delta-mfa-captcha-333"}
+            info = {
+                "captcha_key": ["captcha-required"],
+                "captcha_sitekey": "site-key-abc",
+                "captcha_service": "hcaptcha",
+                "captcha_session_id": "session-mfa2",
+                "captcha_rqdata": "rqdata-mfa2",
+                "captcha_rqtoken": "rqtoken-mfa2",
+                "should_serve_invisible": False,
+                "message": "Invalid Form Body",
+                "mfa": ["totp"],
+                "ticket": "ticket-mfa-captcha-new",
+            }
+            raise server.DiscordError(400, server._login_error_message(400, info), info)
         if ticket == "ticket-expired":
             info = {
                 "message": "Invalid Form Body",
@@ -501,6 +518,18 @@ def main():
         check(status == 401, "a bad MFA code is a 401", str(bad_code)[:200])
         check("two-factor" in bad_code.get("error", "").lower(), "a bad MFA code is explained", str(bad_code)[:220])
         check(not bad_code.get("reason"), "a bad MFA code is not reported as an expired step", str(bad_code)[:220])
+
+        # Discord can put the captcha on the two-factor step. It must reach the
+        # browser with its site key and refreshed ticket, then finish on retry.
+        status, mfa_captcha = request("POST", "/api/auth/mfa", {"ticket": "ticket-mfa-captcha", "code": MFA_CODE, "loginInstanceId": INSTANCE})
+        check(status == 400 and not mfa_captcha.get("ok"), "a two-factor captcha is a 400", str(mfa_captcha)[:220])
+        check((mfa_captcha.get("challenge") or {}).get("sitekey") == "site-key-abc", "the two-factor captcha carries its site key", str(mfa_captcha)[:220])
+        check(mfa_captcha.get("ticket") == "ticket-mfa-captcha-new", "the refreshed ticket rides with the captcha", str(mfa_captcha)[:220])
+
+        status, mfa_solved = request("POST", "/api/auth/mfa", {"ticket": "ticket-mfa-captcha-new", "code": MFA_CODE, "captchaKey": "solved-mfa-captcha", "captchaSessionId": "session-mfa2", "captchaRqToken": "rqtoken-mfa2"})
+        check(status == 200 and mfa_solved.get("status") == "ok", "the two-factor check finishes after the captcha", str(mfa_solved)[:220])
+        check(LOGIN_HEADERS[-1].get("X-Captcha-Key") == "solved-mfa-captcha", "the solved captcha travels as a header", str(LOGIN_HEADERS[-1])[:220])
+        check(data_files_containing(["solved-mfa-captcha", "rqdata-mfa2", "rqtoken-mfa2"]) == [], "no two-factor captcha answer is written to disk")
 
         status, good_code = request("POST", "/api/auth/mfa", {"ticket": "ticket-abc", "code": MFA_CODE, "loginInstanceId": INSTANCE})
         good_state = state_of(good_code)

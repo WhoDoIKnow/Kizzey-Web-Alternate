@@ -8,12 +8,17 @@
   // MFA tickets are short-lived; keep them per panel so two panels can coexist.
   const mfaTickets = {};
   const mfaInstances = {};
+  const mfaCodes = {};
   const busy = {};
 
   // A captcha challenge belongs to one password attempt: the site key is
   // per-request and the solved token is single-use, so each panel keeps its
   // own widget and challenge until the retry comes back.
   const captchas = {};
+  // Which request the current challenge belongs to: the password sign-in, or
+  // the two-factor check Discord is guarding. The solved token is posted back
+  // to whichever one asked.
+  const captchaStage = {};
   let hcaptchaLoader = null;
 
   function captchaState(prefix) {
@@ -340,8 +345,18 @@
       showError(`${prefix}-captcha`, 'Solve the check first.');
       return;
     }
-    const body = captchaRetryBody(prefix, token);
-    if (!body.login || !body.password) {
+    const stage = captchaStage[prefix] === 'mfa' ? 'mfa' : 'login';
+    const body = stage === 'mfa'
+      ? {
+          ticket: mfaTickets[prefix] || '',
+          code: mfaCodes[prefix] || '',
+          loginInstanceId: mfaInstances[prefix] || '',
+          captchaKey: token,
+          captchaSessionId: (state.challenge || {}).sessionId || '',
+          captchaRqToken: (state.challenge || {}).rqtoken || '',
+        }
+      : captchaRetryBody(prefix, token);
+    if (stage === 'login' && (!body.login || !body.password)) {
       setStep(prefix, 'credentials');
       showError(prefix, 'Enter your Discord email and password again.');
       return;
@@ -349,7 +364,7 @@
     state.submitting = true;
     setBusy(prefix, 'captcha-submit', true, 'Continue', 'Checking...');
     try {
-      const data = await K.api('/api/auth/login', { method: 'POST', body });
+      const data = await K.api(stage === 'mfa' ? '/api/auth/mfa' : '/api/auth/login', { method: 'POST', body });
       if (data.status === 'mfa') {
         mfaTickets[prefix] = data.ticket || '';
         mfaInstances[prefix] = data.loginInstanceId || '';
@@ -363,12 +378,18 @@
       if (next && next.sitekey) {
         // The token was rejected or the password was wrong; Discord issued a
         // fresh challenge. Render that one instead of reusing the dead token.
+        if (error.data.ticket) mfaTickets[prefix] = String(error.data.ticket);
         await showCaptcha(prefix, next);
         const codes = (next.errors || []).filter(code => code && code !== 'captcha-required');
         showError(
           `${prefix}-captcha`,
           codes.length ? `${error.message} Discord said: ${codes.join(', ')}.` : error.message
         );
+        return;
+      }
+      if (stage === 'mfa') {
+        setStep(prefix, 'mfa');
+        showError(`${prefix}-mfa`, error.message);
         return;
       }
       setStep(prefix, 'credentials');
@@ -416,13 +437,15 @@
       state.widget = null;
     }
     slot.innerHTML = '';
+    // Discord says whether the check may run silently (`should_serve_invisible`).
+    // When it may not, draw the real hCaptcha checkbox so the operator can see
+    // and solve it. A hardcoded invisible widget is why the box never appeared.
+    const invisible = Boolean(challenge.invisible);
     const options = {
       sitekey: challenge.sitekey,
       theme: document.documentElement.dataset.theme === 'light' ? 'light' : 'dark',
-      // Enterprise request data is only honoured by execute(), not render():
-      // render() drops unknown keys, so the check always runs invisibly and is
-      // started with the rqdata value Discord sent.
-      size: 'invisible',
+      size: invisible ? 'invisible' : 'normal',
+      rqdata: challenge.rqdata || undefined,
       callback: token => {
         state.token = token;
         clearError(`${prefix}-captcha`);
@@ -457,7 +480,12 @@
       revealTokenBlock(prefix, true);
       return;
     }
-    runCaptcha(prefix);
+    // The Enterprise request data travels with the solve whether the widget is
+    // invisible or the operator is clicking a visible checkbox.
+    if (challenge.rqdata && typeof api.setData === 'function') {
+      try { api.setData(state.widget, { rqdata: challenge.rqdata }); } catch (err) {}
+    }
+    if (invisible) runCaptcha(prefix);
   }
 
   function runCaptcha(prefix) {
@@ -581,6 +609,7 @@
     } catch (error) {
       const challenge = error.data && error.data.challenge;
       if (challenge && challenge.sitekey) {
+        captchaStage[prefix] = 'login';
         await showCaptcha(prefix, challenge);
         return;
       }
@@ -631,6 +660,16 @@
         showError(prefix, error.message);
         return;
       }
+      const challenge = error.data && error.data.challenge;
+      if (challenge && challenge.sitekey) {
+        // Discord wants the captcha solved before it checks the code. Keep the
+        // code and hand the challenge to the sheet, then retry the same step.
+        mfaCodes[prefix] = code;
+        if (error.data.ticket) mfaTickets[prefix] = String(error.data.ticket);
+        captchaStage[prefix] = 'mfa';
+        await showCaptcha(prefix, challenge);
+        return;
+      }
       showError(`${prefix}-mfa`, error.message);
       input.select();
       input.focus();
@@ -644,6 +683,8 @@
     const prefix = prefixOf(el);
     mfaTickets[prefix] = '';
     mfaInstances[prefix] = '';
+    mfaCodes[prefix] = '';
+    captchaStage[prefix] = '';
     clearCaptcha(prefix);
     clearError(`${prefix}-captcha`);
     const code = document.querySelector(`#${prefix}-code`);

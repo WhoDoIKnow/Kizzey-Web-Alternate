@@ -145,13 +145,21 @@ The password is used only for that one login request, is never logged and is nev
 only the session token Discord returns is kept, in `data/secret.json`.
 
 Discord frequently answers a password login from a datacenter or headless server with a captcha.
-Kizzey relays that challenge to the browser you are using: the sign-in sheet opens Discord's hCaptcha
-check, you solve it on your phone or laptop, and only the solved response token goes back to Discord
-with the retry. Discord's per-request Enterprise challenge data is handed to the widget, so the
-answer is bound to the challenge Discord issued. The server neither solves the challenge itself nor
-sends it to a third-party solver, and the challenge data is never written to disk. The widget is the
-only external script the app loads; hCaptcha sees the browser's IP address and the Kizzey address,
-never the password. If the widget cannot load on that device, the sheet falls back to the token box.
+Kizzey relays that challenge to the browser you are using: after the email and password are sent, the
+sign-in sheet opens Discord's hCaptcha check as a real, visible box (Discord decides whether the check
+may instead run silently), you solve it on the phone or laptop, and only the solved response token
+goes back to Discord with the retry. Discord can put the same check on the two-factor step instead;
+the sheet handles that too and retries the code after you solve it. Discord's per-request Enterprise
+challenge data is handed to the widget, so the answer is bound to the challenge Discord issued. The
+server neither solves the challenge itself nor sends it to a third-party solver, and the challenge
+data is never written to disk. The widget is the only external script the app loads; hCaptcha sees the
+browser's IP address and the Kizzey address, never the password. If the widget cannot load on that
+device, the sheet falls back to the token box.
+
+Each Discord answer is also summarised in **Settings → Logs** as field names and flags only, for
+example `Discord password login: HTTP 400; fields [captcha_key, captcha_sitekey]; captcha=true
+mfa=false ticket=false session=false`. That line makes a stuck sign-in diagnosable without exposing a
+token, ticket, password or code.
 
 There is no Chromium or browser-automation dependency in this build. Sign-in is the password/MFA
 request plus the in-browser captcha relay, or the token fallback below; a headless container has no

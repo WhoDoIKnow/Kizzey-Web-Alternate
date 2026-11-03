@@ -6029,7 +6029,9 @@ def discord_password_login(login: str, password: str, captcha: dict | None = Non
             body,
             extra_headers=captcha_headers,
         )
+        _log_discord_shape("password login", 200, payload)
     except DiscordError as exc:
+        _log_discord_shape("password login", exc.status, exc.data)
         # Discord can attach the MFA ticket to a non-2xx answer. A captcha in
         # the same reply must still be solved first: the ticket it carries is
         # bound to that unsolved challenge, so it can never be collapsed into
@@ -6058,6 +6060,30 @@ def _has_captcha(info) -> bool:
     return bool(
         isinstance(info, dict) and (info.get("captcha_key") or info.get("captcha_sitekey"))
     )
+
+
+def _log_discord_shape(step: str, status: int, info) -> None:
+    """One line per Discord answer: field names and flags only, never a value.
+
+    A token, ticket, password, code or Enterprise request value never appears,
+    so a failing sign-in can be diagnosed from the Logs screen safely.
+    """
+    try:
+        source = info if isinstance(info, dict) else {}
+        fields = [
+            str(key)
+            for key in source.keys()
+            if not re.search(r"token|password|code|secret", str(key), re.I)
+        ]
+        STORE.log(
+            "INFO",
+            "Account",
+            f"Discord {step}: HTTP {status}; fields [{', '.join(fields) or 'none'}]; "
+            f"captcha={_has_captcha(source)} mfa={bool(source.get('mfa'))} "
+            f"ticket={bool(source.get('ticket'))} session={bool(source.get('token'))}",
+        )
+    except Exception:
+        pass
 
 
 def _mfa_challenge(payload: dict) -> dict | None:
@@ -6117,7 +6143,9 @@ def _mfa_error(exc: DiscordError) -> DiscordError:
     )
 
 
-def discord_mfa_login(ticket: str, code: str, login_instance_id: str = "") -> str:
+def discord_mfa_login(
+    ticket: str, code: str, login_instance_id: str = "", captcha: dict | None = None
+) -> str:
     """Finish a login that Discord answered with an MFA ticket."""
     ticket = str(ticket or "")
     code = str(code or "").strip().replace(" ", "")
@@ -6126,6 +6154,7 @@ def discord_mfa_login(ticket: str, code: str, login_instance_id: str = "") -> st
     if not code:
         raise DiscordError(400, "Enter the 6-digit code from your authenticator app.")
     instance_id = _login_instance(login_instance_id)
+    captcha_headers = _captcha_headers(captcha)
 
     def send(with_instance: bool) -> dict:
         body = {
@@ -6136,7 +6165,13 @@ def discord_mfa_login(ticket: str, code: str, login_instance_id: str = "") -> st
         }
         if with_instance and instance_id:
             body["login_instance_id"] = instance_id
-        return _login_post(DISCORD_MFA_API, body)
+        try:
+            payload = _login_post(DISCORD_MFA_API, body, extra_headers=captcha_headers)
+            _log_discord_shape("two-factor check", 200, payload)
+            return payload
+        except DiscordError as exc:
+            _log_discord_shape("two-factor check", exc.status, exc.data)
+            raise
 
     try:
         payload = send(True)
@@ -6176,8 +6211,10 @@ def login_with_password(login: str, password: str, captcha: dict | None = None) 
     return {"status": "ok", "user": user, "account": STORE.active_account_id()}
 
 
-def login_with_mfa(ticket: str, code: str, login_instance_id: str = "") -> dict:
-    token = discord_mfa_login(ticket, code, login_instance_id)
+def login_with_mfa(
+    ticket: str, code: str, login_instance_id: str = "", captcha: dict | None = None
+) -> dict:
+    token = discord_mfa_login(ticket, code, login_instance_id, captcha)
     user = sign_in(token)
     STORE.log("INFO", "Account", f"Signed in with a password as {user['displayName']}.")
     return {"status": "ok", "user": user, "account": STORE.active_account_id()}
@@ -7853,18 +7890,44 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True, "status": "ok", "user": result["user"], "state": public_state()})
             if path == "/api/auth/mfa":
                 data = self.read_json()
+                captcha_key = _captcha_text(
+                    data.get("captchaKey") or data.get("captcha_key") or ""
+                )
+                captcha = None
+                if captcha_key:
+                    captcha = {
+                        "key": captcha_key,
+                        "sessionId": data.get("captchaSessionId")
+                        or data.get("captcha_session_id")
+                        or "",
+                        "rqtoken": data.get("captchaRqToken")
+                        or data.get("captcha_rqtoken")
+                        or "",
+                    }
                 try:
                     result = login_with_mfa(
                         str(data.get("ticket") or ""),
                         str(data.get("code") or ""),
                         str(data.get("loginInstanceId") or data.get("login_instance_id") or ""),
+                        captcha,
                     )
                 except DiscordError as exc:
                     STORE.log("WARN", "Account", f"Two-factor sign-in failed: {_scrub(exc.message)[:160]}")
+                    extra = {}
                     reason = getattr(exc, "reason", "")
                     if reason:
-                        return self.send_error_json(exc.message, exc.status or 401, reason=reason)
-                    return self.send_error_json(exc.message, exc.status or 401)
+                        extra["reason"] = reason
+                    info = exc.data if isinstance(exc.data, dict) else {}
+                    challenge = captcha_challenge(info)
+                    if challenge:
+                        # Discord wants the captcha solved before it checks the
+                        # code. Hand it to the browser and keep any refreshed
+                        # ticket so the solved token can finish the same step.
+                        extra["captcha"] = True
+                        extra["challenge"] = challenge
+                        if info.get("ticket"):
+                            extra["ticket"] = str(info["ticket"])
+                    return self.send_error_json(exc.message, exc.status or 401, **extra)
                 return self.send_json({"ok": True, "status": "ok", "user": result["user"], "state": public_state()})
             if path == "/api/auth/token":
                 data = self.read_json()
