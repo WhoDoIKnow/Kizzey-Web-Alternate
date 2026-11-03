@@ -62,6 +62,15 @@ needs, and then starts the server, so a fresh machine needs one command:
 node script_pull.js --host 0.0.0.0 --port 8420
 ```
 
+`script_pull.sh` is the same launcher with a bash entry point. It checks that Node 20.18+ and npm
+are installed, then forwards every argument to `script_pull.js`, so a headless server can pull and
+start without reading the launcher source first:
+
+```bash
+./script_pull.sh --host 0.0.0.0 --port 8420   # pull, install, start
+./script_pull.sh --update-only                # pull and install, then exit
+```
+
 It clones into `./kizzey-web` when the script is not already inside a checkout, and forwards every
 other flag to `server.js`. When the script is already inside a checkout it compares the local commit
 with the tracked branch tip first: if they match it says so and starts straight away without a

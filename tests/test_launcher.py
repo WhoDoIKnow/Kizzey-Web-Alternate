@@ -132,6 +132,15 @@ def main():
 
         readme = (ROOT / "README.md").read_text()
         check("script_pull.js" in readme, "README documents the launcher")
+        check("script_pull.sh" in readme, "README documents the bash entry point")
+
+        shell = ROOT / "script_pull.sh"
+        check(shell.exists(), "the bash entry point ships next to the launcher")
+        if shell.exists():
+            shell_text = shell.read_text()
+            check(shell_text.startswith("#!/usr/bin/env bash"), "the bash entry point has a shebang")
+            check("exec node \"$launcher\" \"$@\"" in shell_text, "the bash entry point forwards every argument")
+            check("20.18" in shell_text, "the bash entry point checks the Node version")
 
         # -- voice companion selection -----------------------------------------
         class VoiceArgs:
