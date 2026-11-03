@@ -65,12 +65,34 @@ with the tracked branch tip first: if they match it says so and starts straight 
 fetch, otherwise it fetches and runs `git pull --ff-only`. Runtime data in `data/` is git-ignored,
 so updates never delete accounts, settings or history.
 
+It also starts the optional Discord voice companion. By default it looks for
+`voice_service/voice_service.py`, the `discord` package and `ffmpeg`; when they are all present it
+runs the companion, sets `KIZZEY_VOICE_URL`/`KIZZEY_VOICE_TOKEN` for Kizzey, and supervises both
+processes so stopping one stops the other and recordings finish cleanly. If the companion was
+configured for another host with `KIZZEY_VOICE_URL`, that is left alone. Otherwise Kizzey starts
+alone; the voice screen simply reports the service as unreachable.
+
+```bash
+python3 script_pull.py --voice          # require the companion, fail if it cannot start
+python3 script_pull.py --no-voice       # skip it even when the packages are installed
+python3 script_pull.py --voice-install  # pip install voice_service/requirements.txt first
+python3 script_pull.py --discord-token "$DISCORD_TOKEN" --voice-token "$VOICE_TOKEN"
+```
+
 | Launcher option | Purpose |
 | --- | --- |
 | `--dir PATH` | Checkout to clone or update. Defaults to this script's folder. |
 | `--repo URL` / `--branch NAME` | Remote and branch to track. |
 | `--no-pull` | Start the current checkout without touching git. |
 | `--update-only` | Pull and exit. |
+| `--voice` / `--no-voice` | Always or never start the voice companion. |
+| `--voice-required` | Fail the launch when the companion cannot start. |
+| `--voice-install` | Install `voice_service/requirements.txt`, then start it. |
+| `--voice-host` / `--voice-port` | Companion bind address and port (default `127.0.0.1:8421`). |
+| `--voice-token` / `--discord-token` | Secrets handed to the companion (also read from `VOICE_TOKEN`/`KIZZEY_VOICE_TOKEN` and `DISCORD_TOKEN`). |
+
+Secrets are passed through the child environment, never as command-line arguments, so they do not
+show up in a process listing.
 
 A private remote needs an authenticated git helper first (`gh auth login`, an SSH key, or a
 credential helper). When the working tree has local edits, the fast-forward pull stops and says so

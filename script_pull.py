@@ -14,7 +14,17 @@ checkout already matches the tracked branch tip, the launcher says so and skips
 the download instead of fetching on every start. Local runtime data (``data/``,
 uploads, logs) is never touched: it is git-ignored and lives beside the sources.
 
-Only the Python standard library and a ``git`` binary are required.
+The launcher also starts the optional Discord voice companion. By default it
+looks for ``voice_service/voice_service.py`` plus the ``discord`` package and
+``ffmpeg``; when they are present it runs the companion, points Kizzey at it and
+supervises both processes, otherwise it starts Kizzey alone:
+
+    python3 script_pull.py --voice            # require the companion
+    python3 script_pull.py --no-voice         # skip it
+    python3 script_pull.py --voice-install    # pip install it first
+
+Only the Python standard library and a ``git`` binary are required for the
+launcher itself; the voice companion has its own requirements file.
 """
 
 from __future__ import annotations
@@ -22,17 +32,26 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
 DEFAULT_REPO = "https://github.com/WhoDoIKnow/Kizzey-Web-Alternate"
 DEFAULT_BRANCH = "main"
+DEFAULT_VOICE_PORT = 8421
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
 
 
 def fail(message: str) -> int:
     print(f"  {message}", file=sys.stderr)
     return 1
+
+
+def note(message: str) -> None:
+    print(f"  {message}")
 
 
 def run_git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -130,6 +149,186 @@ def pull(target: Path, repo: str, branch: str) -> int:
     return 0
 
 
+# -- voice companion ----------------------------------------------------------
+
+def voice_service_script(target: Path) -> Path:
+    return target / "voice_service" / "voice_service.py"
+
+
+def voice_requirements(target: Path) -> Path:
+    return target / "voice_service" / "requirements.txt"
+
+
+def check_voice_dependencies(python: str, target: Path) -> tuple[bool, str]:
+    """Return (ready, reason) for running the voice companion in this checkout."""
+    script = voice_service_script(target)
+    if not script.exists():
+        return False, f"{script} was not found in this checkout."
+    if not shutil.which("ffmpeg"):
+        return False, "ffmpeg is not on PATH."
+    probe = subprocess.run(
+        [python, "-c", "import discord"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if probe.returncode != 0:
+        return False, "the Discord voice packages are not installed."
+    return True, ""
+
+
+def install_voice_requirements(python: str, target: Path) -> bool:
+    requirements = voice_requirements(target)
+    if not requirements.exists():
+        return False
+    note(f"Installing voice dependencies: {python} -m pip install -r {requirements}")
+    installed = subprocess.run([python, "-m", "pip", "install", "-r", str(requirements)])
+    return installed.returncode == 0
+
+
+def probe_voice_health(host: str, port: int, process: subprocess.Popen | None = None, timeout: float = 8.0) -> bool:
+    """Poll the unauthenticated /health endpoint until the companion answers."""
+    probe_host = "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
+    url = f"http://{probe_host}:{port}/health"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            return False
+        try:
+            with urllib.request.urlopen(url, timeout=0.5) as response:
+                if response.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return process is None or process.poll() is None
+
+
+def start_voice_service(
+    python: str,
+    target: Path,
+    host: str,
+    port: int,
+    token: str,
+    discord_token: str,
+) -> subprocess.Popen:
+    """Launch the companion with secrets passed only through the environment."""
+    env = dict(os.environ)
+    env["VOICE_HOST"] = host
+    env["VOICE_PORT"] = str(port)
+    env["VOICE_RECORDINGS_DIR"] = env.get("VOICE_RECORDINGS_DIR") or str(target / "data" / "voice_recordings")
+    if token:
+        env["VOICE_TOKEN"] = token
+    if discord_token:
+        env["DISCORD_TOKEN"] = discord_token
+    script = voice_service_script(target)
+    note(f"Starting voice service: {python} {script} --host {host} --port {port}")
+    return subprocess.Popen(
+        [python, str(script), "--host", host, "--port", str(port)],
+        cwd=str(target),
+        env=env,
+    )
+
+
+def run_supervisor(
+    python: str,
+    target: Path,
+    server_py: Path,
+    forwarded: list[str],
+    extra_env: dict,
+    voice_process: subprocess.Popen,
+) -> int:
+    """Run Kizzey and the companion together and stop both when either ends."""
+    env = dict(os.environ)
+    env.update(extra_env)
+    command = [python, str(server_py), *forwarded]
+    print(f"  Starting: {' '.join(command)}")
+    print()
+    server = subprocess.Popen(command, cwd=str(target), env=env)
+
+    state = {"stopping": False}
+
+    def stop_children(signum=None, frame=None):
+        if state["stopping"]:
+            return
+        state["stopping"] = True
+        for process in (voice_process, server):
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+
+    previous: dict[int, object] = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous[sig] = signal.signal(sig, stop_children)
+        except (ValueError, OSError):
+            pass
+
+    try:
+        code = server.wait()
+    finally:
+        stop_children()
+        try:
+            voice_process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            voice_process.kill()
+        for sig, handler in previous.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+    return code
+
+
+def start_voice_companion(known, target: Path) -> tuple[subprocess.Popen | None, dict]:
+    """Decide whether to run the companion and prepare the Kizzey environment."""
+    if known.no_voice:
+        return None, {}
+    if not (known.voice or known.voice_required):
+        configured = str(os.environ.get("KIZZEY_VOICE_URL") or "").strip()
+        if configured:
+            note(f"KIZZEY_VOICE_URL is set to {configured}; not starting a local voice service.")
+            return None, {}
+
+    ready, reason = check_voice_dependencies(sys.executable, target)
+    if not ready and known.voice_install:
+        if install_voice_requirements(sys.executable, target):
+            ready, reason = check_voice_dependencies(sys.executable, target)
+    if not ready:
+        if known.voice or known.voice_required:
+            return None, {"error": f"Cannot start the voice service: {reason}"}
+        note(f"Voice service not started: {reason} Run with --voice-install to set it up.")
+        return None, {}
+
+    process = start_voice_service(
+        sys.executable,
+        target,
+        known.voice_host,
+        known.voice_port,
+        known.voice_token,
+        known.discord_token,
+    )
+    if not probe_voice_health(known.voice_host, known.voice_port, process=process):
+        if process.poll() is not None:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            if known.voice or known.voice_required:
+                return None, {"error": "The voice service exited during startup."}
+            note("Voice service exited during startup; continuing without it.")
+            return None, {}
+        note("Voice service did not answer /health yet; continuing anyway.")
+
+    extra_env = {"KIZZEY_VOICE_URL": f"http://127.0.0.1:{known.voice_port}"}
+    if known.voice_token:
+        extra_env["KIZZEY_VOICE_TOKEN"] = known.voice_token
+    if known.voice_host not in LOOPBACK and not known.voice_token:
+        note("Voice host is not loopback and no token was set; non-local requests will be rejected.")
+    return process, extra_env
+
+
 def main() -> int:
     script_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
@@ -141,6 +340,23 @@ def main() -> int:
     parser.add_argument("--branch", default=DEFAULT_BRANCH, help=f"Branch to track (default: {DEFAULT_BRANCH})")
     parser.add_argument("--no-pull", action="store_true", help="Start the current checkout without updating")
     parser.add_argument("--update-only", action="store_true", help="Pull, then exit without starting the server")
+    parser.add_argument("--voice", action="store_true", help="Start the Discord voice companion (default: auto)")
+    parser.add_argument("--no-voice", action="store_true", help="Do not start the Discord voice companion")
+    parser.add_argument("--voice-required", action="store_true", help="Fail if the voice companion cannot start")
+    parser.add_argument("--voice-install", action="store_true", help="Install voice_service/requirements.txt, then start it")
+    parser.add_argument("--voice-host", default=os.environ.get("VOICE_HOST", "127.0.0.1"), help="Voice bind address (default 127.0.0.1)")
+    parser.add_argument(
+        "--voice-port",
+        type=int,
+        default=int(os.environ.get("VOICE_PORT", str(DEFAULT_VOICE_PORT))),
+        help=f"Voice port (default {DEFAULT_VOICE_PORT})",
+    )
+    parser.add_argument(
+        "--voice-token",
+        default=os.environ.get("VOICE_TOKEN") or os.environ.get("KIZZEY_VOICE_TOKEN") or "",
+        help="Shared voice token (default: $VOICE_TOKEN or $KIZZEY_VOICE_TOKEN)",
+    )
+    parser.add_argument("--discord-token", default=os.environ.get("DISCORD_TOKEN", ""), help="Discord bot token (default: $DISCORD_TOKEN)")
     known, forwarded = parser.parse_known_args()
 
     target = Path(known.dir).expanduser().resolve() if known.dir else default_dir(script_dir)
@@ -167,9 +383,17 @@ def main() -> int:
     if not data_dir.exists():
         print(f"  First run: {data_dir} will be created with fresh settings.")
 
+    voice_process, extra_env = start_voice_companion(known, target)
+    if extra_env.get("error"):
+        return fail(extra_env["error"])
+    if voice_process is not None:
+        return run_supervisor(sys.executable, target, server_py, forwarded, extra_env, voice_process)
+
     command = [sys.executable, str(server_py), *forwarded]
     print(f"  Starting: {' '.join(command)}")
     print()
+    if extra_env:
+        os.environ.update(extra_env)
     try:
         os.chdir(target)
         os.execv(sys.executable, command)

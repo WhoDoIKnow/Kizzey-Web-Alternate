@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Checks for the pull-and-run launcher, without touching git or the network."""
 import importlib.util
+import os
 import shutil
 import sys
 import tempfile
@@ -130,6 +131,111 @@ def main():
 
         readme = (ROOT / "README.md").read_text()
         check("script_pull.py" in readme, "README documents the launcher")
+
+        # -- voice companion selection -----------------------------------------
+        class VoiceArgs:
+            def __init__(self, **kw):
+                self.no_voice = False
+                self.voice = False
+                self.voice_required = False
+                self.voice_install = False
+                self.voice_host = "127.0.0.1"
+                self.voice_port = 8421
+                self.voice_token = ""
+                self.discord_token = ""
+                for key, value in kw.items():
+                    setattr(self, key, value)
+
+        class FakeProc:
+            returncode = None
+
+            def poll(self):
+                return None
+
+        voice_dir = WORK / "voice-checkout"
+        (voice_dir / "voice_service").mkdir(parents=True)
+        (voice_dir / "server.py").write_text("# stub\n")
+        (voice_dir / "voice_service" / "voice_service.py").write_text("# stub\n")
+
+        real_check = launcher.check_voice_dependencies
+        real_start = launcher.start_voice_service
+        real_probe = launcher.probe_voice_health
+        real_companion = launcher.start_voice_companion
+        real_supervisor = launcher.run_supervisor
+        pushed_url = os.environ.pop("KIZZEY_VOICE_URL", None)
+        try:
+            launcher.check_voice_dependencies = lambda python, target: (
+                False,
+                "the Discord voice packages are not installed.",
+            )
+            launcher.start_voice_service = lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("the companion should not start")
+            )
+            process, env = launcher.start_voice_companion(VoiceArgs(), voice_dir)
+            check(process is None and not env, "auto mode skips the companion when dependencies are missing")
+
+            process, env = launcher.start_voice_companion(VoiceArgs(no_voice=True), voice_dir)
+            check(process is None and not env, "--no-voice never starts the companion")
+
+            process, env = launcher.start_voice_companion(VoiceArgs(voice=True), voice_dir)
+            check(process is None and env.get("error"), "--voice fails clearly when the companion cannot start")
+
+            launcher.check_voice_dependencies = lambda python, target: (True, "")
+            started = {}
+
+            def fake_start(python, target, host, port, token, discord_token):
+                started.update(host=host, port=port, token=token, discord_token=discord_token)
+                return FakeProc()
+
+            launcher.start_voice_service = fake_start
+            launcher.probe_voice_health = lambda host, port, process=None: True
+            process, env = launcher.start_voice_companion(
+                VoiceArgs(voice=True, voice_port=8500, voice_token="s3cret", discord_token="bot-token"),
+                voice_dir,
+            )
+            check(process is not None, "--voice starts the companion when ready")
+            check(
+                env.get("KIZZEY_VOICE_URL") == "http://127.0.0.1:8500",
+                "a healthy companion points Kizzey at it",
+                str(env),
+            )
+            check(env.get("KIZZEY_VOICE_TOKEN") == "s3cret", "the voice token reaches Kizzey through the environment")
+            check(started.get("token") == "s3cret", "the voice token reaches the companion")
+            check(started.get("discord_token") == "bot-token", "the Discord token reaches the companion")
+
+            os.environ["KIZZEY_VOICE_URL"] = "http://voice.example:9000"
+            process, env = launcher.start_voice_companion(VoiceArgs(), voice_dir)
+            check(process is None and not env, "auto mode respects an externally configured voice URL")
+
+            # main() supervises both processes instead of replacing itself.
+            launcher.start_voice_companion = lambda known, target: (
+                FakeProc(),
+                {"KIZZEY_VOICE_URL": "http://127.0.0.1:8421"},
+            )
+            supervised = {}
+            launcher.run_supervisor = lambda python, target, server_py, forwarded, extra_env, voice: (
+                supervised.update(forwarded=list(forwarded), extra_env=dict(extra_env), voice=voice) or 0
+            )
+            code, execs, _ = run(["--no-pull", "--dir", str(target), "--port", "9123"])
+            check(code == 0, "a supervised run exits cleanly", str(code))
+            check(not execs, "a supervised run does not replace the launcher process")
+            check(supervised.get("forwarded") == ["--port", "9123"], "a supervised run forwards server flags", str(supervised))
+            check(supervised.get("voice") is not None, "a supervised run hands the companion to the supervisor")
+        finally:
+            if pushed_url is not None:
+                os.environ["KIZZEY_VOICE_URL"] = pushed_url
+            else:
+                os.environ.pop("KIZZEY_VOICE_URL", None)
+            launcher.check_voice_dependencies = real_check
+            launcher.start_voice_service = real_start
+            launcher.probe_voice_health = real_probe
+            launcher.start_voice_companion = real_companion
+            launcher.run_supervisor = real_supervisor
+
+        text = (ROOT / "script_pull.py").read_text()
+        check("--voice" in text and "--no-voice" in text, "the launcher exposes voice toggles")
+        check("--voice-install" in text, "the launcher can install the voice requirements")
+        check("KIZZEY_VOICE_URL" in text, "the launcher wires Kizzey to the companion")
 
         print(f"\n{sum(checks)}/{len(checks)} launcher checks passed")
         return 0 if all(checks) else 1
