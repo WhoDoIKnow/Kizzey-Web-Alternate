@@ -67,16 +67,18 @@ so updates never delete accounts, settings or history.
 
 It also starts the optional Discord voice companion. By default it looks for
 `voice_service/voice_service.py`, the `discord` package and `ffmpeg`; when they are all present it
-runs the companion, sets `KIZZEY_VOICE_URL`/`KIZZEY_VOICE_TOKEN` for Kizzey, and supervises both
-processes so stopping one stops the other and recordings finish cleanly. If the companion was
-configured for another host with `KIZZEY_VOICE_URL`, that is left alone. Otherwise Kizzey starts
-alone; the voice screen simply reports the service as unreachable.
+runs the companion, sets `KIZZEY_VOICE_URL` for Kizzey, and supervises both processes so stopping
+one stops the other and recordings finish cleanly. There is no second secret to create: voice logs
+in with the same Discord account token that already runs RPC (read from `data/secret.json`), and the
+same token is used as the loopback bearer. An explicit `KIZZEY_VOICE_TOKEN`, `VOICE_TOKEN` or
+`DISCORD_TOKEN` still overrides it. If the companion was configured for another host with
+`KIZZEY_VOICE_URL`, that is left alone. Otherwise Kizzey starts alone; the voice screen simply
+reports the service as unreachable.
 
 ```bash
 python3 script_pull.py --voice          # require the companion, fail if it cannot start
 python3 script_pull.py --no-voice       # skip it even when the packages are installed
 python3 script_pull.py --voice-install  # pip install voice_service/requirements.txt first
-python3 script_pull.py --discord-token "$DISCORD_TOKEN" --voice-token "$VOICE_TOKEN"
 ```
 
 | Launcher option | Purpose |
@@ -89,7 +91,7 @@ python3 script_pull.py --discord-token "$DISCORD_TOKEN" --voice-token "$VOICE_TO
 | `--voice-required` | Fail the launch when the companion cannot start. |
 | `--voice-install` | Install `voice_service/requirements.txt`, then start it. |
 | `--voice-host` / `--voice-port` | Companion bind address and port (default `127.0.0.1:8421`). |
-| `--voice-token` / `--discord-token` | Secrets handed to the companion (also read from `VOICE_TOKEN`/`KIZZEY_VOICE_TOKEN` and `DISCORD_TOKEN`). |
+| `--voice-token` / `--discord-token` | Optional overrides; both default to the saved RPC token. |
 
 Secrets are passed through the child environment, never as command-line arguments, so they do not
 show up in a process listing.
@@ -291,15 +293,25 @@ search query, and records the call. Discord voice is an always-on voice gateway 
 Opus, so it runs in a small companion process instead of the standard-library-only Kizzey server.
 Kizzey proxies commands to it and never sends the Discord token or the service token to the browser.
 
-```bash
-# 1. the companion (Python packages + ffmpeg)
-cd voice_service
-pip install -r requirements.txt
-VOICE_TOKEN=change-me DISCORD_TOKEN=your-bot-token python3 voice_service.py --host 0.0.0.0 --port 8421
+Voice uses the **same Discord account token that already runs RPC**, so there is no separate bot
+token or voice secret to paste. When you join from the screen, Kizzey reads the active account token
+from `data/secret.json` and hands it to the companion server-side. Sign in through the normal Kizzey
+flow first; the launcher also passes the saved token at startup so the companion can warm up.
 
-# 2. Kizzey, pointed at the companion
-KIZZEY_VOICE_URL=http://127.0.0.1:8421 KIZZEY_VOICE_TOKEN=change-me python3 server.py
+```bash
+# simplest: one command, starts Kizzey and the companion together
+python3 script_pull.py
+
+# or run them by hand (companion on loopback, no shared secret needed)
+cd voice_service && pip install -r requirements.txt
+python3 voice_service.py --host 127.0.0.1 --port 8421
+
+KIZZEY_VOICE_URL=http://127.0.0.1:8421 python3 server.py
 ```
+
+Set `VOICE_TOKEN` on the companion and the matching `KIZZEY_VOICE_TOKEN` on Kizzey only when the
+companion is reachable off loopback. In that case the shared secret is a bearer token between the two
+processes, not the Discord token.
 
 The bot needs **Connect** permission in the channel. Guild and channel IDs are enough; the guild is
 resolved from the channel. The service asks only for the non-privileged Guilds and Voice States
@@ -327,18 +339,19 @@ backend it loaded.
 Two deployment shapes are included:
 
 ```bash
-# two containers, recordings in a named volume
+# two containers, recordings in a named volume (voice is off loopback,
+# so pick a shared KIZZEY_VOICE_TOKEN; DISCORD_TOKEN is optional now)
 docker compose up --build
 
-# or one container running both processes
+# or one container running both processes (both on loopback, no extra secret)
 docker build -f Dockerfile.allinone -t kizzey-voice .
-docker run --rm -p 8420:8420 -e KIZZEY_VOICE_TOKEN=change-me \
-  -e DISCORD_TOKEN=your-bot-token -v kizzey-data:/app/data kizzey-voice
+docker run --rm -p 8420:8420 -v kizzey-data:/app/data kizzey-voice
 ```
 
-Set `DISCORD_TOKEN` and `KIZZEY_VOICE_TOKEN` in `.env` for Compose. The voice service refuses
-non-loopback requests when `VOICE_TOKEN` is empty, and Kizzey never exposes its recordings directory
-as a static path.
+For Compose, set `KIZZEY_VOICE_TOKEN` in `.env`; Kizzey sends the active RPC token to the companion
+on join, so `DISCORD_TOKEN` is only needed if you want the companion to connect before anyone signs
+in. The voice service refuses non-loopback requests when `VOICE_TOKEN` is empty, and Kizzey never
+exposes its recordings directory as a static path.
 
 ## Importing from Kizzey for Android
 

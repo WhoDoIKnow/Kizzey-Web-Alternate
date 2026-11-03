@@ -137,6 +137,27 @@ check(join["body"] == {"guildId": "1", "channelId": "2"}, "proxy forwards the JS
 check(join["auth"].startswith("Bearer "), "proxy sends the service bearer token")
 check("test-secret" not in json.dumps(join["body"]), "proxy keeps the token out of the body")
 
+# -- join payload: the saved RPC token is injected server-side --------------
+class FakeStore:
+    def __init__(self, token):
+        self._token = token
+
+    def active_token(self):
+        return self._token
+
+
+original_store = server.STORE
+server.STORE = FakeStore("acct-token")
+payload = server.voice_join_payload({"guildId": "g", "channelId": "c", "token": "browser-token"})
+check(payload["token"] == "acct-token", "join uses the saved RPC token")
+check("browser-token" not in payload.values(), "join ignores a browser-supplied token")
+check(payload["guildId"] == "g" and payload["channelId"] == "c", "join keeps the channel ids")
+server.STORE = FakeStore("")
+check("token" not in server.voice_join_payload({"channelId": "c"}), "join omits the token before sign-in")
+server.STORE = None
+check("token" not in server.voice_join_payload({"channelId": "c"}), "join works without a store")
+server.STORE = original_store
+
 # -- proxy: raw download ----------------------------------------------------
 body, content_type = server.voice_service_call("/recordings/abc", raw=True)
 check(body == b"OggS", "raw proxy returns the recording bytes")

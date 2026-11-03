@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Checks for the pull-and-run launcher, without touching git or the network."""
 import importlib.util
+import json
 import os
 import shutil
 import sys
@@ -202,6 +203,33 @@ def main():
             check(env.get("KIZZEY_VOICE_TOKEN") == "s3cret", "the voice token reaches Kizzey through the environment")
             check(started.get("token") == "s3cret", "the voice token reaches the companion")
             check(started.get("discord_token") == "bot-token", "the Discord token reaches the companion")
+
+            # With nothing configured, both tokens fall back to the saved RPC token.
+            (voice_dir / "data").mkdir(exist_ok=True)
+            (voice_dir / "data" / "secret.json").write_text(
+                json.dumps({"token": "rpc-token-123", "accounts": [{"token": "other"}]})
+            )
+            started.clear()
+            process, env = launcher.start_voice_companion(VoiceArgs(voice=True), voice_dir)
+            check(started.get("token") == "rpc-token-123", "the saved RPC token becomes the voice token", str(started))
+            check(
+                started.get("discord_token") == "rpc-token-123",
+                "the saved RPC token is the companion Discord login",
+                str(started),
+            )
+            check(
+                env.get("KIZZEY_VOICE_TOKEN") == "rpc-token-123",
+                "the RPC token is handed to Kizzey",
+                str(env),
+            )
+            check(launcher.rpc_token(voice_dir) == "rpc-token-123", "rpc_token reads the active account")
+
+            (voice_dir / "data" / "secret.json").write_text(json.dumps({"token": "", "accounts": [{"token": "acct"}]}))
+            check(launcher.rpc_token(voice_dir) == "acct", "rpc_token falls back to the first account")
+            (voice_dir / "data" / "secret.json").write_text("{not json")
+            check(launcher.rpc_token(voice_dir) == "", "rpc_token tolerates a broken file")
+            (voice_dir / "data" / "secret.json").unlink()
+            check(launcher.rpc_token(voice_dir) == "", "rpc_token is empty before sign-in")
 
             os.environ["KIZZEY_VOICE_URL"] = "http://voice.example:9000"
             process, env = launcher.start_voice_companion(VoiceArgs(), voice_dir)

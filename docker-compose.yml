@@ -1,8 +1,8 @@
 # Kizzey Web + the optional Discord voice service.
 #
 #   1. copy this file next to .env and set:
-#        DISCORD_TOKEN=your-bot-token
 #        KIZZEY_VOICE_TOKEN=some-long-random-string
+#        DISCORD_TOKEN=your-bot-token        (optional; Kizzey sends the RPC token on join)
 #   2. docker compose up --build
 #
 # Kizzey stays on port 8420. The voice service is only reachable on the compose

@@ -7460,6 +7460,27 @@ def voice_service_post(path: str, payload: dict | None = None) -> dict:
     return voice_service_call(path, payload if isinstance(payload, dict) else {}, method="POST")
 
 
+def voice_join_payload(data: dict | None = None) -> dict:
+    """Build the companion /join body.
+
+    Voice uses the same Discord account token as RPC. It is read from the
+    server store and injected here, so the browser never sees or supplies it.
+    """
+    data = data if isinstance(data, dict) else {}
+    payload = {
+        "guildId": str(data.get("guildId") or ""),
+        "channelId": str(data.get("channelId") or ""),
+    }
+    if STORE:
+        try:
+            token = STORE.active_token()
+        except Exception:
+            token = ""
+        if token:
+            payload["token"] = token
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
@@ -7995,9 +8016,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True, "voice": voice_update(str(data.get("clientId") or ""), data)})
             if path == "/api/voice/discord/join":
                 data = self.read_json()
-                payload = {"guildId": str(data.get("guildId") or ""), "channelId": str(data.get("channelId") or "")}
-                if data.get("token"):
-                    payload["token"] = str(data["token"])
+                # Voice logs in with the same Discord account that runs RPC.
+                # The token is read from the server store, never from the browser.
+                payload = voice_join_payload(data)
                 result = voice_service_post("/join", payload)
                 if STORE:
                     channel = (result.get("state") or {}).get("channelName") or payload["channelId"]
@@ -8750,7 +8771,7 @@ def banner(host: str, port: int) -> None:
 
 
 def main() -> int:
-    global STORE
+    global STORE, VOICE_SERVICE_TOKEN
     parser = argparse.ArgumentParser(description="Kizzey Web — Discord Rich Presence for your browser")
     parser.add_argument("--host", default=os.environ.get("KIZZEY_HOST", "0.0.0.0"), help="Bind address (default 0.0.0.0)")
     parser.add_argument("--port", type=int, default=int(os.environ.get("KIZZEY_PORT", DEFAULT_PORT)), help="Port (default 8420)")
@@ -8766,6 +8787,14 @@ def main() -> int:
         os.environ["KIZZEY_BROWSER_CDP"] = str(args.browser_cdp).strip()
 
     STORE = Store()
+    # The voice companion shares the Discord token that already drives RPC, so
+    # there is no second secret to configure. An explicit KIZZEY_VOICE_TOKEN
+    # still wins for deployments that put the companion on another host.
+    if not VOICE_SERVICE_TOKEN:
+        try:
+            VOICE_SERVICE_TOKEN = STORE.active_token()
+        except Exception:
+            pass
     STORE.log(
         "INFO",
         "Server",

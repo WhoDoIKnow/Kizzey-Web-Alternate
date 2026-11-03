@@ -16,13 +16,19 @@ an always-on UDP/RTP session with its own gateway, so it cannot live inside the
 standard-library-only Kizzey server process; instead Kizzey talks to this
 service over a tiny JSON HTTP API and never hands the connection to the browser.
 
-Run it next to Kizzey:
+Run it next to Kizzey. Voice uses the Discord account token already saved for
+RPC, so a local (loopback) run needs no extra secret:
 
-    VOICE_TOKEN=change-me DISCORD_TOKEN=... python3 voice_service.py
+    python3 voice_service.py --host 127.0.0.1 --port 8421
 
-Then point Kizzey at it:
+Then point Kizzey at it (``script_pull.py`` starts both and sets this for you):
 
-    KIZZEY_VOICE_URL=http://127.0.0.1:8421 KIZZEY_VOICE_TOKEN=change-me python3 server.py
+    KIZZEY_VOICE_URL=http://127.0.0.1:8421 python3 server.py
+
+Kizzey reads the active account token from ``data/secret.json`` and includes it
+in each ``/join`` request. ``VOICE_TOKEN`` is only needed when the service is
+reachable off loopback; it is a bearer token between the two processes, and it
+must match ``KIZZEY_VOICE_TOKEN`` on the server.
 
 Requires the packages in ``requirements.txt`` plus the ``ffmpeg`` binary.  Audio
 receive additionally needs a DAVE-capable voice stack, because Discord encrypts

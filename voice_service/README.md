@@ -36,22 +36,24 @@ pip install -r requirements.txt
 
 ## Run
 
-```bash
-VOICE_TOKEN=change-me \
-DISCORD_TOKEN=your-bot-token \
-python3 voice_service.py --host 0.0.0.0 --port 8421
-```
-
-Then start Kizzey pointed at it:
+The companion uses the same Discord account token that Kizzey already stores for
+RPC. When you join from the Kizzey screen, the server reads the active account
+token from `data/secret.json` and sends it to the companion over the local
+socket, so there is no second token to paste. Sign in through Kizzey first, or
+pass `DISCORD_TOKEN` if you want the companion to connect at startup.
 
 ```bash
-KIZZEY_VOICE_URL=http://127.0.0.1:8421 \
-KIZZEY_VOICE_TOKEN=change-me \
-python3 server.py --host 0.0.0.0 --port 8420
+# loopback only: no shared secret needed
+python3 voice_service.py --host 127.0.0.1 --port 8421
+
+# Kizzey (the launcher starts both for you: python3 script_pull.py)
+KIZZEY_VOICE_URL=http://127.0.0.1:8421 python3 server.py --host 0.0.0.0 --port 8420
 ```
 
 `VOICE_TOKEN` is required whenever the service is bound to anything other than
-loopback. Kizzey sends it as a bearer token and never exposes it to the browser.
+loopback. Then set the same value as `KIZZEY_VOICE_TOKEN` on Kizzey; it is a
+bearer token between the two processes, not the Discord token. Kizzey never
+exposes it to the browser.
 
 ### Environment
 
@@ -60,7 +62,7 @@ loopback. Kizzey sends it as a bearer token and never exposes it to the browser.
 | `VOICE_HOST` | `127.0.0.1` | Bind address. |
 | `VOICE_PORT` | `8421` | Port. |
 | `VOICE_TOKEN` | *(empty)* | Shared secret. Required off loopback. |
-| `DISCORD_TOKEN` | *(empty)* | Default bot/user token. A token can also be sent per `/join`. |
+| `DISCORD_TOKEN` | *(empty)* | Optional default token. Kizzey normally sends the saved RPC token per `/join`. |
 | `VOICE_RECORDINGS_DIR` | `data/voice_recordings` | Where OGG recordings are stored. |
 | `VOICE_FFMPEG` | `ffmpeg` | ffmpeg binary. |
 | `VOICE_YTDLP` | `yt-dlp` | yt-dlp binary used when the Python module is missing. |
@@ -76,8 +78,9 @@ docker compose up --build
 ```
 
 The compose file runs Kizzey and the voice service side by side, with the
-recordings in a named volume. Set `DISCORD_TOKEN` and `KIZZEY_VOICE_TOKEN` in a
-`.env` file next to `docker-compose.yml`.
+recordings in a named volume. The two containers are not on loopback, so set
+`KIZZEY_VOICE_TOKEN` in a `.env` file next to `docker-compose.yml`. `DISCORD_TOKEN`
+is optional; Kizzey forwards the saved RPC token when you join.
 
 ## Recording and Discord's DAVE encryption
 

@@ -5,10 +5,11 @@
 #
 #   docker build -f Dockerfile.allinone -t kizzey-voice .
 #   docker run -p 8420:8420 \
-#     -e KIZZEY_VOICE_TOKEN=change-me \
-#     -e DISCORD_TOKEN=your-bot-token \
 #     -v kizzey-data:/app/data \
 #     kizzey-voice
+#
+# Both processes sit on loopback, so no shared secret is needed. Voice joins
+# with the Discord account token Kizzey already stores for RPC.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

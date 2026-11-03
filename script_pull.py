@@ -30,6 +30,7 @@ launcher itself; the voice companion has its own requirements file.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import signal
@@ -157,6 +158,32 @@ def voice_service_script(target: Path) -> Path:
 
 def voice_requirements(target: Path) -> Path:
     return target / "voice_service" / "requirements.txt"
+
+
+def rpc_token(target: Path) -> str:
+    """The Discord token Kizzey already uses for RPC, or "" when not signed in.
+
+    RPC, the gateway and the voice companion all use the same account token.
+    Reading it here means the launcher can wire voice without a second secret;
+    the file lives in the git-ignored data directory and is never logged.
+    """
+    secret_path = target / "data" / "secret.json"
+    try:
+        data = json.loads(secret_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    token = str(data.get("token") or "").strip()
+    if token:
+        return token
+    for account in data.get("accounts") or []:
+        if not isinstance(account, dict):
+            continue
+        candidate = str(account.get("token") or "").strip()
+        if candidate:
+            return candidate
+    return ""
 
 
 def check_voice_dependencies(python: str, target: Path) -> tuple[bool, str]:
@@ -301,13 +328,22 @@ def start_voice_companion(known, target: Path) -> tuple[subprocess.Popen | None,
         note(f"Voice service not started: {reason} Run with --voice-install to set it up.")
         return None, {}
 
+    # RPC, the gateway and the voice companion all use one Discord account
+    # token. When nothing was configured explicitly, reuse the token already in
+    # data/secret.json instead of asking for a second secret.
+    account_token = rpc_token(target)
+    voice_token = known.voice_token or account_token
+    discord_token = known.discord_token or account_token
+    if account_token and not known.discord_token:
+        note("Using the Discord account token already saved for RPC.")
+
     process = start_voice_service(
         sys.executable,
         target,
         known.voice_host,
         known.voice_port,
-        known.voice_token,
-        known.discord_token,
+        voice_token,
+        discord_token,
     )
     if not probe_voice_health(known.voice_host, known.voice_port, process=process):
         if process.poll() is not None:
@@ -322,9 +358,9 @@ def start_voice_companion(known, target: Path) -> tuple[subprocess.Popen | None,
         note("Voice service did not answer /health yet; continuing anyway.")
 
     extra_env = {"KIZZEY_VOICE_URL": f"http://127.0.0.1:{known.voice_port}"}
-    if known.voice_token:
-        extra_env["KIZZEY_VOICE_TOKEN"] = known.voice_token
-    if known.voice_host not in LOOPBACK and not known.voice_token:
+    if voice_token:
+        extra_env["KIZZEY_VOICE_TOKEN"] = voice_token
+    if known.voice_host not in LOOPBACK and not voice_token:
         note("Voice host is not loopback and no token was set; non-local requests will be rejected.")
     return process, extra_env
 
@@ -354,9 +390,13 @@ def main() -> int:
     parser.add_argument(
         "--voice-token",
         default=os.environ.get("VOICE_TOKEN") or os.environ.get("KIZZEY_VOICE_TOKEN") or "",
-        help="Shared voice token (default: $VOICE_TOKEN or $KIZZEY_VOICE_TOKEN)",
+        help="Shared voice token (default: $VOICE_TOKEN, else the saved RPC token)",
     )
-    parser.add_argument("--discord-token", default=os.environ.get("DISCORD_TOKEN", ""), help="Discord bot token (default: $DISCORD_TOKEN)")
+    parser.add_argument(
+        "--discord-token",
+        default=os.environ.get("DISCORD_TOKEN", ""),
+        help="Discord token for the companion (default: $DISCORD_TOKEN, else the saved RPC token)",
+    )
     known, forwarded = parser.parse_known_args()
 
     target = Path(known.dir).expanduser().resolve() if known.dir else default_dir(script_dir)

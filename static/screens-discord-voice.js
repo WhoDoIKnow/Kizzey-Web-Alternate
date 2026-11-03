@@ -58,7 +58,7 @@
 
   function statusMarkup(state) {
     if (!D().configured) {
-      return `<div class="card soft"><div class="card-row"><div class="feature-icon" style="width:40px;height:40px;background:var(--surface-2);color:var(--primary)">${K.icon('info')}</div><div><div class="card-title" style="font-size:0.8125rem">Voice service not configured</div><div class="card-sub">Run the PyPI sidecar from <b>voice_service/</b> and set <b>KIZZEY_VOICE_URL</b> plus <b>KIZZEY_VOICE_TOKEN</b> on the Kizzey server.</div></div></div></div>`;
+      return `<div class="card soft"><div class="card-row"><div class="feature-icon" style="width:40px;height:40px;background:var(--surface-2);color:var(--primary)">${K.icon('info')}</div><div><div class="card-title" style="font-size:0.8125rem">Voice service not configured</div><div class="card-sub">Start the voice companion from <b>voice_service/</b> (the launcher does this) and point <b>KIZZEY_VOICE_URL</b> at it. Voice reuses the Discord token already saved for RPC.</div></div></div></div>`;
     }
     if (!D().reachable) {
       return `<div class="card soft"><div class="card-row"><div class="feature-icon" style="width:40px;height:40px;background:rgba(255,120,120,.14);color:#ffb4ab">${K.icon('alert-circle')}</div><div><div class="card-title" style="font-size:0.8125rem">Voice service unreachable</div><div class="card-sub">${h(D().error || 'The server could not reach the voice service.')}</div></div></div><div style="margin-top:10px"><button class="btn btn-tonal btn-sm" data-action="dv-refresh">${K.icon('refresh', 'sm')}Try again</button></div></div>`;
