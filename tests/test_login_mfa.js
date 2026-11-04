@@ -56,28 +56,32 @@ async function main() {
   let mfaProps = {};
   try { mfaProps = JSON.parse(Buffer.from(calls[0].headers['X-Super-Properties'], 'base64').toString('utf8')); } catch {}
   check(
-    Boolean(mfaProps.client_launch_id) && mfaProps.release_channel === 'stable' && mfaProps.has_client_mods === false,
+    Boolean(mfaProps.client_launch_id) && Boolean(mfaProps.launch_signature)
+      && Boolean(mfaProps.client_heartbeat_session_id)
+      && mfaProps.release_channel === 'stable' && mfaProps.has_client_mods === false,
     'the two-factor request carries a full web fingerprint',
     JSON.stringify(mfaProps)
   );
   check(mfaProps.browser === 'Chrome' && mfaProps.browser_user_agent === calls[0].headers['User-Agent'], 'the fingerprint names the same client as the request');
 
-
+  // The ticket alone is enough, which is what Discord's own clients send.
   installFetch(() => ({ status: 200, body: { token: 'tok-2' } }));
   token = await login.discordMfaLogin('ticket-1', '123456', UUID);
-  check(calls[0].body.login_instance_id === UUID, 'a valid login instance is sent', JSON.stringify(calls[0].body));
+  check(token === 'tok-2' && calls.length === 1, 'the MFA sign-in finishes on the first try', JSON.stringify(calls));
+  check(calls[0].body.login_instance_id === undefined, 'the first MFA try omits the login instance', JSON.stringify(calls[0].body));
 
-  // If Discord still rejects the field, retry once without it.
+  // A shape Discord does not accept the code against is retried with the
+  // echoed login instance before giving up.
   installFetch((url, body) =>
     url !== MFA_URL
       ? { status: 500 }
       : body.login_instance_id
-        ? { status: 400, body: { message: 'Invalid Form Body', code: 50035, errors: { login_instance_id: { _errors: [{}] } } } }
-        : { status: 200, body: { token: 'tok-3' } }
+        ? { status: 200, body: { token: 'tok-3' } }
+        : { status: 400, body: { message: 'Invalid two-factor code', code: 60008 } }
   );
   token = await login.discordMfaLogin('ticket-2', '123456', UUID);
-  check(token === 'tok-3' && calls.length === 2, 'a rejected login instance is retried without it', JSON.stringify(calls));
-  check(calls[1].body.login_instance_id === undefined, 'the retry omits the login instance');
+  check(token === 'tok-3' && calls.length === 2, 'a rejected ticket-only try is retried with the login instance', JSON.stringify(calls));
+  check(calls[0].body.login_instance_id === undefined && calls[1].body.login_instance_id === UUID, 'the retry adds the login instance');
 
   // A dead ticket is reported as an expired step, not a bad code.
   installFetch(() => ({

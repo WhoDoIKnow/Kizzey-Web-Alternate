@@ -104,8 +104,11 @@ DISCORD_LOGIN_API = "https://discord.com/api/v9/auth/login"
 DISCORD_MFA_API = "https://discord.com/api/v9/auth/mfa/totp"
 DISCORD_LOGIN_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/138.0.7204.251 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 )
+DISCORD_CHROME_MAJOR = "146"
+DISCORD_CLIENT_VERSION = "146.0.0.0"
+DISCORD_CLIENT_BUILD = 661871
 
 MIME_OVERRIDES = {
     ".js": "text/javascript; charset=utf-8",
@@ -5843,18 +5846,24 @@ def _login_headers() -> dict:
         "X-Super-Properties": web_super_properties(),
         "X-Discord-Locale": "en-US",
         "X-Discord-Timezone": "Europe/London",
-        "Sec-Ch-Ua": '"Google Chrome";v="138", "Chromium";v="138", "Not_A Brand";v="24"',
+        "Sec-Ch-Ua": f'"Google Chrome";v="{DISCORD_CHROME_MAJOR}", "Chromium";v="{DISCORD_CHROME_MAJOR}", "Not_A Brand";v="24"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Windows"',
     }
+
+
+_WEB_LAUNCH_ID = str(uuid.uuid4())
+_WEB_LAUNCH_SIGNATURE = str(uuid.uuid4())
+_WEB_HEARTBEAT_SESSION_ID = str(uuid.uuid4())
 
 
 def web_super_properties() -> str:
     """Client properties matching DISCORD_LOGIN_UA, for the web password flow.
 
     Discord's two-factor endpoint rejects a *current* authenticator code with
-    60008 "Invalid two-factor code" unless the request carries a complete
-    X-Super-Properties blob including a client_launch_id. The code is not the
+    60008 "Invalid two-factor code" unless the request looks like a live client
+    launch: complete ``X-Super-Properties``, including ``client_launch_id``,
+    ``launch_signature`` and ``client_heartbeat_session_id``. The code is not the
     problem; the missing fingerprint is. Keep this in step with the web client
     shape and send it on both the password and the two-factor request.
     """
@@ -5865,17 +5874,19 @@ def web_super_properties() -> str:
         "system_locale": "en-US",
         "has_client_mods": False,
         "browser_user_agent": DISCORD_LOGIN_UA,
-        "browser_version": "138.0.7204.251",
+        "browser_version": DISCORD_CLIENT_VERSION,
         "os_version": "10",
         "referrer": "",
         "referring_domain": "",
         "referrer_current": "",
         "referring_domain_current": "",
         "release_channel": "stable",
-        "client_build_number": 661871,
+        "client_build_number": DISCORD_CLIENT_BUILD,
         "client_event_source": None,
+        "client_launch_id": _WEB_LAUNCH_ID,
+        "launch_signature": _WEB_LAUNCH_SIGNATURE,
+        "client_heartbeat_session_id": _WEB_HEARTBEAT_SESSION_ID,
         "client_app_state": "focused",
-        "client_launch_id": "00000000-0000-4000-8000-000000000000",
     }
     raw = json.dumps(props, separators=(",", ":")).encode()
     return base64.b64encode(raw).decode()
@@ -6150,9 +6161,10 @@ def _mfa_error(exc: DiscordError) -> DiscordError:
         )
         error.reason = "mfa-expired"
         return error
+    suffix = f" (Discord said {info['code']})" if isinstance(info.get("code"), int) else ""
     return DiscordError(
         status,
-        "That two-factor code was not accepted. Try the current code from your authenticator app.",
+        "That two-factor code was not accepted. Try the current code from your authenticator app." + suffix,
         info,
     )
 
@@ -6187,20 +6199,32 @@ def discord_mfa_login(
             _log_discord_shape("two-factor check", exc.status, exc.data)
             raise
 
-    try:
-        payload = send(True)
-    except DiscordError as exc:
-        info = exc.data if isinstance(exc.data, dict) else {}
-        fields = info.get("errors") if isinstance(info.get("errors"), dict) else {}
-        if instance_id and fields.get("login_instance_id"):
-            # Discord rejected the echoed login instance; retry with just the
-            # ticket, which is what its own validator accepts.
-            try:
-                payload = send(False)
-            except DiscordError as retry_exc:
-                raise _mfa_error(retry_exc) from None
-        else:
-            raise _mfa_error(exc) from None
+    # Discord's own clients finish the challenge with the ticket alone. Echoing
+    # the login_instance_id is the one difference the web client adds, and a
+    # stale or mismatched id makes Discord answer 60008 for a *current* code, so
+    # the ticket-only shape goes first and the echoed id is only a second
+    # attempt when the first came back without a captcha and without a dead
+    # ticket.
+    attempts = [False]
+    if instance_id:
+        attempts.append(True)
+    payload = None
+    failure = None
+    for with_instance in attempts:
+        try:
+            payload = send(with_instance)
+            failure = None
+            break
+        except DiscordError as exc:
+            failure = exc
+            info = exc.data if isinstance(exc.data, dict) else {}
+            if info.get("captcha_key") or info.get("captcha_sitekey"):
+                raise
+            fields = info.get("errors") if isinstance(info.get("errors"), dict) else {}
+            if fields.get("ticket") or "MFA_INVALID_TICKET" in json.dumps(info):
+                break
+    if failure is not None:
+        raise _mfa_error(failure) from None
     token = clean_discord_token(payload.get("token"))
     if not token:
         raise DiscordError(401, "Discord did not accept that two-factor code.")

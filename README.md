@@ -141,6 +141,15 @@ first: the two-factor ticket Discord hands back is bound to that unsolved check,
 early makes a current authenticator code look wrong. Kizzey shows the captcha, then the two-factor
 field.
 
+Discord only accepts the code when the two-factor request carries the same complete
+`X-Super-Properties` fingerprint a live web client sends — launch id, launch signature, heartbeat
+session id and client build included — and finishes with the ticket alone. Echoing a
+`login_instance_id` that is stale or mismatched is what makes Discord answer `60008` for a code that
+is actually current. Kizzey sends the live fingerprint on both the password and the two-factor
+request, tries the ticket alone first, and only echoes the instance id as a second attempt. A code
+that is still refused reports Discord's own numeric error code, so the cause is visible instead of
+being guessed at.
+
 The password is used only for that one login request, is never logged and is never written anywhere;
 only the session token Discord returns is kept, in `data/secret.json`.
 
