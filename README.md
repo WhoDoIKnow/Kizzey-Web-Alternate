@@ -141,14 +141,29 @@ first: the two-factor ticket Discord hands back is bound to that unsolved check,
 early makes a current authenticator code look wrong. Kizzey shows the captcha, then the two-factor
 field.
 
-Discord only accepts the code when the two-factor request carries the same complete
-`X-Super-Properties` fingerprint a live web client sends — launch id, launch signature, heartbeat
-session id and client build included — and finishes with the ticket alone. Echoing a
-`login_instance_id` that is stale or mismatched is what makes Discord answer `60008` for a code that
-is actually current. Kizzey sends the live fingerprint on both the password and the two-factor
-request, tries the ticket alone first, and only echoes the instance id as a second attempt. A code
-that is still refused reports Discord's own numeric error code, so the cause is visible instead of
-being guessed at.
+Discord's two-factor step is tied to the same browser session that minted the ticket, not just to
+the ticket itself. Before the first auth call Kizzey does what the web page does on load: it asks
+`/api/v9/experiments` for that client's `fingerprint` and `installation`, keeps the device cookies
+Discord sets (`__dcfduid`, `__sdcfduid`, `_cfuvid`), and replays all of them on both the password
+and the two-factor request. The identity is stored in `data/login-client.json` so a restart keeps the
+same client instead of appearing as a stranger; deleting that file makes the next sign-in request a
+fresh one. The `X-Super-Properties` value matches the
+web sign-in page, including a null `launch_signature` — the real web client only produces a launch
+signature after its audio library has loaded, which has not happened on the sign-in page.
+
+The two-factor request is then the same one the browser sends: `code`, `ticket`, `login_source`,
+`gift_code_sku_id`, and the `login_instance_id` Discord supplied, on a single attempt. A rejected code
+is not retried with a different body — that only burns an attempt and shortens the ticket. The only
+retry is for a malformed `login_instance_id`, which Discord validates to exactly 36 characters.
+
+Discord names the factors it will accept with separate `totp`, `sms`, `backup` and `webauthn` fields
+(`mfa` itself is only true or false). Kizzey reads those, labels the field for the factor the account
+actually has, and sends a six-digit authenticator code to `/auth/mfa/totp`, an eight-character backup
+code to `/auth/mfa/backup`, and a texted code to `/auth/mfa/sms`. Because a six-digit code is only
+valid for the current 30-second window, the field shows how long the code you are looking at has left,
+so a code that expired while the captcha was solved is not mistaken for a wrong code. A code that is
+still refused reports Discord's own numeric error code, so the cause is visible instead of being
+guessed at.
 
 The password is used only for that one login request, is never logged and is never written anywhere;
 only the session token Discord returns is kept, in `data/secret.json`.
@@ -169,8 +184,10 @@ device, the sheet says so, offers to reload it, and falls back to the token box.
 
 Each Discord answer is also summarised in **Settings → Logs** as field names and flags only, for
 example `Discord password login: HTTP 400; fields [captcha_key, captcha_sitekey]; captcha=true
-mfa=false ticket=false session=false`. That line makes a stuck sign-in diagnosable without exposing a
-token, ticket, password or code.
+mfa=false ticket=false session=false totp=false sms=false backup=false webauthn=false code=n/a`.
+A two-factor answer adds the endpoint used, the code length and whether it was numeric, whether the
+login instance was sent, and Discord's own message. That line makes a stuck sign-in diagnosable
+without exposing a token, ticket, password or code.
 
 There is no Chromium or browser-automation dependency in this build. Sign-in is the password/MFA
 request plus the in-browser captcha relay, or the token fallback below; a headless container has no
@@ -493,9 +510,13 @@ data/state.json             settings, presets, mirror rules, chat, history, wall
 data/secret.json            private Discord tokens, active-account ID and managed webhook URLs
 data/history.json           presence-history mirror
 data/kizzey.log             server event log
+data/login-client.json      the sign-in client fingerprint, installation id and Discord device cookies
 data/uploads/               local chat images, avatars and screen captures
 data/voice_recordings/      OGG/Opus recordings and recordings.json
 ```
+
+The sign-in identity file holds no credential — only the `fingerprint`, `installation` and device
+cookies Discord issued, so the password and two-factor calls look like one browser session.
 
 Screen captures, avatars and chat attachments stay on this server. Only artwork explicitly used
 on a Discord card is sent to the public Kizzy image resolver so Discord can display it; external
@@ -504,7 +525,8 @@ artwork URLs are resolved the same way.
 ### Reset
 
 Stop the server, remove `data/state.json`, `data/history.json`, `data/secret.json`,
-`data/kizzey.log`, the files in `data/uploads/` and `data/voice_recordings/`, then start it again.
+`data/kizzey.log`, `data/login-client.json`, the files in `data/uploads/` and
+`data/voice_recordings/`, then start it again.
 A fresh neutral state is created automatically. Removing `secret.json` signs the server out of
 Discord.
 

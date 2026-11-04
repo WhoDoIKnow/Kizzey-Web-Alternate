@@ -61,6 +61,10 @@ SECRET_FILE = DATA_DIR / "secret.json"
 CHAT_FILE = DATA_DIR / "chat.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 LOG_FILE = DATA_DIR / "kizzey.log"
+# Stable browser identity for the password flow: the fingerprint and
+# installation id Discord hands out, plus its device cookies. The real web
+# client sends these on every call, including the two-factor one.
+LOGIN_CLIENT_FILE = DATA_DIR / "login-client.json"
 
 for directory in (DATA_DIR, UPLOAD_DIR, TMP_DIR):
     directory.mkdir(parents=True, exist_ok=True)
@@ -102,6 +106,9 @@ VOICE_RECORDING_MIME = "audio/ogg"
 # the machine running this server. Nothing is stored but the resulting token.
 DISCORD_LOGIN_API = "https://discord.com/api/v9/auth/login"
 DISCORD_MFA_API = "https://discord.com/api/v9/auth/mfa/totp"
+DISCORD_MFA_BACKUP_API = "https://discord.com/api/v9/auth/mfa/backup"
+DISCORD_MFA_SMS_API = "https://discord.com/api/v9/auth/mfa/sms"
+DISCORD_EXPERIMENTS_API = "https://discord.com/api/v9/experiments?with_guild_experiments=true"
 DISCORD_LOGIN_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
@@ -5853,7 +5860,6 @@ def _login_headers() -> dict:
 
 
 _WEB_LAUNCH_ID = str(uuid.uuid4())
-_WEB_LAUNCH_SIGNATURE = str(uuid.uuid4())
 _WEB_HEARTBEAT_SESSION_ID = str(uuid.uuid4())
 
 
@@ -5884,7 +5890,9 @@ def web_super_properties() -> str:
         "client_build_number": DISCORD_CLIENT_BUILD,
         "client_event_source": None,
         "client_launch_id": _WEB_LAUNCH_ID,
-        "launch_signature": _WEB_LAUNCH_SIGNATURE,
+        # The web client only has a launch signature once libdiscore has
+        # loaded; on the sign-in page it is null.
+        "launch_signature": None,
         "client_heartbeat_session_id": _WEB_HEARTBEAT_SESSION_ID,
         "client_app_state": "focused",
     }
@@ -5892,16 +5900,157 @@ def web_super_properties() -> str:
     return base64.b64encode(raw).decode()
 
 
+# ---------------------------------------------------------------------------
+# Client identity
+#
+# The web client calls /experiments before sign-in, keeps the `fingerprint` and
+# `installation` it is given, and replays them plus the device cookies on every
+# later request. Discord's auth service binds a two-factor challenge to that
+# client, so a current code presented by a session without the same identity can
+# come back 60008. One persisted identity is used for both auth steps.
+# ---------------------------------------------------------------------------
+
+_CLIENT_STATE: dict | None = None
+_CLIENT_LOCK = threading.Lock()
+
+
+def _blank_client_state() -> dict:
+    return {"fingerprint": "", "installation": "", "cookies": {}}
+
+
+def _read_client_state() -> dict:
+    global _CLIENT_STATE
+    with _CLIENT_LOCK:
+        if _CLIENT_STATE is not None:
+            return _CLIENT_STATE
+        state = _blank_client_state()
+        try:
+            parsed = json.loads(LOGIN_CLIENT_FILE.read_text("utf-8"))
+            if isinstance(parsed, dict):
+                if isinstance(parsed.get("fingerprint"), str):
+                    state["fingerprint"] = parsed["fingerprint"]
+                if isinstance(parsed.get("installation"), str):
+                    state["installation"] = parsed["installation"]
+                cookies = parsed.get("cookies")
+                if isinstance(cookies, dict):
+                    for name, value in cookies.items():
+                        if isinstance(value, str):
+                            state["cookies"][name] = value
+        except Exception:
+            pass
+        _CLIENT_STATE = state
+        return state
+
+
+def _save_client_state() -> None:
+    try:
+        LOGIN_CLIENT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LOGIN_CLIENT_FILE.write_text(json.dumps(_read_client_state()), "utf-8")
+    except Exception:
+        pass
+
+
+def _cookie_header() -> str:
+    cookies = _read_client_state()["cookies"]
+    return "; ".join(f"{name}={value}" for name, value in cookies.items())
+
+
+def _capture_cookies(headers) -> None:
+    try:
+        values = headers.get_all("Set-Cookie") or []
+    except Exception:
+        values = []
+    if not values:
+        return
+    state = _read_client_state()
+    changed = False
+    for raw in values:
+        parts = str(raw or "").split(";")
+        pair = parts.pop(0) if parts else ""
+        name, sep, value = pair.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            continue
+        expired = False
+        for attr in parts:
+            key, _, attr_value = attr.partition("=")
+            if key.strip().lower() == "max-age":
+                try:
+                    expired = int(float(attr_value)) <= 0
+                except Exception:
+                    expired = False
+        if expired:
+            if name in state["cookies"]:
+                del state["cookies"][name]
+                changed = True
+        elif state["cookies"].get(name) != value.strip():
+            state["cookies"][name] = value.strip()
+            changed = True
+    if changed:
+        _save_client_state()
+
+
+def _identity_headers() -> dict:
+    state = _read_client_state()
+    headers = {}
+    if state["fingerprint"]:
+        headers["X-Fingerprint"] = state["fingerprint"]
+    if state["installation"]:
+        headers["X-Installation-ID"] = state["installation"]
+    cookie = _cookie_header()
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
+_IDENTITY_LOCK = threading.Lock()
+
+
+def _ensure_client_identity() -> None:
+    """Fetch the fingerprint/installation once, exactly like a page load."""
+    if _read_client_state()["fingerprint"]:
+        return
+    with _IDENTITY_LOCK:
+        if _read_client_state()["fingerprint"]:
+            return
+        headers = _login_headers()
+        headers.update(_identity_headers())
+        req = urllib.request.Request(DISCORD_EXPERIMENTS_API, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                _capture_cookies(resp.headers)
+                raw = resp.read()
+            payload = json.loads(raw) if raw else {}
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+        state = _read_client_state()
+        changed = False
+        if isinstance(payload.get("fingerprint"), str) and payload["fingerprint"]:
+            state["fingerprint"] = payload["fingerprint"]
+            changed = True
+        if isinstance(payload.get("installation"), str) and payload["installation"]:
+            state["installation"] = payload["installation"]
+            changed = True
+        if changed:
+            _save_client_state()
+
+
 def _login_post(url: str, body: dict, timeout: float = 25, extra_headers: dict | None = None) -> dict:
+    _ensure_client_identity()
     data = json.dumps(body).encode()
     headers = _login_headers()
+    headers.update(_identity_headers())
     for name, value in (extra_headers or {}).items():
         headers[str(name)] = str(value)
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            _capture_cookies(resp.headers)
             raw = resp.read()
     except urllib.error.HTTPError as exc:
+        _capture_cookies(exc.headers)
         raw = exc.read()
         info = {}
         try:
@@ -6083,7 +6232,7 @@ def _has_captcha(info) -> bool:
     )
 
 
-def _log_discord_shape(step: str, status: int, info) -> None:
+def _log_discord_shape(step: str, status: int, info, meta: dict | None = None) -> None:
     """One line per Discord answer: field names and flags only, never a value.
 
     A token, ticket, password, code or Enterprise request value never appears,
@@ -6099,16 +6248,66 @@ def _log_discord_shape(step: str, status: int, info) -> None:
         # `code` is Discord's numeric error code, never the authenticator code.
         error_code = source.get("code")
         error_code = error_code if isinstance(error_code, int) else "n/a"
+        detail = ""
+        if isinstance(meta, dict):
+            bits = []
+            if meta.get("endpoint"):
+                bits.append(f"endpoint={meta['endpoint']}")
+            if meta.get("codeLen") is not None:
+                bits.append(f"codeLen={meta['codeLen']}")
+            if meta.get("codeNumeric") is not None:
+                bits.append(f"codeNumeric={str(bool(meta['codeNumeric'])).lower()}")
+            if meta.get("instance") is not None:
+                bits.append(f"instance={str(bool(meta['instance'])).lower()}")
+            if meta.get("errorFields"):
+                bits.append(f"errors={meta['errorFields']}")
+            if meta.get("message"):
+                bits.append(f"said={str(meta['message'])[:80]}")
+            if bits:
+                detail = "; " + " ".join(bits)
         STORE.log(
             "INFO",
             "Account",
             f"Discord {step}: HTTP {status}; fields [{', '.join(fields) or 'none'}]; "
             f"captcha={_has_captcha(source)} mfa={bool(source.get('mfa'))} "
             f"ticket={bool(source.get('ticket'))} session={bool(source.get('token'))} "
-            f"code={error_code}",
+            f"totp={source.get('totp') is True} sms={source.get('sms') is True} "
+            f"backup={source.get('backup') is True} webauthn={bool(source.get('webauthn'))} "
+            f"code={error_code}{detail}",
         )
     except Exception:
         pass
+
+
+def _mfa_methods(payload: dict) -> list[str]:
+    """The factors Discord says the account has.
+
+    ``mfa`` itself is a boolean; ``totp`` / ``sms`` / ``backup`` are separate
+    booleans and ``webauthn`` carries the credential request. Reading ``mfa`` as
+    a list always produced an empty method list. Order matches the web client.
+    """
+    if not isinstance(payload, dict):
+        return []
+    methods: list[str] = []
+
+    def push(value) -> None:
+        name = str(value or "").strip().lower()
+        if name and name not in methods:
+            methods.append(name)
+
+    raw = payload.get("mfa")
+    if isinstance(raw, list):
+        for item in raw:
+            push(item)
+    if payload.get("webauthn"):
+        push("webauthn")
+    if payload.get("totp") is True:
+        push("totp")
+    if payload.get("backup") is True:
+        push("backup")
+    if payload.get("sms") is True:
+        push("sms")
+    return methods
 
 
 def _mfa_challenge(payload: dict) -> dict | None:
@@ -6118,12 +6317,23 @@ def _mfa_challenge(payload: dict) -> dict | None:
     ticket = str(payload.get("ticket") or "")
     if not ticket:
         return None
-    methods = payload.get("mfa") if isinstance(payload.get("mfa"), list) else []
-    result = {"status": "mfa", "ticket": ticket, "methods": [str(m) for m in methods]}
+    result = {"status": "mfa", "ticket": ticket, "methods": _mfa_methods(payload)}
     instance_id = _login_instance(payload.get("login_instance_id"))
     if instance_id:
         result["loginInstanceId"] = instance_id
     return result
+
+
+def _mfa_endpoint_for(code: str, methods) -> tuple[str, str]:
+    """Pick the endpoint the typed code belongs to."""
+    text = re.sub(r"[\s-]", "", str(code or ""))
+    methods = methods if isinstance(methods, list) else []
+    backup_shape = bool(re.search(r"[A-Za-z]", text)) or len(text) >= 8
+    if backup_shape and ("backup" in methods or "totp" not in methods):
+        return "backup", DISCORD_MFA_BACKUP_API
+    if "totp" not in methods and "sms" in methods:
+        return "sms", DISCORD_MFA_SMS_API
+    return "totp", DISCORD_MFA_API
 
 
 def _login_instance(value) -> str:
@@ -6161,16 +6371,36 @@ def _mfa_error(exc: DiscordError) -> DiscordError:
         )
         error.reason = "mfa-expired"
         return error
+    if info.get("code") == 60009:
+        error = DiscordError(
+            status,
+            "That two-factor session expired. Sign in again to get a fresh one.",
+            info,
+        )
+        error.reason = "mfa-expired"
+        return error
+    if info.get("code") == 60010:
+        return DiscordError(
+            status,
+            "This account is not set up for texted two-factor codes. Use your "
+            "authenticator app, a backup code, or a token.",
+            info,
+        )
     suffix = f" (Discord said {info['code']})" if isinstance(info.get("code"), int) else ""
     return DiscordError(
         status,
-        "That two-factor code was not accepted. Try the current code from your authenticator app." + suffix,
+        "That two-factor code was not accepted. Wait for a fresh code from your "
+        "authenticator app and enter it straight away." + suffix,
         info,
     )
 
 
 def discord_mfa_login(
-    ticket: str, code: str, login_instance_id: str = "", captcha: dict | None = None
+    ticket: str,
+    code: str,
+    login_instance_id: str = "",
+    captcha: dict | None = None,
+    methods: list | None = None,
 ) -> str:
     """Finish a login that Discord answered with an MFA ticket."""
     ticket = str(ticket or "")
@@ -6178,53 +6408,63 @@ def discord_mfa_login(
     if not ticket:
         raise DiscordError(400, "That two-factor step expired. Sign in again.")
     if not code:
-        raise DiscordError(400, "Enter the 6-digit code from your authenticator app.")
+        raise DiscordError(400, "Enter the code from your authenticator app.")
     instance_id = _login_instance(login_instance_id)
     captcha_headers = _captcha_headers(captcha)
+    kind, url = _mfa_endpoint_for(code, methods if isinstance(methods, list) else [])
+    code_numeric = bool(re.fullmatch(r"[0-9]+", code))
 
-    def send(with_instance: bool) -> dict:
-        body = {
-            "code": code,
-            "ticket": ticket,
-            "login_source": None,
-            "gift_code_sku_id": None,
+    # Exactly the web client's body: the login instance is part of it whenever
+    # Discord supplied one. The earlier ticket-only attempt sent a different
+    # shape from the browser that minted the ticket.
+    body = {
+        "code": code,
+        "ticket": ticket,
+        "login_source": None,
+        "gift_code_sku_id": None,
+    }
+    if instance_id:
+        body["login_instance_id"] = instance_id
+
+    def send(payload_body: dict) -> dict:
+        meta = {
+            "endpoint": kind,
+            "codeLen": len(code),
+            "codeNumeric": code_numeric,
+            "instance": bool(payload_body.get("login_instance_id")),
         }
-        if with_instance and instance_id:
-            body["login_instance_id"] = instance_id
         try:
-            payload = _login_post(DISCORD_MFA_API, body, extra_headers=captcha_headers)
-            _log_discord_shape("two-factor check", 200, payload)
+            payload = _login_post(url, payload_body, extra_headers=captcha_headers)
+            _log_discord_shape("two-factor check", 200, payload, meta)
             return payload
         except DiscordError as exc:
-            _log_discord_shape("two-factor check", exc.status, exc.data)
+            info = exc.data if isinstance(exc.data, dict) else {}
+            fields = info.get("errors") if isinstance(info.get("errors"), dict) else {}
+            meta["errorFields"] = ",".join(str(key) for key in fields.keys())
+            meta["message"] = info.get("message")
+            _log_discord_shape("two-factor check", exc.status, exc.data, meta)
             raise
 
-    # Discord's own clients finish the challenge with the ticket alone. Echoing
-    # the login_instance_id is the one difference the web client adds, and a
-    # stale or mismatched id makes Discord answer 60008 for a *current* code, so
-    # the ticket-only shape goes first and the echoed id is only a second
-    # attempt when the first came back without a captcha and without a dead
-    # ticket.
-    attempts = [False]
-    if instance_id:
-        attempts.append(True)
-    payload = None
-    failure = None
-    for with_instance in attempts:
-        try:
-            payload = send(with_instance)
-            failure = None
-            break
-        except DiscordError as exc:
-            failure = exc
-            info = exc.data if isinstance(exc.data, dict) else {}
-            if info.get("captcha_key") or info.get("captcha_sitekey"):
-                raise
-            fields = info.get("errors") if isinstance(info.get("errors"), dict) else {}
-            if fields.get("ticket") or "MFA_INVALID_TICKET" in json.dumps(info):
-                break
-    if failure is not None:
-        raise _mfa_error(failure) from None
+    try:
+        payload = send(body)
+    except DiscordError as exc:
+        info = exc.data if isinstance(exc.data, dict) else {}
+        if info.get("captcha_key") or info.get("captcha_sitekey"):
+            raise
+        fields = info.get("errors") if isinstance(info.get("errors"), dict) else {}
+        # Only a malformed instance id earns a second shape. Retrying a
+        # rejected code just burns an attempt and shortens the ticket without
+        # changing the code that was typed.
+        if fields.get("login_instance_id") and body.get("login_instance_id"):
+            retry_body = {
+                "code": code,
+                "ticket": ticket,
+                "login_source": None,
+                "gift_code_sku_id": None,
+            }
+            payload = send(retry_body)
+        else:
+            raise _mfa_error(exc) from None
     token = clean_discord_token(payload.get("token"))
     if not token:
         raise DiscordError(401, "Discord did not accept that two-factor code.")
@@ -6250,9 +6490,13 @@ def login_with_password(login: str, password: str, captcha: dict | None = None) 
 
 
 def login_with_mfa(
-    ticket: str, code: str, login_instance_id: str = "", captcha: dict | None = None
+    ticket: str,
+    code: str,
+    login_instance_id: str = "",
+    captcha: dict | None = None,
+    methods: list | None = None,
 ) -> dict:
-    token = discord_mfa_login(ticket, code, login_instance_id, captcha)
+    token = discord_mfa_login(ticket, code, login_instance_id, captcha, methods)
     user = sign_in(token)
     STORE.log("INFO", "Account", f"Signed in with a password as {user['displayName']}.")
     return {"status": "ok", "user": user, "account": STORE.active_account_id()}
@@ -7948,6 +8192,7 @@ class Handler(BaseHTTPRequestHandler):
                         str(data.get("code") or ""),
                         str(data.get("loginInstanceId") or data.get("login_instance_id") or ""),
                         captcha,
+                        data.get("methods") if isinstance(data.get("methods"), list) else [],
                     )
                 except DiscordError as exc:
                     STORE.log("WARN", "Account", f"Two-factor sign-in failed: {_scrub(exc.message)[:160]}")

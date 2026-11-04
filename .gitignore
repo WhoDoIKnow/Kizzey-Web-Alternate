@@ -4,6 +4,7 @@ data/state.json
 data/secret.json
 data/history.json
 data/kizzey.log
+data/login-client.json
 data/uploads/
 data/tmp/
 .DS_Store

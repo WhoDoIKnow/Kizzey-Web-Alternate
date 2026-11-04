@@ -203,7 +203,7 @@ def fake_login_post(url, body, timeout=25, extra_headers=None):
             raise server.DiscordError(400, server._login_error_message(400, info), info)
         if ticket == "ticket-instance-only":
             # A shape that only accepts the code when the login instance is
-            # echoed back; the ticket-only first try must be retried with it.
+            # echoed back. The client must send it on the one attempt it makes.
             if (body or {}).get("login_instance_id") == INSTANCE:
                 return {"token": "tok-delta-mfa-222"}
             info = {"message": "Invalid two-factor code", "code": 60008}
@@ -409,12 +409,42 @@ def main():
         )
         check(
             bool(login_props.get("client_launch_id"))
-            and bool(login_props.get("launch_signature"))
+            and "launch_signature" in login_props
+            and login_props.get("launch_signature") is None
             and bool(login_props.get("client_heartbeat_session_id"))
             and login_props.get("release_channel") == "stable"
             and login_props.get("has_client_mods") is False,
             "the fingerprint carries the fields Discord's two-factor step needs",
             str(login_props)[:220],
+        )
+
+        # The login reply marks each factor with its own boolean; `mfa` is just
+        # true/false, so reading it as a list always produced an empty set.
+        check(
+            server._mfa_methods(
+                {"mfa": True, "totp": True, "sms": True, "backup": True, "webauthn": "{}"}
+            )
+            == ["webauthn", "totp", "backup", "sms"],
+            "the factor booleans become a method list",
+            str(server._mfa_methods({"mfa": True, "totp": True})),
+        )
+        check(
+            server._mfa_methods({"mfa": ["totp"]}) == ["totp"],
+            "an array shaped mfa list still parses",
+        )
+        check(server._mfa_methods({"mfa": True}) == [], "a bare mfa boolean yields no methods")
+        check(
+            server._mfa_endpoint_for("123456", ["totp", "backup"])[1] == server.DISCORD_MFA_API,
+            "a six digit code uses the totp endpoint",
+        )
+        check(
+            server._mfa_endpoint_for("ABCD1234", ["totp", "backup"])[1]
+            == server.DISCORD_MFA_BACKUP_API,
+            "an eight character code uses the backup endpoint",
+        )
+        check(
+            server._mfa_endpoint_for("123456", ["sms"])[1] == server.DISCORD_MFA_SMS_API,
+            "an sms-only account uses the sms endpoint",
         )
 
         # --- input validation -------------------------------------------------
@@ -564,13 +594,14 @@ def main():
             "the MFA code travels in Discord's code/ticket shape",
             str(mfa_body)[:220],
         )
-        check(mfa_body.get("login_instance_id") is None, "the MFA sign-in finishes with the ticket alone", str(mfa_body)[:220])
+        check(mfa_body.get("login_instance_id") == INSTANCE, "the one MFA try carries the login instance", str(mfa_body)[:220])
 
-        # A shape Discord only accepts with the echoed login instance is retried
-        # with it before the code is reported as wrong.
+        # The web client echoes the login instance on the single attempt it
+        # makes. A shape that only accepts the code with the instance therefore
+        # finishes first time now, instead of burning a rejected attempt first.
         status, instance_retry = request("POST", "/api/auth/mfa", {"ticket": "ticket-instance-only", "code": MFA_CODE, "loginInstanceId": INSTANCE})
-        check(status == 200 and instance_retry.get("status") == "ok", "a code that needs the login instance is retried with it", str(instance_retry)[:220])
-        check(MFA_BODIES[-1].get("login_instance_id") == INSTANCE, "the retry carries the login instance", str(MFA_BODIES[-1])[:220])
+        check(status == 200 and instance_retry.get("status") == "ok", "a code that needs the login instance finishes first time", str(instance_retry)[:220])
+        check(MFA_BODIES[-1].get("login_instance_id") == INSTANCE, "the first attempt carries the login instance", str(MFA_BODIES[-1])[:220])
 
         # A login instance Discord cannot accept is dropped, not echoed.
         status, short_retry = request("POST", "/api/auth/mfa", {"ticket": "ticket-abc", "code": MFA_CODE, "loginInstanceId": "instance-abc"})

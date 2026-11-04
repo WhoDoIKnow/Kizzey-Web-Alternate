@@ -478,7 +478,8 @@ function accountsState(overrides = {}) {
   const loginJs = fs.readFileSync(path.join(root, 'static', 'login.js'), 'utf8');
   check(loginJs.includes('js.hcaptcha.com') && loginJs.includes('captchaRqToken'), 'the captcha runs in the browser and returns only a solved token');
   check(loginJs.includes("data.rqdata") && /execute\(state\.widget,\s*data\)/.test(loginJs) && !/options\.rqdata/.test(loginJs), 'Enterprise challenge data is sent to the widget, not dropped by render');
-  check(loginJs.includes('mfaInstances[prefix] = data.loginInstanceId') && loginJs.includes('loginInstanceId: mfaInstances[prefix]'), 'the MFA retry carries the login instance');
+  check(loginJs.includes("mfaInstances[prefix] = (data && data.loginInstanceId) || ''") && loginJs.includes('loginInstanceId: mfaInstances[prefix]') && loginJs.includes('methods: mfaMethods[prefix]'), 'the MFA request carries the login instance and the factor list');
+  check(loginJs.includes('mfaMethods[prefix] = Array.isArray(data && data.methods)') && loginJs.includes('data-mfa-copy') && loginJs.includes('data-mfa-clock'), 'the two-factor sheet names the factor Discord expects and counts the code window');
   check(!/2captcha|capsolver|anti-captcha/i.test(loginJs), 'the captcha is not outsourced to a solver service');
   check(loginJs.includes('pending[prefix] = data') && loginJs.includes('await showCaptcha(prefix, null)'), 'the check step is always shown after a password sign-in');
   check(loginJs.includes('if (invisible) submitCaptcha(prefix, token)'), 'a visible box waits for Continue instead of submitting itself');

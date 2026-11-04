@@ -3,7 +3,7 @@
    bytes change, so every browser installs the new worker, purges the old
    shell cache, and reloads the open windows onto it. */
 
-const BUILD = 'v19';
+const BUILD = 'v20';
 const CACHE = 'kizzey-shell-' + BUILD;
 
 const SHELL = [

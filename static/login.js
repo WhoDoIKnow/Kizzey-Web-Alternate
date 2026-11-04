@@ -9,7 +9,12 @@
   const mfaTickets = {};
   const mfaInstances = {};
   const mfaCodes = {};
+  // Which factors Discord said this account has (`totp`, `backup`, `sms`,
+  // `webauthn`). The six-digit authenticator and the eight-character backup
+  // code go to different endpoints, so the sheet must send this back.
+  const mfaMethods = {};
   const busy = {};
+  let mfaClockTimer = null;
 
   // A captcha challenge belongs to one password attempt: the site key is
   // per-request and the solved token is single-use, so each panel keeps its
@@ -186,13 +191,14 @@
       <form data-login-step="mfa" class="hidden" data-submit-action="login-mfa">
         <div class="login-hint" style="margin-bottom:14px">
           ${K.icon('shield-check', 'sm')}
-          <div><b>Two-factor is on</b><span>Enter the 6-digit code from your authenticator app to finish signing in.</span></div>
+          <div><b>Two-factor is on</b><span data-mfa-copy>Enter the 6-digit code from your authenticator app to finish signing in.</span></div>
         </div>
         <div class="field">
-          <label for="${prefix}-code"><span>Code</span></label>
+          <label for="${prefix}-code"><span data-mfa-label>Code</span></label>
           <div class="input-wrap">
             <input id="${prefix}-code" class="input mono-copy" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="8" placeholder="123456" style="letter-spacing:.32em">
           </div>
+          <div id="${prefix}-mfa-clock" class="hidden" style="margin-top:8px;opacity:.7;font-size:12px"></div>
         </div>
         <div id="${prefix}-mfa-error" class="field-error hidden"></div>
         <button class="btn btn-primary btn-block btn-lg" type="submit" data-action="login-mfa" data-prefix="${prefix}" id="${prefix}-mfa-submit">Verify</button>
@@ -256,11 +262,79 @@
     panel.querySelectorAll('[data-login-step]').forEach(node => {
       node.classList.toggle('hidden', node.dataset.loginStep !== step);
     });
+    if (step !== 'mfa') stopMfaClock();
     if (step === 'credentials') {
       mfaTickets[prefix] = '';
       mfaInstances[prefix] = '';
+      mfaMethods[prefix] = [];
       pending[prefix] = null;
     }
+  }
+
+  // Authenticator codes are only valid for the current 30 second window. The
+  // captcha step can easily eat a window, so show how long the displayed code
+  // has left instead of letting a just-expired code look "wrong".
+  function stopMfaClock() {
+    if (mfaClockTimer) {
+      clearInterval(mfaClockTimer);
+      mfaClockTimer = null;
+    }
+    document.querySelectorAll('[data-mfa-clock]').forEach(node => node.classList.add('hidden'));
+  }
+
+  function startMfaClock(prefix) {
+    stopMfaClock();
+    const el = document.querySelector(`#${prefix}-mfa-clock`);
+    if (!el) return;
+    const tick = () => {
+      const left = 30 - (Math.floor(Date.now() / 1000) % 30);
+      el.textContent = left <= 5
+        ? `A new code appears in ${left}s — wait for it, then type it.`
+        : `This code has ${left}s left. Codes rotate every 30s.`;
+    };
+    el.classList.remove('hidden');
+    tick();
+    mfaClockTimer = setInterval(tick, 500);
+  }
+
+  function applyMfaHint(prefix) {
+    const panel = document.querySelector(`[data-login-panel="${prefix}"]`);
+    if (!panel) return;
+    const methods = mfaMethods[prefix] || [];
+    const usesTotp = methods.includes('totp');
+    const usesBackup = methods.includes('backup');
+    const usesSms = methods.includes('sms');
+    const copy = panel.querySelector('[data-mfa-copy]');
+    const label = panel.querySelector('[data-mfa-label]');
+    const input = panel.querySelector(`#${prefix}-code`);
+    if (usesTotp) {
+      if (copy) copy.textContent = 'Enter the current 6-digit code from your authenticator app.';
+      if (label) label.textContent = 'Authenticator code';
+      if (input) { input.placeholder = '123456'; input.maxLength = 8; input.inputMode = 'numeric'; }
+    } else if (usesBackup) {
+      if (copy) copy.textContent = 'Enter one of your 8-character Discord backup codes.';
+      if (label) label.textContent = 'Backup code';
+      if (input) { input.placeholder = 'XXXXXXXX'; input.maxLength = 8; input.inputMode = 'text'; }
+    } else if (usesSms) {
+      if (copy) copy.textContent = 'Enter the 6-digit code Discord sent to your phone.';
+      if (label) label.textContent = 'Texted code';
+      if (input) { input.placeholder = '123456'; input.maxLength = 8; input.inputMode = 'numeric'; }
+    } else {
+      if (copy) copy.textContent = 'Enter the code from your two-factor app, or an 8-character backup code.';
+      if (label) label.textContent = 'Code';
+      if (input) { input.placeholder = '123456'; input.maxLength = 8; input.inputMode = 'text'; }
+    }
+    if (usesTotp) startMfaClock(prefix);
+    else stopMfaClock();
+  }
+
+  function enterMfa(prefix, data) {
+    mfaTickets[prefix] = (data && data.ticket) || '';
+    mfaInstances[prefix] = (data && data.loginInstanceId) || '';
+    mfaMethods[prefix] = Array.isArray(data && data.methods) ? data.methods.map(String) : [];
+    setStep(prefix, 'mfa');
+    applyMfaHint(prefix);
+    setTimeout(() => document.querySelector(`#${prefix}-code`)?.focus({ preventScroll: true }), 40);
   }
 
   function showError(id, message) {
@@ -368,6 +442,7 @@
           ticket: mfaTickets[prefix] || '',
           code: mfaCodes[prefix] || '',
           loginInstanceId: mfaInstances[prefix] || '',
+          methods: mfaMethods[prefix] || [],
           captchaKey: token,
           captchaSessionId: (state.challenge || {}).sessionId || '',
           captchaRqToken: (state.challenge || {}).rqtoken || '',
@@ -383,10 +458,7 @@
     try {
       const data = await K.api(stage === 'mfa' ? '/api/auth/mfa' : '/api/auth/login', { method: 'POST', body });
       if (data.status === 'mfa') {
-        mfaTickets[prefix] = data.ticket || '';
-        mfaInstances[prefix] = data.loginInstanceId || '';
-        setStep(prefix, 'mfa');
-        setTimeout(() => document.querySelector(`#${prefix}-code`)?.focus({ preventScroll: true }), 40);
+        enterMfa(prefix, data);
         return;
       }
       finish(data);
@@ -573,10 +645,7 @@
         return;
       }
       if (result.status === 'mfa') {
-        mfaTickets[prefix] = result.ticket || '';
-        mfaInstances[prefix] = result.loginInstanceId || '';
-        setStep(prefix, 'mfa');
-        setTimeout(() => document.querySelector(`#${prefix}-code`)?.focus({ preventScroll: true }), 40);
+        enterMfa(prefix, result);
         return;
       }
       finish(result);
@@ -734,7 +803,7 @@
     try {
       const data = await K.api('/api/auth/mfa', {
         method: 'POST',
-        body: { ticket, code, loginInstanceId: mfaInstances[prefix] || '' },
+        body: { ticket, code, loginInstanceId: mfaInstances[prefix] || '', methods: mfaMethods[prefix] || [] },
       });
       finish(data);
     } catch (error) {
@@ -768,6 +837,8 @@
     mfaTickets[prefix] = '';
     mfaInstances[prefix] = '';
     mfaCodes[prefix] = '';
+    mfaMethods[prefix] = [];
+    stopMfaClock();
     captchaStage[prefix] = '';
     pending[prefix] = null;
     clearCaptcha(prefix);
