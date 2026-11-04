@@ -5850,12 +5850,20 @@ def _login_headers() -> dict:
 
 
 def web_super_properties() -> str:
-    """Client properties matching DISCORD_LOGIN_UA, for the web password flow."""
+    """Client properties matching DISCORD_LOGIN_UA, for the web password flow.
+
+    Discord's two-factor endpoint rejects a *current* authenticator code with
+    60008 "Invalid two-factor code" unless the request carries a complete
+    X-Super-Properties blob including a client_launch_id. The code is not the
+    problem; the missing fingerprint is. Keep this in step with the web client
+    shape and send it on both the password and the two-factor request.
+    """
     props = {
         "os": "Windows",
         "browser": "Chrome",
         "device": "",
         "system_locale": "en-US",
+        "has_client_mods": False,
         "browser_user_agent": DISCORD_LOGIN_UA,
         "browser_version": "138.0.7204.251",
         "os_version": "10",
@@ -5864,8 +5872,10 @@ def web_super_properties() -> str:
         "referrer_current": "",
         "referring_domain_current": "",
         "release_channel": "stable",
-        "client_build_number": 655747,
+        "client_build_number": 661871,
         "client_event_source": None,
+        "client_app_state": "focused",
+        "client_launch_id": "00000000-0000-4000-8000-000000000000",
     }
     raw = json.dumps(props, separators=(",", ":")).encode()
     return base64.b64encode(raw).decode()
@@ -6075,12 +6085,16 @@ def _log_discord_shape(step: str, status: int, info) -> None:
             for key in source.keys()
             if not re.search(r"token|password|code|secret", str(key), re.I)
         ]
+        # `code` is Discord's numeric error code, never the authenticator code.
+        error_code = source.get("code")
+        error_code = error_code if isinstance(error_code, int) else "n/a"
         STORE.log(
             "INFO",
             "Account",
             f"Discord {step}: HTTP {status}; fields [{', '.join(fields) or 'none'}]; "
             f"captcha={_has_captcha(source)} mfa={bool(source.get('mfa'))} "
-            f"ticket={bool(source.get('ticket'))} session={bool(source.get('token'))}",
+            f"ticket={bool(source.get('ticket'))} session={bool(source.get('token'))} "
+            f"code={error_code}",
         )
     except Exception:
         pass

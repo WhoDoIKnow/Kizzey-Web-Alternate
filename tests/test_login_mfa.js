@@ -49,6 +49,19 @@ async function main() {
   check(token === 'tok-1', 'the MFA login returns the token', String(token));
   check(calls.length === 1 && calls[0].body.login_instance_id === undefined, 'a short login instance is not sent', JSON.stringify(calls));
   check(calls[0].body.code === '123456' && calls[0].body.ticket === 'ticket-1', 'the MFA body carries the code and ticket');
+  // Discord answers a *current* authenticator code with 60008 unless the
+  // two-factor request carries a full web fingerprint, client_launch_id
+  // included. This is the fix for "code not accepted" when Discord's own site
+  // accepts it.
+  let mfaProps = {};
+  try { mfaProps = JSON.parse(Buffer.from(calls[0].headers['X-Super-Properties'], 'base64').toString('utf8')); } catch {}
+  check(
+    Boolean(mfaProps.client_launch_id) && mfaProps.release_channel === 'stable' && mfaProps.has_client_mods === false,
+    'the two-factor request carries a full web fingerprint',
+    JSON.stringify(mfaProps)
+  );
+  check(mfaProps.browser === 'Chrome' && mfaProps.browser_user_agent === calls[0].headers['User-Agent'], 'the fingerprint names the same client as the request');
+
 
   installFetch(() => ({ status: 200, body: { token: 'tok-2' } }));
   token = await login.discordMfaLogin('ticket-1', '123456', UUID);

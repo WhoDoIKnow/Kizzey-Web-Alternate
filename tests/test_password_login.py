@@ -400,6 +400,13 @@ def main():
             "the password flow identifies as the same web client that solves the captcha",
             str(login_props)[:220],
         )
+        check(
+            bool(login_props.get("client_launch_id"))
+            and login_props.get("release_channel") == "stable"
+            and login_props.get("has_client_mods") is False,
+            "the fingerprint carries the fields Discord's two-factor step needs",
+            str(login_props)[:220],
+        )
 
         # --- input validation -------------------------------------------------
         status, blank_login = request("POST", "/api/auth/login", {"login": "", "password": "x"})
