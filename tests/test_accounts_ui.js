@@ -480,6 +480,12 @@ function accountsState(overrides = {}) {
   check(loginJs.includes("data.rqdata") && /execute\(state\.widget,\s*data\)/.test(loginJs) && !/options\.rqdata/.test(loginJs), 'Enterprise challenge data is sent to the widget, not dropped by render');
   check(loginJs.includes('mfaInstances[prefix] = data.loginInstanceId') && loginJs.includes('loginInstanceId: mfaInstances[prefix]'), 'the MFA retry carries the login instance');
   check(!/2captcha|capsolver|anti-captcha/i.test(loginJs), 'the captcha is not outsourced to a solver service');
+  check(loginJs.includes('pending[prefix] = data') && loginJs.includes('await showCaptcha(prefix, null)'), 'the check step is always shown after a password sign-in');
+  check(loginJs.includes('if (invisible) submitCaptcha(prefix, token)'), 'a visible box waits for Continue instead of submitting itself');
+  check(loginJs.includes('Discord did not ask for a check') && loginJs.includes('Press Continue to finish signing in.'), 'a sign-in with no challenge still says Continue');
+  check(loginJs.includes('const result = pending[prefix]') && loginJs.includes("result.status === 'mfa'"), 'Continue advances the result Discord already returned');
+  check(panel.includes('data-captcha-title') && panel.includes('data-captcha-copy'), 'the check step can explain when no box is needed');
+  check(panel.includes('login-captcha-reload') && loginJs.includes("K.actions['login-captcha-reload']"), 'a failed check can be reloaded');
   check(settings.includes("tappable('Discord login'") && settings.includes("action: 'account-add'"), 'settings opens the password login sheet');
   check(!/oauth/i.test(settings), 'settings has no OAuth wording');
   check(css.includes('.account-list-row') && css.includes('.mirror-route') && css.includes('.mirror-toggle'), 'new components have Material styles');

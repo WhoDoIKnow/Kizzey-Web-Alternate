@@ -19,6 +19,9 @@
   // the two-factor check Discord is guarding. The solved token is posted back
   // to whichever one asked.
   const captchaStage = {};
+  // A sign-in that did not need a captcha still stops on the check step; this
+  // holds the result Discord already returned so Continue can advance.
+  const pending = {};
   let hcaptchaLoader = null;
 
   function captchaState(prefix) {
@@ -50,11 +53,20 @@
       script.src = 'https://js.hcaptcha.com/1/api.js?render=explicit&hl=en&host=discord.com';
       script.async = true;
       script.defer = true;
-      script.onload = () => {
-        if (window.hcaptcha) resolve(window.hcaptcha);
-        else reject(new Error('hCaptcha did not start.'));
+      // A stalled script would otherwise leave the sheet on "Loading..." for
+      // ever; fail after a few seconds so the step can say what happened.
+      const timer = setTimeout(() => {
+        reject(new Error('hCaptcha took too long to load.'));
+      }, 12000);
+      const settle = (fn, value) => {
+        clearTimeout(timer);
+        fn(value);
       };
-      script.onerror = () => reject(new Error('hCaptcha could not be loaded.'));
+      script.onload = () => {
+        if (window.hcaptcha) settle(resolve, window.hcaptcha);
+        else settle(reject, new Error('hCaptcha did not start.'));
+      };
+      script.onerror = () => settle(reject, new Error('hCaptcha could not be loaded.'));
       document.head.appendChild(script);
     }).catch(error => {
       hcaptchaLoader = null;
@@ -190,12 +202,15 @@
       <form data-login-step="captcha" class="hidden" data-submit-action="login-captcha" novalidate>
         <div class="login-hint" style="margin-bottom:14px">
           ${K.icon('shield-check', 'sm')}
-          <div><b>Discord wants a quick check</b><span>Solve the captcha below. It runs in this browser, so the server never has to see it.</span></div>
+          <div><b data-captcha-title>Discord security check</b><span data-captcha-copy>Solve the check below, then press Continue.</span></div>
         </div>
         <div class="captcha-slot" data-captcha-slot="${prefix}"></div>
         <div id="${prefix}-captcha-error" class="field-error hidden"></div>
         <button class="btn btn-primary btn-block btn-lg" type="submit" data-action="login-captcha" data-prefix="${prefix}" id="${prefix}-captcha-submit" disabled>Continue</button>
-        <div class="text-center mt-8"><button class="btn btn-ghost btn-sm" type="button" data-action="login-back" data-prefix="${prefix}">Use a different account</button></div>
+        <div class="text-center mt-8">
+          <button class="btn btn-ghost btn-sm hidden" type="button" data-action="login-captcha-reload" data-prefix="${prefix}" id="${prefix}-captcha-reload">Reload the check</button>
+          <button class="btn btn-ghost btn-sm" type="button" data-action="login-back" data-prefix="${prefix}">Use a different account</button>
+        </div>
       </form>
 
       <div class="login-or"><span>or</span></div>
@@ -244,6 +259,7 @@
     if (step === 'credentials') {
       mfaTickets[prefix] = '';
       mfaInstances[prefix] = '';
+      pending[prefix] = null;
     }
   }
 
@@ -307,6 +323,7 @@
 
   function finish(data) {
     Object.keys(captchas).forEach(clearCaptcha);
+    Object.keys(pending).forEach(key => { pending[key] = null; });
     K.receiveState(data.state || K.state);
     K.closeSheet();
     K.toast('Discord connected', `Signed in as ${K.displayName()}.`, 'ok');
@@ -409,25 +426,62 @@
     }
   }
 
-  async function showCaptcha(prefix, challenge) {
+  // The check step is always shown after a password sign-in, so Discord's
+  // captcha is visible when it asks for one. Three shapes:
+  //   * a challenge -> draw the hCaptcha box, wait for the solve, then Continue
+  //   * no challenge -> Discord did not ask; Continue advances the result the
+  //                     server already returned (MFA step or signed in)
+  //   * notice -> Discord wants a check this browser cannot draw; explain and
+  //               point at the token route
+  async function showCaptcha(prefix, challenge, notice = '') {
     const state = captchaState(prefix);
-    state.challenge = challenge;
+    if (state.widget !== null && window.hcaptcha) {
+      try { window.hcaptcha.remove(state.widget); } catch (err) {}
+    }
+    state.widget = null;
     state.token = '';
+    state.challenge = challenge || null;
     setStep(prefix, 'captcha');
     clearError(`${prefix}-captcha`);
     const slot = document.querySelector(`[data-captcha-slot="${prefix}"]`);
-    if (!slot) return;
     const button = document.querySelector(`#${prefix}-captcha-submit`);
-    if (button) button.disabled = false;
+    const reload = document.querySelector(`#${prefix}-captcha-reload`);
+    const title = document.querySelector(`[data-login-panel="${prefix}"] [data-captcha-title]`);
+    const copy = document.querySelector(`[data-login-panel="${prefix}"] [data-captcha-copy]`);
+    if (reload) reload.classList.add('hidden');
+    if (!challenge) {
+      if (slot) slot.innerHTML = '';
+      if (notice) {
+        if (title) title.textContent = 'Discord wants a check this browser cannot show';
+        if (copy) copy.textContent = 'Use a token instead, or try again from a secure (HTTPS) address.';
+        if (button) button.disabled = true;
+        showError(`${prefix}-captcha`, notice);
+        revealTokenBlock(prefix, true);
+      } else {
+        if (title) title.textContent = 'Discord did not ask for a check';
+        if (copy) copy.textContent = 'Press Continue to finish signing in.';
+        if (button) button.disabled = !pending[prefix];
+      }
+      return;
+    }
+    if (title) title.textContent = 'Discord wants a quick check';
+    if (copy) copy.textContent = 'Solve the check below, then press Continue.';
+    if (!slot) {
+      showError(`${prefix}-captcha`, 'The captcha could not start. Use a token instead.');
+      revealTokenBlock(prefix, true);
+      return;
+    }
+    if (button) button.disabled = true;
     slot.innerHTML = '<div class="captcha-loading">Loading the check…</div>';
     let api;
     try {
       api = await loadHCaptcha();
     } catch (error) {
       slot.innerHTML = '';
+      if (reload) reload.classList.remove('hidden');
       showError(
         `${prefix}-captcha`,
-        'The captcha could not be loaded on this device. Check the connection, or use a token instead.'
+        'The captcha could not be loaded here. Open Kizzey over HTTPS or localhost so the check can run, or use a token instead.'
       );
       revealTokenBlock(prefix, true);
       return;
@@ -450,11 +504,13 @@
         state.token = token;
         clearError(`${prefix}-captcha`);
         if (button) button.disabled = false;
-        submitCaptcha(prefix, token);
+        // Check the box, then press Continue. An invisible widget has no box to
+        // click, so finish it straight away.
+        if (invisible) submitCaptcha(prefix, token);
       },
       'expired-callback': () => {
         state.token = '';
-        if (button) button.disabled = false;
+        if (button) button.disabled = true;
         showError(`${prefix}-captcha`, 'That check expired. Solve it again.');
         runCaptcha(prefix);
       },
@@ -465,10 +521,11 @@
       },
       'error-callback': () => {
         state.token = '';
-        if (button) button.disabled = false;
+        if (button) button.disabled = true;
+        if (reload) reload.classList.remove('hidden');
         showError(
           `${prefix}-captcha`,
-          'The captcha could not run in this browser. Use a token instead.'
+          'The captcha could not run in this browser. Open Kizzey over HTTPS or localhost, or use a token instead.'
         );
         revealTokenBlock(prefix, true);
       },
@@ -476,6 +533,7 @@
     try {
       state.widget = api.render(slot, options);
     } catch (error) {
+      if (reload) reload.classList.remove('hidden');
       showError(`${prefix}-captcha`, 'The captcha could not start. Use a token instead.');
       revealTokenBlock(prefix, true);
       return;
@@ -506,7 +564,22 @@
     const state = captchaState(prefix);
     if (state.submitting) return;
     if (!state.challenge) {
-      setStep(prefix, 'credentials');
+      // No check was needed on this attempt: Continue advances the result the
+      // server already returned.
+      const result = pending[prefix];
+      pending[prefix] = null;
+      if (!result) {
+        setStep(prefix, 'credentials');
+        return;
+      }
+      if (result.status === 'mfa') {
+        mfaTickets[prefix] = result.ticket || '';
+        mfaInstances[prefix] = result.loginInstanceId || '';
+        setStep(prefix, 'mfa');
+        setTimeout(() => document.querySelector(`#${prefix}-code`)?.focus({ preventScroll: true }), 40);
+        return;
+      }
+      finish(result);
       return;
     }
     if (state.token) {
@@ -518,6 +591,13 @@
       return;
     }
     showError(`${prefix}-captcha`, 'The check is still loading. Try again in a moment.');
+  };
+
+  K.actions['login-captcha-reload'] = function (el) {
+    const prefix = prefixOf(el);
+    const state = captchaState(prefix);
+    if (!state.challenge) return;
+    showCaptcha(prefix, state.challenge);
   };
 
   K.actions['login-browser'] = async function (el) {
@@ -596,16 +676,16 @@
       return;
     }
     setBusy(prefix, 'submit', true, 'Sign in', 'Signing in...');
+    captchaStage[prefix] = 'login';
+    pending[prefix] = null;
     try {
       const data = await K.api('/api/auth/login', { method: 'POST', body: { login, password } });
-      if (data.status === 'mfa') {
-        mfaTickets[prefix] = data.ticket || '';
-        mfaInstances[prefix] = data.loginInstanceId || '';
-        setStep(prefix, 'mfa');
-        setTimeout(() => document.querySelector(`#${prefix}-code`)?.focus({ preventScroll: true }), 40);
-        return;
-      }
-      finish(data);
+      // Discord may or may not ask for a check. Either way stop on the check
+      // step: with a challenge the operator solves it, without one they press
+      // Continue and the answer Discord already gave is used.
+      pending[prefix] = data;
+      await showCaptcha(prefix, null);
+      return;
     } catch (error) {
       const challenge = error.data && error.data.challenge;
       if (challenge && challenge.sitekey) {
@@ -613,12 +693,16 @@
         await showCaptcha(prefix, challenge);
         return;
       }
-      showError(prefix, error.message);
       if (error.data && error.data.captcha) {
-        // The challenge could not be rendered here; the token route is the way through.
-        revealTokenBlock(prefix, true);
-        setTimeout(() => document.querySelector(`#${prefix}-token`)?.focus({ preventScroll: true }), 40);
-      } else if (error.status === 401) {
+        // Discord wants a check this browser cannot draw (or the challenge was
+        // malformed). Still show the step so the failure is visible, and point
+        // at the token route.
+        captchaStage[prefix] = 'login';
+        await showCaptcha(prefix, null, error.message);
+        return;
+      }
+      showError(prefix, error.message);
+      if (error.status === 401) {
         passwordInput.select();
         passwordInput.focus();
       }
@@ -685,6 +769,7 @@
     mfaInstances[prefix] = '';
     mfaCodes[prefix] = '';
     captchaStage[prefix] = '';
+    pending[prefix] = null;
     clearCaptcha(prefix);
     clearError(`${prefix}-captcha`);
     const code = document.querySelector(`#${prefix}-code`);
