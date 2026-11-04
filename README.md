@@ -72,11 +72,11 @@ start without reading the launcher source first:
 ```
 
 It clones into `./kizzey-web` when the script is not already inside a checkout, and forwards every
-other flag to `server.js`. When the script is already inside a checkout it compares the local commit
-with the tracked branch tip first: if they match it says so and starts straight away without a
-fetch, otherwise it fetches and runs `git pull --ff-only`. Runtime data in `data/` is git-ignored,
-so updates never delete accounts, settings or history. `npm install` always runs, so a freshly
-pulled checkout has the packages its modules require.
+other flag to `server.js`. When the script is already inside a checkout it always pulls from that
+checkout's own origin (`git pull --ff-only`) before starting, so a new commit on the tracked branch is
+never missed; when nothing changed it says so and starts anyway. Runtime data in `data/` is
+git-ignored, so updates never delete accounts, settings or history. `npm install` always runs, so a
+freshly pulled checkout has the packages its modules require.
 
 It also starts the Node Discord voice companion when it can. It looks for
 `voice_service/index.js`, the voice npm packages, `ffmpeg` and (optionally) `yt-dlp`; when they are

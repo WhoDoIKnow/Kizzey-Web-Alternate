@@ -83,6 +83,45 @@ function main() {
     check(result.status === 0, 'a non-git checkout is used as-is', `${result.status} ${result.stderr}`);
     check(/not a git checkout/.test(result.stdout), 'a non-git checkout is reported as-is', result.stdout);
 
+    // A real (file://) remote: a new commit must be pulled on the next run.
+    const gitVersion = spawnSync('git', ['--version'], { encoding: 'utf8' });
+    if (gitVersion.status !== 0) {
+      console.log('skip: git is not installed; the pull path is not exercised');
+    } else {
+      const runGit = (args, cwd) => spawnSync('git', args, { cwd, encoding: 'utf8' });
+      const origin = path.join(WORK, 'origin.git');
+      const seed = path.join(WORK, 'seed');
+      runGit(['init', '-q', '--bare', origin]);
+      runGit(['clone', '-q', origin, seed]);
+      const commit = (message) => {
+        runGit(['add', '-A'], seed);
+        runGit(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', message], seed);
+      };
+      fs.writeFileSync(path.join(seed, 'server.js'), '// v1\n');
+      commit('v1');
+      runGit(['branch', '-M', 'main'], seed);
+      runGit(['push', '-q', 'origin', 'main'], seed);
+
+      const pulled = path.join(WORK, 'pulled');
+      const cloneUrl = `file://${origin}`;
+      result = runLauncher(['--update-only', '--no-install', '--dir', pulled, '--repo', cloneUrl, '--branch', 'main'], binDir);
+      check(result.status === 0 && fs.existsSync(path.join(pulled, 'server.js')), 'the launcher clones a fresh checkout', `${result.status} ${result.stderr}`);
+      const firstHead = runGit(['rev-parse', 'HEAD'], pulled).stdout.trim();
+
+      fs.writeFileSync(path.join(seed, 'server.js'), '// v2\n');
+      commit('v2');
+      runGit(['push', '-q', 'origin', 'main'], seed);
+
+      result = runLauncher(['--update-only', '--no-install', '--dir', pulled, '--repo', cloneUrl, '--branch', 'main'], binDir);
+      const secondHead = runGit(['rev-parse', 'HEAD'], pulled).stdout.trim();
+      check(result.status === 0 && secondHead && secondHead !== firstHead, 'a new commit is pulled on the next run', `${result.status} ${result.stdout}`);
+      check(/Updated to the latest sources/.test(result.stdout), 'a new commit is reported as pulled', result.stdout);
+      check(fs.readFileSync(path.join(pulled, 'server.js'), 'utf8').includes('v2'), 'the checkout advances to the new commit', fs.readFileSync(path.join(pulled, 'server.js'), 'utf8'));
+
+      result = runLauncher(['--update-only', '--no-install', '--dir', pulled, '--repo', cloneUrl, '--branch', 'main'], binDir);
+      check(result.status === 0 && /Already up to date/.test(result.stdout), 'an unchanged checkout reports up to date', result.stdout);
+    }
+
     const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
     check(readme.includes('--no-install'), 'README documents --no-install');
 

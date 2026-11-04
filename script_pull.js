@@ -10,10 +10,11 @@
  *   node script_pull.js --update-only          # pull + install, then exit
  *   node script_pull.js --voice-install
  *
- * Pulls the checkout, installs the required npm packages (always, so a fresh
- * clone runs, including with --update-only), optionally starts the Discord
- * voice companion, then supervises both processes. Runtime data in data/ is
- * never touched. Use --no-install to skip the npm install.
+ * Pulls the checkout (every run, so a new commit always lands before the server
+ * starts), installs the required npm packages (always, so a fresh clone runs,
+ * including with --update-only), optionally starts the Discord voice companion,
+ * then supervises both processes. Runtime data in data/ is never touched. Use
+ * --no-install to skip the npm install.
  */
 
 const fs = require('fs');
@@ -53,16 +54,6 @@ function localHead(target) {
   return rev.status === 0 ? rev.stdout.trim() : '';
 }
 
-function remoteHead(target, repo, branch) {
-  const listed = runGit(['ls-remote', repo, `refs/heads/${branch}`], target);
-  if (listed.status !== 0) return '';
-  for (const line of String(listed.stdout || '').split('\n')) {
-    const parts = line.trim().split(/\s+/);
-    if (parts.length >= 2 && parts[1] === `refs/heads/${branch}`) return parts[0];
-  }
-  return '';
-}
-
 function defaultDir(scriptDir) {
   if (fs.existsSync(path.join(scriptDir, 'server.js'))) return scriptDir;
   return path.join(process.cwd(), 'kizzey-web');
@@ -97,31 +88,19 @@ function pull(target, repo, branch) {
     return 0;
   }
   note(`Checking ${target}`);
-  const local = localHead(target);
-  let ahead = remoteHead(target, repo, branch);
-  if (ahead && local && ahead === local) {
-    note('Already up to date; nothing to pull.');
-    return 0;
+  const before = localHead(target);
+  // Always pull from the checkout's own origin. Skipping the network call when
+  // a cached tip (or a stale remote-tip answer for a repository this checkout
+  // does not even track) looked current is what let a new commit go unpulled.
+  // Pulling every run guarantees the new commit lands before the server starts.
+  const pulled = runGit(['pull', '--ff-only', 'origin', branch], target);
+  if (pulled.status !== 0) {
+    process.stderr.write(String(pulled.stdout || pulled.stderr || ''));
+    fail('The checkout could not be updated. Check your network, and commit or stash local changes, then retry.');
   }
-  const fetched = runGit(['fetch', '--prune', 'origin', branch], target);
-  if (fetched.status !== 0) {
-    process.stderr.write(String(fetched.stdout || fetched.stderr || ''));
-    fail('Could not fetch from origin. Check your network and repository access.');
-  }
-  if (!ahead) {
-    const tracked = runGit(['rev-parse', `origin/${branch}`], target);
-    ahead = tracked.status === 0 ? tracked.stdout.trim() : '';
-  }
-  if (ahead && local && ahead === local) {
-    note('Already up to date; nothing to pull.');
-    return 0;
-  }
-  const merged = runGit(['merge', '--ff-only', `origin/${branch}`], target);
-  if (merged.status !== 0) {
-    process.stderr.write(String(merged.stdout || merged.stderr || ''));
-    fail('The checkout could not fast-forward. Commit or stash local changes, then retry.');
-  }
-  note('Updated to the latest sources.');
+  const after = localHead(target);
+  if (before && after && before === after) note('Already up to date; nothing to pull.');
+  else note('Updated to the latest sources.');
   return 0;
 }
 

@@ -77,9 +77,10 @@ def main():
         text = (ROOT / "script_pull.py").read_text()
         check("--ff-only" in text, "updates never force a merge")
         check("--update-only" in text and "--no-pull" in text, "launcher exposes both escape hatches")
-        check("ls-remote" in text, "the launcher checks the remote tip before pulling")
+        check("ls-remote" not in text, "the launcher always pulls instead of trusting a cached remote tip")
 
-        # Incremental pull: an unchanged checkout skips the fetch entirely.
+        # Every run pulls from the checkout's own origin, so a new commit can
+        # never be skipped by an "already up to date" shortcut.
         repo_dir = WORK / "repo"
         (repo_dir / ".git").mkdir(parents=True)
         git_calls = []
@@ -98,35 +99,29 @@ def main():
         try:
             launcher.run_git = stub_git({
                 "rev-parse HEAD": (0, "cafe1234\n"),
-                f"ls-remote {launcher.DEFAULT_REPO}": (0, "cafe1234\trefs/heads/main\n"),
+                "pull --ff-only origin main": (0, "Already up to date.\n"),
             })
             code = launcher.pull(repo_dir, launcher.DEFAULT_REPO, "main")
             check(code == 0, "an up-to-date checkout pulls cleanly", str(code))
-            check(not any(call[0] == "fetch" for call in git_calls), "an up-to-date checkout skips the fetch")
-            check(not any(call[0] == "pull" for call in git_calls), "an up-to-date checkout skips the pull")
+            check(any(call[:2] == ["pull", "--ff-only"] for call in git_calls), "an up-to-date checkout still pulls")
 
             git_calls.clear()
             launcher.run_git = stub_git({
                 "rev-parse HEAD": (0, "cafe1234\n"),
-                f"ls-remote {launcher.DEFAULT_REPO}": (0, "beef5678\trefs/heads/main\n"),
-                "fetch": (0, ""),
-                "pull": (0, "Fast-forward\n"),
+                "pull --ff-only origin main": (0, "Fast-forward\n"),
             })
             code = launcher.pull(repo_dir, launcher.DEFAULT_REPO, "main")
             check(code == 0, "a stale checkout pulls cleanly", str(code))
-            check(any(call[0] == "fetch" for call in git_calls), "a stale checkout fetches first")
             check(any(call[:2] == ["pull", "--ff-only"] for call in git_calls), "a stale checkout fast-forwards")
 
+            # A failed pull is reported instead of silently keeping stale code.
             git_calls.clear()
             launcher.run_git = stub_git({
                 "rev-parse HEAD": (0, "cafe1234\n"),
-                f"ls-remote {launcher.DEFAULT_REPO}": (1, ""),
-                "rev-parse origin/main": (0, "cafe1234\n"),
-                "fetch": (0, ""),
+                "pull --ff-only origin main": (1, "fatal: could not read from remote\n"),
             })
             code = launcher.pull(repo_dir, launcher.DEFAULT_REPO, "main")
-            check(code == 0, "a blocked ls-remote falls back to the fetched tip", str(code))
-            check(not any(call[0] == "pull" for call in git_calls), "the fetched-tip comparison skips the pull")
+            check(code == 1, "a failed pull stops the launcher", str(code))
         finally:
             launcher.run_git = real_run_git
 
